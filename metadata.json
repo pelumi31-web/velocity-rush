@@ -1,0 +1,6 @@
+{
+  "name": "Velocity Rush",
+  "description": "3D arcade highway racing game with tilt motion steering, traffic near-miss scoring, garage upgrades, challenges, and mobile monetization architecture.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
