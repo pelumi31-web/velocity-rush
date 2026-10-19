@@ -25,7 +25,7 @@ import {
   tryUnlockCar,
   writeSaveToStorage,
 } from './game/saveSystem';
-import { soundController } from './game/audio';
+import { MusicTrackId, MusicTrackMeta, soundController } from './game/audio';
 import {
   CompletedRunPayload,
   GameLifecycleState,
@@ -107,6 +107,9 @@ export default function App() {
   const [statusNotice, setStatusNotice] = useState<string | null>(null);
   const [simulatedTiltDeg, setSimulatedTiltDeg] = useState<number>(0);
   const [isMuted, setIsMuted] = useState<boolean>(false);
+  const [musicTrack, setMusicTrack] = useState<MusicTrackMeta>(() =>
+    soundController.getTrackMeta()
+  );
 
   const [liveSnapshot, setLiveSnapshot] = useState<LiveRaceSnapshot>({
     integrity: HIGHWAY_CONFIG.maxHullIntegrity,
@@ -322,7 +325,51 @@ export default function App() {
     setGameState('title');
   }, []);
 
-  // Global keyboard shortcuts: Enter/Space on Title starts race; M mutes; R restarts in race
+  const handleCycleMusicTrack = useCallback(() => {
+    soundController.playButtonClick();
+    const nextMeta = soundController.cycleTrack();
+    setMusicTrack(nextMeta);
+    showToastNotice(`Now Playing: ${nextMeta.title} (${nextMeta.genre})`);
+  }, [showToastNotice]);
+
+  const handleSelectMusicTrack = useCallback(
+    (trackId: MusicTrackId) => {
+      soundController.playButtonClick();
+      const nextMeta = soundController.setTrackId(trackId);
+      setMusicTrack(nextMeta);
+      showToastNotice(`Now Playing: ${nextMeta.title} (${nextMeta.genre})`);
+    },
+    [showToastNotice]
+  );
+
+  const handleToggleMute = useCallback(() => {
+    const nextMuted = !soundController.getMuted();
+    soundController.setMuted(nextMuted);
+    setIsMuted(nextMuted);
+    if (!nextMuted) {
+      soundController.startMusicLoop();
+    }
+  }, []);
+
+  // Automatically start the intense soundtrack on the user's very first pointer/touch/key gesture
+  useEffect(() => {
+    const unlockAudioOnFirstGesture = () => {
+      soundController.startMusicLoop();
+      window.removeEventListener('pointerdown', unlockAudioOnFirstGesture);
+      window.removeEventListener('touchstart', unlockAudioOnFirstGesture);
+      window.removeEventListener('keydown', unlockAudioOnFirstGesture);
+    };
+    window.addEventListener('pointerdown', unlockAudioOnFirstGesture, { passive: true });
+    window.addEventListener('touchstart', unlockAudioOnFirstGesture, { passive: true });
+    window.addEventListener('keydown', unlockAudioOnFirstGesture);
+    return () => {
+      window.removeEventListener('pointerdown', unlockAudioOnFirstGesture);
+      window.removeEventListener('touchstart', unlockAudioOnFirstGesture);
+      window.removeEventListener('keydown', unlockAudioOnFirstGesture);
+    };
+  }, []);
+
+  // Global keyboard shortcuts: Enter/Space on Title starts race; M mutes; T switches track; R restarts in race
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) {
@@ -336,9 +383,9 @@ export default function App() {
         e.preventDefault();
         handleStartRace('solo');
       } else if (e.code === 'KeyM' && !e.repeat) {
-        const nextMuted = !soundController.getMuted();
-        soundController.setMuted(nextMuted);
-        setIsMuted(nextMuted);
+        handleToggleMute();
+      } else if (e.code === 'KeyT' && !e.repeat) {
+        handleCycleMusicTrack();
       } else if (
         e.code === 'KeyR' &&
         !e.repeat &&
@@ -349,7 +396,14 @@ export default function App() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [gameState, activeModal, handleStartRace, handleRestartRace]);
+  }, [
+    gameState,
+    activeModal,
+    handleStartRace,
+    handleRestartRace,
+    handleToggleMute,
+    handleCycleMusicTrack,
+  ]);
 
   const handleRunEnded = useCallback((payload: CompletedRunPayload) => {
     setLastRunPayload(payload);
@@ -674,6 +728,11 @@ export default function App() {
           onRotateTurntable={(delta) =>
             controlsRef.current.rotateGarageTurntable?.(delta)
           }
+          musicTrack={musicTrack}
+          isMuted={isMuted}
+          onCycleMusicTrack={handleCycleMusicTrack}
+          onSelectMusicTrack={handleSelectMusicTrack}
+          onToggleMute={handleToggleMute}
           feedbackNotice={statusNotice}
           onTriggerFeedbackNotice={showToastNotice}
         />
@@ -693,11 +752,9 @@ export default function App() {
           onCalibrateTilt={handleCalibrateTilt}
           onRequestMotionPermission={handleRequestMotionPermission}
           isMuted={isMuted}
-          onToggleMute={() => {
-            const next = !soundController.getMuted();
-            soundController.setMuted(next);
-            setIsMuted(next);
-          }}
+          onToggleMute={handleToggleMute}
+          musicTrackTitle={musicTrack.title}
+          onCycleMusicTrack={handleCycleMusicTrack}
           onPauseToggle={handlePauseToggle}
           onRestartRace={handleRestartRace}
           onNextLevel={handleNextLevel}

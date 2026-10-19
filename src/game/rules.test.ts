@@ -36,6 +36,13 @@ import {
   sampleTrackAtDistance,
   stepAiOpponent,
 } from './levelsMode.ts';
+import {
+  createInitialWeatherState,
+  selectNextRandomWeather,
+  stepWeatherInterpolation,
+  WEATHER_ORDER,
+  WEATHER_PROFILES,
+} from './weather.ts';
 
 test('8 distinct vehicles exist with unique body styles and valid customization compatibility', () => {
   assert.equal(CAR_ORDER.length, 8);
@@ -402,3 +409,43 @@ test('economy, Solo Mode runs, challenges, AdMob frequency, and save sanitizatio
   assert.equal(sanitized.coins, 600);
   assert.equal(sanitized.selectedCarId, 'starter_apex');
 });
+
+test('Weather system profiles (clear, rain, fog, snow) impact visibility, fog density, and track grip', () => {
+  assert.deepEqual(WEATHER_ORDER, ['clear', 'rain', 'fog', 'snow']);
+
+  const clear = WEATHER_PROFILES.clear;
+  const rain = WEATHER_PROFILES.rain;
+  const fog = WEATHER_PROFILES.fog;
+  const snow = WEATHER_PROFILES.snow;
+
+  // Track grip hierarchy: Clear (1.0) > Fog (0.9) > Rain (0.82) > Snow (0.72)
+  assert.equal(clear.gripMultiplier, 1.0);
+  assert.ok(fog.gripMultiplier < clear.gripMultiplier);
+  assert.ok(rain.gripMultiplier < fog.gripMultiplier);
+  assert.ok(snow.gripMultiplier < rain.gripMultiplier);
+
+  // Visibility & fog density hierarchy: Fog has highest fogDensity & lowest visibilityPct
+  assert.ok(fog.fogDensity > snow.fogDensity);
+  assert.ok(snow.fogDensity > rain.fogDensity);
+  assert.ok(rain.fogDensity > clear.fogDensity);
+  assert.ok(fog.visibilityPct < snow.visibilityPct);
+  assert.ok(rain.visibilityPct < clear.visibilityPct);
+
+  // Random weather selector always chooses a different condition from current
+  for (const current of WEATHER_ORDER) {
+    for (const sampleRand of [0, 0.25, 0.5, 0.75, 0.99]) {
+      const next = selectNextRandomWeather(current, sampleRand);
+      assert.notEqual(next, current);
+    }
+  }
+
+  // Smooth weather interpolation converges toward target profile
+  let state = createInitialWeatherState('clear');
+  for (let i = 0; i < 60; i++) {
+    state = stepWeatherInterpolation(state, 'snow', 0.1, 0.8);
+  }
+  assert.equal(state.activeConditionId, 'snow');
+  assert.ok(Math.abs(state.gripMultiplier - snow.gripMultiplier) < 0.01);
+  assert.ok(Math.abs(state.fogDensity - snow.fogDensity) < 0.001);
+});
+

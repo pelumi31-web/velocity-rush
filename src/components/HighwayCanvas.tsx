@@ -39,6 +39,14 @@ import {
 import { CarCustomizationState, createDefaultCarCustomization } from '../game/saveSystem';
 import { soundController } from '../game/audio';
 import {
+  createInitialWeatherState,
+  selectNextRandomWeather,
+  stepWeatherInterpolation,
+  WEATHER_ORDER,
+  WEATHER_PROFILES,
+  WeatherConditionId,
+} from '../game/weather';
+import {
   applyCarCustomizationToRig,
   buildCoinCollectibleMesh,
   buildLevelObstacleMesh,
@@ -85,6 +93,11 @@ export interface LiveRaceSnapshot {
   totalRacers?: number;    // 6
   isDrifting?: boolean;
   driftScore?: number;
+  weatherCondition?: WeatherConditionId;
+  weatherLabel?: string;
+  surfaceConditionLabel?: string;
+  trackGripPct?: number;
+  visibilityPct?: number;
 }
 
 export interface CompletedRunPayload {
@@ -123,6 +136,8 @@ export interface TouchInputControlsRef {
   triggerRestart?: () => void;
   rotateGarageTurntable?: (deltaRad: number) => void;
   requestMotionPermission?: () => Promise<boolean>;
+  cycleWeather?: () => WeatherConditionId;
+  setWeatherCondition?: (condition: WeatherConditionId) => void;
 }
 
 interface HighwayCanvasProps {
@@ -550,12 +565,53 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       }
     }
 
+    // Weather Precipitation Pool (Rain streaks, Snowflakes & Mist motes)
+    const maxWeatherParticles = 400;
+    const weatherDropGeo = new THREE.BoxGeometry(1, 1, 1);
+    const weatherDropMat = new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.76,
+      depthWrite: false,
+    });
+    const weatherPrecipInst = new THREE.InstancedMesh(
+      weatherDropGeo,
+      weatherDropMat,
+      maxWeatherParticles
+    );
+    weatherPrecipInst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    scene.add(weatherPrecipInst);
+
+    const weatherParticles = Array.from({ length: maxWeatherParticles }, (_, idx) => ({
+      x: (Math.random() - 0.5) * 34,
+      y: Math.random() * 14,
+      z: -Math.random() * 72 + 8,
+      phase: idx * 0.37,
+      speedScale: 0.85 + Math.random() * 0.35,
+    }));
+
     // Pre-allocated temporaries
     const _dummy = new THREE.Object3D();
     const _color = new THREE.Color();
+    const _targetFogColor = new THREE.Color();
+    const _targetSkyColor = new THREE.Color();
+    const _targetGroundColor = new THREE.Color();
+    const _targetRoadTint = new THREE.Color();
     const _targetCamPos = new THREE.Vector3();
     const _currentCamLook = new THREE.Vector3(0, 1.0, -18);
     const _desiredCamLook = new THREE.Vector3(0, 1.0, -18);
+
+    const resolveUrlWeatherParam = (): WeatherConditionId | null => {
+      if (typeof window === 'undefined') return null;
+      const w = new URLSearchParams(window.location.search).get('weather');
+      if (w === 'clear' || w === 'rain' || w === 'fog' || w === 'snow') {
+        return w;
+      }
+      return null;
+    };
+
+    const initialWeatherId: WeatherConditionId =
+      resolveUrlWeatherParam() ?? selectNextRandomWeather('clear');
 
     // Simulation State
     const sim = {
@@ -602,12 +658,22 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       elapsedRaceSec: 0,
       playerPosition: 6,
       lastSegmentLabel: 'Starting Grid',
+      // Dynamic Weather System State
+      targetWeatherId: initialWeatherId,
+      weatherState: createInitialWeatherState(initialWeatherId),
+      weatherChangeTimer: 24 + Math.random() * 10,
+      weatherLockedByUser: resolveUrlWeatherParam() !== null,
+      lastReportedGripPct: Math.round(WEATHER_PROFILES[initialWeatherId].gripMultiplier * 100),
     };
 
     function syncLiveHudSnapshot(
       banner?: { text: string; subtext: string; tone: 'cyan' | 'amber' | 'danger' }
     ) {
       const mode = propsRef.current.playMode ?? 'solo';
+      const activeProfile = WEATHER_PROFILES[sim.targetWeatherId] ?? WEATHER_PROFILES.clear;
+      const gripPct = Math.round(sim.weatherState.gripMultiplier * 100);
+      sim.lastReportedGripPct = gripPct;
+
       propsRef.current.onLiveStateChange({
         integrity: sim.integrity,
         maxIntegrity: sim.maxIntegrity,
@@ -625,7 +691,28 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
         totalRacers: 6,
         isDrifting: sim.isDrifting,
         driftScore: Math.floor(sim.driftScore),
+        weatherCondition: sim.targetWeatherId,
+        weatherLabel: activeProfile.name,
+        surfaceConditionLabel: activeProfile.surfaceConditionLabel,
+        trackGripPct: gripPct,
+        visibilityPct: sim.weatherState.visibilityPct,
       });
+    }
+
+    function applyWeatherTransition(nextWeather: WeatherConditionId, announceBanner: boolean) {
+      sim.targetWeatherId = nextWeather;
+      sim.weatherChangeTimer = 24 + Math.random() * 12;
+      const profile = WEATHER_PROFILES[nextWeather];
+      if (announceBanner && propsRef.current.gameState === 'playing') {
+        const gripPct = Math.round(profile.gripMultiplier * 100);
+        syncLiveHudSnapshot({
+          text: `WEATHER: ${profile.name.toUpperCase()}`,
+          subtext: `${profile.surfaceConditionLabel} · Track Grip ${gripPct}% · Visibility ${profile.visibilityPct}%`,
+          tone: nextWeather === 'snow' || nextWeather === 'rain' ? 'amber' : 'cyan',
+        });
+      } else {
+        syncLiveHudSnapshot();
+      }
     }
 
     function rebuildAiOpponentMeshes(opponents: AiOpponentState[]) {
@@ -698,6 +785,17 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       sim.defeatDelayTimer = 0;
       sim.elapsedRaceSec = 0;
       sim.playerPosition = 6;
+      sim.weatherChangeTimer = 22 + Math.random() * 10;
+
+      const urlWeather = resolveUrlWeatherParam();
+      if (urlWeather) {
+        sim.targetWeatherId = urlWeather;
+        sim.weatherState = createInitialWeatherState(urlWeather);
+      } else if (!sim.weatherLockedByUser) {
+        const nextRandWeather = selectNextRandomWeather(sim.targetWeatherId);
+        sim.targetWeatherId = nextRandWeather;
+        sim.weatherState = createInitialWeatherState(nextRandWeather);
+      }
 
       for (const t of trafficPool) {
         t.active = false;
@@ -756,6 +854,17 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
     propsRef.current.controlsRef.current.triggerRevive = reviveCurrentRun;
     propsRef.current.controlsRef.current.rotateGarageTurntable = (deltaRad: number) => {
       sim.garageYawRad += deltaRad;
+    };
+    propsRef.current.controlsRef.current.cycleWeather = () => {
+      const idx = WEATHER_ORDER.indexOf(sim.targetWeatherId);
+      const next = WEATHER_ORDER[(idx + 1) % WEATHER_ORDER.length];
+      sim.weatherLockedByUser = true;
+      applyWeatherTransition(next, true);
+      return next;
+    };
+    propsRef.current.controlsRef.current.setWeatherCondition = (cond: WeatherConditionId) => {
+      sim.weatherLockedByUser = true;
+      applyWeatherTransition(cond, true);
     };
 
     // Keyboard & Turntable Drag Listeners
@@ -1040,6 +1149,25 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
 
         sim.elapsedRaceSec += dt;
 
+        // Dynamic Random Weather Progression (cycles every ~25-35s unless locked)
+        if (!sim.weatherLockedByUser) {
+          sim.weatherChangeTimer -= dt;
+          if (sim.weatherChangeTimer <= 0) {
+            const nextRandom = selectNextRandomWeather(sim.targetWeatherId);
+            applyWeatherTransition(nextRandom, true);
+          }
+        }
+        sim.weatherState = stepWeatherInterpolation(
+          sim.weatherState,
+          sim.targetWeatherId,
+          dt,
+          0.65
+        );
+        const currentGripPct = Math.round(sim.weatherState.gripMultiplier * 100);
+        if (Math.abs(currentGripPct - sim.lastReportedGripPct) >= 2) {
+          syncLiveHudSnapshot();
+        }
+
         // 1. Evaluate Steering Input
         let kbSteer = 0;
         if (keysPressed.has('ArrowLeft') || keysPressed.has('KeyA')) kbSteer -= 1;
@@ -1088,7 +1216,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
           }
         }
 
-        // 2. Longitudinal Physics (Automatic Acceleration, Braking, Nitro)
+        // 2. Longitudinal Physics (Automatic Acceleration, Weather-Adjusted Braking, Nitro)
         const nitroWanted =
           keysPressed.has('Space') ||
           keysPressed.has('KeyW') ||
@@ -1099,13 +1227,22 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
           keysPressed.has('ArrowDown') ||
           controlsRef.current.brakeHeld;
 
+        const weatherEffectiveStats = {
+          ...effectiveStats,
+          brakingDecelMs2:
+            effectiveStats.brakingDecelMs2 * sim.weatherState.brakingMultiplier,
+          accelRateMs2:
+            effectiveStats.accelRateMs2 *
+            (0.88 + 0.12 * sim.weatherState.gripMultiplier),
+        };
+
         const longStep = stepLongitudinalPhysics({
           currentSpeedMs: sim.speedMs,
           nitroAmount: sim.nitroAmount,
           isNitroActive: sim.isNitroActive,
           nitroWanted,
           brakeWanted,
-          effectiveStats,
+          effectiveStats: weatherEffectiveStats,
           dt,
         });
 
@@ -1123,7 +1260,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
           sim.topSpeedReachedKmh = currentSpeedKmh;
         }
 
-        // 3. Track Curvature, Centrifugal Force & Drift Detection (Levels Mode)
+        // 3. Track Curvature, Weather Track Grip, Centrifugal Slip & Drift Detection
         let currentCurvature = 0;
         if (playMode === 'levels') {
           const sample = sampleTrackAtDistance(sim.activeCourse, sim.distanceMeters);
@@ -1144,14 +1281,29 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
 
         const centrifugalPull =
           playMode === 'levels'
-            ? -currentCurvature * Math.max(0, (sim.speedMs - 20) / 45) * 4.2
+            ? -currentCurvature *
+              Math.max(0, (sim.speedMs - 20) / 45) *
+              4.2 *
+              sim.weatherState.centrifugalMultiplier
             : 0;
 
-        const targetLatVel = activeSteerInput * effectiveStats.handling + centrifugalPull;
+        // Crosswind and low-grip surface micro-drift at high speed in Rain or Snow
+        const crosswindPush =
+          sim.weatherState.windLateralMs *
+          0.18 *
+          Math.max(0, (sim.speedMs - 22) / 40);
+
+        const targetLatVel =
+          activeSteerInput *
+            effectiveStats.handling *
+            sim.weatherState.gripMultiplier +
+          centrifugalPull +
+          crosswindPush;
+
         sim.lateralVelocity = THREE.MathUtils.damp(
           sim.lateralVelocity,
           targetLatVel,
-          14,
+          sim.weatherState.lateralDampRate,
           dt
         );
         sim.playerX = THREE.MathUtils.clamp(
@@ -1162,19 +1314,27 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
 
         playerAnchor.position.x = sim.playerX;
 
-        // Genuine Drift Detection when cornering hard through curves
+        // Genuine Drift Detection (curves in Levels Mode OR low-grip wet/icy powerslides)
         const absCurve = Math.abs(currentCurvature);
         const absSteer = Math.abs(activeSteerInput);
         const wasDrifting = sim.isDrifting;
-        sim.isDrifting =
+        const curveDrift =
           playMode === 'levels' &&
-          absCurve >= 0.32 &&
-          sim.speedMs > 30 &&
-          absSteer >= 0.35 &&
+          absCurve >= 0.32 * sim.weatherState.driftThresholdScale &&
+          sim.speedMs > 28 &&
+          absSteer >= 0.32;
+        const slickWeatherPowerslide =
+          sim.weatherState.gripMultiplier <= 0.85 &&
+          sim.speedMs > 34 &&
+          absSteer >= 0.72 &&
+          Math.abs(sim.lateralVelocity) > 4.2;
+
+        sim.isDrifting =
+          (curveDrift || slickWeatherPowerslide) &&
           Math.abs(sim.playerX) < HIGHWAY_CONFIG.playerBoundX - 0.15;
 
         if (sim.isDrifting) {
-          sim.driftScore += dt * 125 * (1 + absCurve);
+          sim.driftScore += dt * 125 * (1 + absCurve + (1 - sim.weatherState.gripMultiplier));
           sim.nitroAmount = Math.min(1, sim.nitroAmount + dt * 0.055);
           sim.driftAudioCooldown -= dt;
           if (sim.driftAudioCooldown <= 0) {
@@ -1185,6 +1345,16 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
             spawnParticleBurst(sim.playerX - 0.7, 0.15, 1.35, 1, 0xf59e0b, 3.2);
             spawnParticleBurst(sim.playerX + 0.7, 0.15, 1.35, 1, 0x38bdf8, 3.2);
           }
+        }
+        // Wet / snowy rear tire rooster-tail spray at speed
+        if (
+          sim.speedMs > 24 &&
+          (sim.targetWeatherId === 'rain' || sim.targetWeatherId === 'snow') &&
+          Math.random() < 0.42
+        ) {
+          const sprayColor = sim.targetWeatherId === 'snow' ? 0xe0f2fe : 0x7dd3fc;
+          spawnParticleBurst(sim.playerX - 0.68, 0.12, 1.85, 1, sprayColor, 2.2);
+          spawnParticleBurst(sim.playerX + 0.68, 0.12, 1.85, 1, sprayColor, 2.2);
         }
         if (wasDrifting !== sim.isDrifting) {
           syncLiveHudSnapshot();
@@ -1791,6 +1961,112 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       }
       particleInst.instanceMatrix.needsUpdate = true;
       if (particleInst.instanceColor) particleInst.instanceColor.needsUpdate = true;
+
+      // Update Atmosphere, Road Surface Wetness/Ice & 3D Weather Precipitation
+      const isGaragePreview =
+        currentProps.gameState === 'title' && currentProps.isGarageOpen;
+      const effectiveWeatherId: WeatherConditionId = isGaragePreview
+        ? 'clear'
+        : sim.targetWeatherId;
+      const targetWeatherProfile =
+        WEATHER_PROFILES[effectiveWeatherId] ?? WEATHER_PROFILES.clear;
+
+      const envLerp = Math.min(1, dt * 2.5);
+      if (scene.fog instanceof THREE.FogExp2) {
+        scene.fog.density = isGaragePreview
+          ? THREE.MathUtils.damp(scene.fog.density, 0.0038, 5, dt)
+          : sim.weatherState.fogDensity;
+        _targetFogColor.setHex(targetWeatherProfile.fogColorHex);
+        scene.fog.color.lerp(_targetFogColor, envLerp);
+      }
+
+      _targetSkyColor.setHex(targetWeatherProfile.hemiSkyHex);
+      _targetGroundColor.setHex(targetWeatherProfile.hemiGroundHex);
+      hemiLight.color.lerp(_targetSkyColor, envLerp);
+      hemiLight.groundColor.lerp(_targetGroundColor, envLerp);
+      hemiLight.intensity = isGaragePreview
+        ? 1.45
+        : sim.weatherState.hemiIntensity;
+      sunLight.intensity = isGaragePreview
+        ? 2.6
+        : sim.weatherState.sunIntensity;
+      renderer.toneMappingExposure = isGaragePreview
+        ? 1.2
+        : sim.weatherState.exposure;
+
+      roadMat.roughness = isGaragePreview ? 0.65 : sim.weatherState.roadRoughness;
+      roadMat.metalness = isGaragePreview ? 0.18 : sim.weatherState.roadMetalness;
+      _targetRoadTint.setHex(targetWeatherProfile.roadTintHex);
+      roadMat.color.lerp(_targetRoadTint, envLerp);
+
+      const activePrecipCount =
+        isGaragePreview || showTunnels ? 0 : targetWeatherProfile.particleCount;
+      const precipType = targetWeatherProfile.precipitationType;
+      weatherDropMat.opacity =
+        precipType === 'rain' ? 0.72 : precipType === 'snow' ? 0.86 : 0.22;
+      const forwardRushSpeed =
+        currentProps.gameState === 'playing' ? sim.speedMs * 0.62 : 14;
+
+      for (let i = 0; i < maxWeatherParticles; i++) {
+        if (i >= activePrecipCount || precipType === 'none') {
+          _dummy.position.set(0, -60, 0);
+          _dummy.scale.set(0.001, 0.001, 0.001);
+          _dummy.updateMatrix();
+          weatherPrecipInst.setMatrixAt(i, _dummy.matrix);
+          continue;
+        }
+
+        const wp = weatherParticles[i];
+        if (precipType === 'rain') {
+          wp.x += sim.weatherState.windLateralMs * dt;
+          wp.y -= 28 * wp.speedScale * dt;
+          wp.z += forwardRushSpeed * dt;
+        } else if (precipType === 'snow') {
+          const swirl = Math.sin(now * 0.0028 + wp.phase) * 2.4;
+          wp.x += (sim.weatherState.windLateralMs + swirl) * dt;
+          wp.y -= 5.6 * wp.speedScale * dt;
+          wp.z += forwardRushSpeed * 0.65 * dt;
+        } else {
+          // Dense metro fog drifting mist motes
+          wp.x += Math.cos(now * 0.0014 + wp.phase) * 1.1 * dt;
+          wp.y -= 0.6 * dt;
+          wp.z += forwardRushSpeed * 0.55 * dt;
+        }
+
+        // Wrap particles smoothly inside the active camera volume
+        if (wp.y < 0.05) {
+          wp.y = 13.5 + (Math.random() * 1.5);
+          wp.x = sim.playerX + (Math.random() - 0.5) * 32;
+        }
+        if (wp.z > 9) {
+          wp.z = -64 - Math.random() * 8;
+          wp.x = sim.playerX + (Math.random() - 0.5) * 32;
+        }
+        if (wp.x > sim.playerX + 18) wp.x -= 36;
+        if (wp.x < sim.playerX - 18) wp.x += 36;
+
+        _dummy.position.set(wp.x, wp.y, wp.z);
+        if (precipType === 'rain') {
+          _dummy.rotation.set(0.32, 0, -sim.weatherState.windLateralMs * 0.04);
+          _dummy.scale.set(0.032, 0.96, 0.032);
+          _color.setHex(0xbae6fd);
+        } else if (precipType === 'snow') {
+          _dummy.rotation.set(now * 0.002 + wp.phase, wp.phase, 0);
+          _dummy.scale.set(0.11, 0.11, 0.11);
+          _color.setHex(0xf8fafc);
+        } else {
+          _dummy.rotation.set(0, wp.phase, 0);
+          _dummy.scale.set(0.55, 0.08, 0.55);
+          _color.setHex(0x94a3b8);
+        }
+        _dummy.updateMatrix();
+        weatherPrecipInst.setMatrixAt(i, _dummy.matrix);
+        weatherPrecipInst.setColorAt(i, _color);
+      }
+      weatherPrecipInst.instanceMatrix.needsUpdate = true;
+      if (weatherPrecipInst.instanceColor) {
+        weatherPrecipInst.instanceColor.needsUpdate = true;
+      }
 
       // --- C. SMOOTH LANDSCAPE CAMERA RIG CHOREOGRAPHY ---
       sim.cameraTrauma = Math.max(0, sim.cameraTrauma - dt * 2.2);

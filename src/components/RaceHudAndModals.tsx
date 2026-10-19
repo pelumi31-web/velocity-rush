@@ -25,6 +25,8 @@ interface RaceHudAndModalsProps {
   onRequestMotionPermission: () => void;
   isMuted: boolean;
   onToggleMute: () => void;
+  musicTrackTitle?: string;
+  onCycleMusicTrack?: () => void;
   onPauseToggle: () => void;
   onRestartRace: () => void;
   onNextLevel?: () => void;
@@ -52,6 +54,8 @@ export const RaceHudAndModals: React.FC<RaceHudAndModalsProps> = ({
   onRequestMotionPermission,
   isMuted,
   onToggleMute,
+  musicTrackTitle,
+  onCycleMusicTrack,
   onPauseToggle,
   onRestartRace,
   onNextLevel,
@@ -274,8 +278,54 @@ export const RaceHudAndModals: React.FC<RaceHudAndModalsProps> = ({
           </div>
         </div>
 
-        {/* Top-Center Transient Countdown, Course Progress & Drift / Near-Miss Callout */}
+        {/* Top-Center Transient Countdown, Weather/Grip Telemetry, Course Progress & Callouts */}
         <div className="flex flex-col items-center gap-1.5 pointer-events-none">
+          <button
+            type="button"
+            data-testid="hud-weather-btn"
+            onClick={(e) => {
+              e.currentTarget.blur();
+              soundController.playButtonClick();
+              controlsRef.current.cycleWeather?.();
+            }}
+            title="Click to cycle Weather Condition (Clear / Rain / Fog / Snow)"
+            className="pointer-events-auto bg-[#0b0f19]/90 hover:bg-slate-800/90 border border-slate-800 rounded-xl px-3 py-1 shadow-lg flex items-center gap-2 text-[10px] sm:text-[11px] font-bold tracking-wider uppercase transition-colors cursor-pointer"
+          >
+            <span className="text-cyan-400">
+              {liveSnapshot.weatherCondition === 'rain'
+                ? '🌧 RAIN'
+                : liveSnapshot.weatherCondition === 'fog'
+                  ? '🌫 FOG'
+                  : liveSnapshot.weatherCondition === 'snow'
+                    ? '❄ SNOW'
+                    : '☀ CLEAR'}
+            </span>
+            <span className="text-slate-600" aria-hidden="true">
+              ·
+            </span>
+            <span
+              data-testid="hud-grip-pct"
+              className={
+                (liveSnapshot.trackGripPct ?? 100) < 80
+                  ? 'text-amber-400 font-mono'
+                  : (liveSnapshot.trackGripPct ?? 100) < 95
+                    ? 'text-cyan-300 font-mono'
+                    : 'text-emerald-400 font-mono'
+              }
+            >
+              GRIP {liveSnapshot.trackGripPct ?? 100}%
+            </span>
+            <span className="text-slate-600 hidden sm:inline" aria-hidden="true">
+              ·
+            </span>
+            <span
+              data-testid="hud-visibility-pct"
+              className="text-slate-300 font-mono hidden sm:inline"
+            >
+              VIS {liveSnapshot.visibilityPct ?? 100}%
+            </span>
+          </button>
+
           {isLevels && (
             <div className="bg-[#0b0f19]/88 border border-slate-800 px-3 py-1 rounded-xl flex flex-col items-center gap-1 min-w-[180px] sm:min-w-[230px]">
               <div className="flex items-center justify-between w-full text-[10px] font-bold">
@@ -364,6 +414,24 @@ export const RaceHudAndModals: React.FC<RaceHudAndModalsProps> = ({
           </div>
 
           <div className="flex items-center gap-1.5">
+            {onCycleMusicTrack && (
+              <button
+                type="button"
+                aria-label={`Switch Soundtrack (${musicTrackTitle ?? 'Cyber Overdrive'})`}
+                title={`Switch Soundtrack: ${musicTrackTitle ?? 'Cyber Overdrive'}`}
+                onClick={(e) => {
+                  e.currentTarget.blur();
+                  onCycleMusicTrack();
+                }}
+                className="h-10 sm:h-11 px-2.5 rounded-xl bg-[#0b0f19]/90 hover:bg-slate-800 border border-cyan-500/40 flex items-center justify-center gap-1 text-cyan-300 text-xs font-bold cursor-pointer"
+              >
+                <span aria-hidden="true">♪</span>
+                <span className="hidden md:inline max-w-[90px] truncate">
+                  {musicTrackTitle ?? 'Track'}
+                </span>
+              </button>
+            )}
+
             <button
               type="button"
               aria-label={isMuted ? 'Unmute Audio' : 'Mute Audio'}
@@ -494,14 +562,26 @@ export const RaceHudAndModals: React.FC<RaceHudAndModalsProps> = ({
                   steerGestureRef.current.activePointerId = null;
                   applySteeringHoldState(false, false);
                 }}
-                className={`w-16 h-12 sm:w-20 sm:h-14 rounded-xl border font-bold text-xs sm:text-sm flex items-center justify-center gap-1 shadow-lg cursor-pointer select-none touch-none transition-colors ${
+                className={`w-16 h-12 sm:w-20 sm:h-14 rounded-xl border font-bold flex items-center justify-center shadow-lg cursor-pointer select-none touch-none transition-all ${
                   activeSteerUi.left
-                    ? 'bg-cyan-500 text-slate-950 border-cyan-300 shadow-cyan-500/30'
+                    ? 'bg-cyan-500 text-slate-950 border-cyan-300 shadow-cyan-500/30 scale-95'
                     : 'bg-[#0b0f19]/90 text-slate-100 border-slate-700 hover:border-slate-600'
                 }`}
               >
-                <span aria-hidden="true">◀</span>
-                <span>LEFT</span>
+                <svg
+                  viewBox="0 0 24 24"
+                  className="w-7 h-7 sm:w-8 sm:h-8"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth={2.75}
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M15 18l-6-6 6-6" />
+                  <path d="M9 12h10" />
+                </svg>
+                <span className="sr-only">Steer Left</span>
               </button>
               <button
                 type="button"
@@ -528,14 +608,26 @@ export const RaceHudAndModals: React.FC<RaceHudAndModalsProps> = ({
                   steerGestureRef.current.activePointerId = null;
                   applySteeringHoldState(false, false);
                 }}
-                className={`w-16 h-12 sm:w-20 sm:h-14 rounded-xl border font-bold text-xs sm:text-sm flex items-center justify-center gap-1 shadow-lg cursor-pointer select-none touch-none transition-colors ${
+                className={`w-16 h-12 sm:w-20 sm:h-14 rounded-xl border font-bold flex items-center justify-center shadow-lg cursor-pointer select-none touch-none transition-all ${
                   activeSteerUi.right
-                    ? 'bg-cyan-500 text-slate-950 border-cyan-300 shadow-cyan-500/30'
+                    ? 'bg-cyan-500 text-slate-950 border-cyan-300 shadow-cyan-500/30 scale-95'
                     : 'bg-[#0b0f19]/90 text-slate-100 border-slate-700 hover:border-slate-600'
                 }`}
               >
-                <span>RIGHT</span>
-                <span aria-hidden="true">▶</span>
+                <svg
+                  viewBox="0 0 24 24"
+                  className="w-7 h-7 sm:w-8 sm:h-8"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth={2.75}
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M9 18l6-6-6-6" />
+                  <path d="M15 12H5" />
+                </svg>
+                <span className="sr-only">Steer Right</span>
               </button>
             </div>
 

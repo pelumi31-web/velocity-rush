@@ -46,6 +46,7 @@ import {
   SaveGameData,
   UserSettingsData,
 } from '../game/saveSystem';
+import { MUSIC_TRACKS, MusicTrackId, MusicTrackMeta } from '../game/audio';
 
 export type SubModalType =
   | 'none'
@@ -94,6 +95,11 @@ interface TitleAndMenusProps {
   onRequestMotionPermission: () => void;
   onToggleFullscreen: () => void;
   onRotateTurntable: (deltaRad: number) => void;
+  musicTrack?: MusicTrackMeta;
+  isMuted?: boolean;
+  onCycleMusicTrack?: () => void;
+  onSelectMusicTrack?: (trackId: MusicTrackId) => void;
+  onToggleMute?: () => void;
   feedbackNotice: string | null;
   onTriggerFeedbackNotice: (msg: string) => void;
 }
@@ -117,6 +123,11 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
   onRequestMotionPermission,
   onToggleFullscreen,
   onRotateTurntable,
+  musicTrack,
+  isMuted = false,
+  onCycleMusicTrack,
+  onSelectMusicTrack,
+  onToggleMute,
   feedbackNotice,
   onTriggerFeedbackNotice,
 }) => {
@@ -247,11 +258,33 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
           </div>
         </div>
 
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1.5 shrink-0">
+          {onCycleMusicTrack && (
+            <button
+              type="button"
+              data-testid="menu-cycle-music-btn"
+              onClick={onCycleMusicTrack}
+              title="Switch Intense Soundtrack Theme (Shortcut: T)"
+              className="bg-[#0b0f19]/90 hover:bg-slate-800/90 border border-cyan-500/40 text-cyan-300 px-2.5 py-1.5 rounded-xl text-xs font-semibold transition-colors cursor-pointer flex items-center gap-1 whitespace-nowrap shrink-0"
+            >
+              <span aria-hidden="true">♪</span>
+              <span className="hidden sm:inline">{musicTrack?.title ?? 'Cyber Overdrive'}</span>
+            </button>
+          )}
+          {onToggleMute && (
+            <button
+              type="button"
+              aria-label={isMuted ? 'Unmute Audio' : 'Mute Audio'}
+              onClick={onToggleMute}
+              className="bg-[#0b0f19]/90 hover:bg-slate-800/90 border border-slate-800 text-slate-200 px-2.5 py-1.5 rounded-xl text-xs font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0"
+            >
+              {isMuted ? 'Muted' : 'Audio On'}
+            </button>
+          )}
           <button
             type="button"
             onClick={onToggleFullscreen}
-            className="bg-[#0b0f19]/90 hover:bg-slate-800/90 border border-slate-800 text-slate-200 px-2.5 py-1.5 rounded-xl text-xs font-medium transition-colors cursor-pointer"
+            className="bg-[#0b0f19]/90 hover:bg-slate-800/90 border border-slate-800 text-slate-200 px-2.5 py-1.5 rounded-xl text-xs font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0"
           >
             Fullscreen
           </button>
@@ -1668,8 +1701,38 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
 
             <div className="space-y-2.5 bg-slate-900/75 border border-slate-800 rounded-xl p-3">
               <div className="font-bold text-slate-200 uppercase tracking-wider">
-                Audio, Graphics & Privacy
+                Audio, Soundtrack & Graphics
               </div>
+
+              {onSelectMusicTrack && (
+                <div>
+                  <label className="block text-slate-400 mb-1">
+                    Intense Racing Soundtrack
+                  </label>
+                  <div className="grid grid-cols-1 gap-1.5">
+                    {MUSIC_TRACKS.map((tr) => {
+                      const active = (musicTrack?.id ?? 'cyber_overdrive') === tr.id;
+                      return (
+                        <button
+                          key={tr.id}
+                          type="button"
+                          onClick={() => onSelectMusicTrack(tr.id)}
+                          className={`py-1.5 px-2.5 rounded-lg text-left border transition flex items-center justify-between cursor-pointer ${
+                            active
+                              ? 'bg-cyan-400/20 border-cyan-400 text-cyan-200 font-bold'
+                              : 'bg-slate-950 border-slate-800 text-slate-300 hover:border-slate-700'
+                          }`}
+                        >
+                          <span>♪ {tr.title}</span>
+                          <span className="text-[10px] font-mono opacity-80">
+                            {tr.genre}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
 
               <div>
                 <div className="flex justify-between text-slate-300 mb-1">
