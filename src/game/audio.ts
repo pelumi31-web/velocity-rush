@@ -324,6 +324,59 @@ class SoundController {
       osc.stop(now + (isGo ? 0.3 : 0.16));
     } catch {}
   }
+
+  public playDriftPulse(): void {
+    const ctx = this.ensureContext();
+    if (!ctx || !this.sfxGain || this.isMuted) return;
+    const now = ctx.currentTime;
+
+    try {
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'bandpass';
+      filter.frequency.setValueAtTime(1180, now);
+      filter.Q.value = 4.5;
+
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(340 + Math.random() * 60, now);
+      osc.frequency.exponentialRampToValueAtTime(280, now + 0.12);
+
+      g.gain.setValueAtTime(0.14, now);
+      g.gain.exponentialRampToValueAtTime(0.001, now + 0.13);
+
+      osc.connect(filter);
+      filter.connect(g);
+      g.connect(this.sfxGain);
+      osc.start(now);
+      osc.stop(now + 0.14);
+    } catch {}
+  }
+
+  public playRaceFinish(isWin: boolean): void {
+    const ctx = this.ensureContext();
+    if (!ctx || !this.sfxGain || this.isMuted) return;
+    const now = ctx.currentTime;
+
+    const notes = isWin ? [523.25, 659.25, 783.99, 1046.5] : [440, 392, 349.23];
+    notes.forEach((freq, idx) => {
+      try {
+        const osc = ctx.createOscillator();
+        const g = ctx.createGain();
+        osc.type = 'triangle';
+        const startT = now + idx * 0.085;
+        osc.frequency.setValueAtTime(freq, startT);
+
+        g.gain.setValueAtTime(0.28, startT);
+        g.gain.exponentialRampToValueAtTime(0.001, startT + 0.25);
+
+        osc.connect(g);
+        g.connect(this.sfxGain!);
+        osc.start(startT);
+        osc.stop(startT + 0.26);
+      } catch {}
+    });
+  }
 }
 
 export const soundController = new SoundController();

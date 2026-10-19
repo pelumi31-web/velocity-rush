@@ -3,7 +3,9 @@ import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import {
   CAR_CONFIGS,
+  CAR_ORDER,
   CarId,
+  GamePlayMode,
   GraphicsQuality,
   HIGHWAY_CONFIG,
   SensitivityLevel,
@@ -11,24 +13,48 @@ import {
 } from '../game/config';
 import {
   calculateRunRewards,
+  CarProtectionMap,
   CarUpgradesMap,
+  computeLandscapeTiltDegreesFromSensors,
   evaluateVehicleInteraction,
   getEffectiveCarStats,
   processTiltInput,
   RunRewardsSummary,
   selectFairTrafficLanes,
+  stepLongitudinalPhysics,
 } from '../game/rules';
 import {
-  buildCoinPickupMesh,
+  AiOpponentState,
+  calculateLevelRaceRewards,
+  computeRaceStandings,
+  createLevelAiOpponents,
+  GeneratedLevelCourse,
+  generateLevelCourse,
+  LevelHazardType,
+  LevelRaceRewardsBreakdown,
+  RacerStandingEntry,
+  sampleTrackAtDistance,
+  stepAiOpponent,
+} from '../game/levelsMode';
+import { CarCustomizationState, createDefaultCarCustomization } from '../game/saveSystem';
+import { soundController } from '../game/audio';
+import {
+  applyCarCustomizationToRig,
+  buildCoinCollectibleMesh,
+  buildLevelObstacleMesh,
   buildPlayerCarMesh,
+  buildStartFinishGantryMesh,
   buildTrafficVehicleMesh,
+  createCityBuildingTexture,
   createRoadTextures,
+  createSkyBackdropTexture,
   PlayerCarMeshRig,
   TrafficArchetype,
 } from '../game/models3d';
-import { soundController } from '../game/audio';
 
 export type GameLifecycleState = 'title' | 'playing' | 'paused' | 'gameover';
+
+export type MotionPermissionState = 'unknown' | 'granted' | 'denied' | 'unsupported';
 
 export interface HudDomRefs {
   speedValueRef: React.RefObject<HTMLSpanElement | null>;
@@ -38,6 +64,10 @@ export interface HudDomRefs {
   nitroFillRef: React.RefObject<HTMLDivElement | null>;
   nitroPctRef: React.RefObject<HTMLSpanElement | null>;
   tiltAngleBadgeRef: React.RefObject<HTMLSpanElement | null>;
+  steerIndicatorBarRef: React.RefObject<HTMLDivElement | null>;
+  racePositionValueRef?: React.RefObject<HTMLSpanElement | null>;
+  remainingDistValueRef?: React.RefObject<HTMLSpanElement | null>;
+  levelProgressFillRef?: React.RefObject<HTMLDivElement | null>;
 }
 
 export interface LiveRaceSnapshot {
@@ -47,35 +77,63 @@ export interface LiveRaceSnapshot {
   nearMissCount: number;
   comboBanner: { text: string; subtext: string; id: number; tone: 'cyan' | 'amber' | 'danger' } | null;
   reviveUsed: boolean;
+  playMode?: GamePlayMode;
+  levelNumber?: number;
+  levelTitle?: string;
+  segmentLabel?: string;
+  playerPosition?: number; // 1..6
+  totalRacers?: number;    // 6
+  isDrifting?: boolean;
+  driftScore?: number;
 }
 
 export interface CompletedRunPayload {
   runId: string;
+  playMode: GamePlayMode;
   summary: RunRewardsSummary;
   nearMissCount: number;
   topSpeedKmh: number;
   reviveAvailable: boolean;
+  levelResult?: {
+    course: GeneratedLevelCourse;
+    standings: RacerStandingEntry[];
+    playerPosition: number;
+    playerFinishedCourse: boolean;
+    finishTimeSec: number;
+    rewards: LevelRaceRewardsBreakdown;
+    driftScore: number;
+    collisionsCount: number;
+  };
 }
 
 export interface TouchInputControlsRef {
   steerLeftHeld: boolean;
   steerRightHeld: boolean;
+  steerTapImpulse?: number;
+  steerTapRemainingSec?: number;
+  steerLongPressActive?: boolean;
   nitroHeld: boolean;
   brakeHeld: boolean;
   dragSteerNormalized: number;
   simulatedTiltDeg: number;
   lastRawDeviceTiltDeg: number;
   hasRealDeviceOrientation: boolean;
+  motionPermissionState: MotionPermissionState;
   triggerRevive?: () => void;
   triggerRestart?: () => void;
   rotateGarageTurntable?: (deltaRad: number) => void;
+  requestMotionPermission?: () => Promise<boolean>;
 }
 
 interface HighwayCanvasProps {
   gameState: GameLifecycleState;
+  playMode?: GamePlayMode;
+  levelNumber?: number;
   isGarageOpen: boolean;
   selectedCarId: CarId;
-  carUpgrades: CarUpgradesMap;
+  carUpgrades: Record<CarId, CarUpgradesMap>;
+  carProtection?: Record<CarId, CarProtectionMap>;
+  carCustomizations?: Record<CarId, CarCustomizationState>;
   steeringMode: SteeringMode;
   sensitivity: SensitivityLevel;
   invertTilt: boolean;
@@ -122,306 +180,267 @@ interface ParticleData {
   colorHex: number;
 }
 
-// Module-scope reusable scratch objects (Zero-GC render loop)
-const _dummy = new THREE.Object3D();
-const _color = new THREE.Color();
-const _targetCamPos = new THREE.Vector3();
-const _currentCamLook = new THREE.Vector3(0, 1.1, -18);
-const _desiredCamLook = new THREE.Vector3();
+const TRAFFIC_COLORS = [
+  0xe2e8f0, 0x38bdf8, 0xf59e0b, 0xef4444, 0x10b981, 0xa855f7, 0x64748b, 0xf97316,
+];
 
-export const HighwayCanvas: React.FC<HighwayCanvasProps> = ({
-  gameState,
-  isGarageOpen,
-  selectedCarId,
-  carUpgrades,
-  steeringMode,
-  sensitivity,
-  invertTilt,
-  neutralTiltOffsetDeg,
-  graphicsQuality,
-  hudRefs,
-  controlsRef,
-  onLiveStateChange,
-  onRunEnded,
-  onRequestPauseToggle,
-  onSensorFallbackNotice,
-}) => {
-  const mountRef = useRef<HTMLDivElement | null>(null);
+const TRAFFIC_SPECS: Record<
+  TrafficArchetype,
+  { halfWidth: number; halfLength: number; minSpeedMs: number; maxSpeedMs: number }
+> = {
+  sedan: { halfWidth: 0.92, halfLength: 2.18, minSpeedMs: 22, maxSpeedMs: 32 },
+  suv: { halfWidth: 1.0, halfLength: 2.3, minSpeedMs: 20, maxSpeedMs: 29 },
+  sport: { halfWidth: 0.94, halfLength: 2.15, minSpeedMs: 28, maxSpeedMs: 39 },
+  truck: { halfWidth: 1.15, halfLength: 3.55, minSpeedMs: 17, maxSpeedMs: 24 },
+};
 
-  // Store latest React props in ref so 60Hz loop always reads fresh state without re-mounting WebGL
-  const propsRef = useRef({
-    gameState,
-    isGarageOpen,
-    selectedCarId,
-    carUpgrades,
-    steeringMode,
-    sensitivity,
-    invertTilt,
-    neutralTiltOffsetDeg,
-    graphicsQuality,
-    hudRefs,
-    onLiveStateChange,
-    onRunEnded,
-    onRequestPauseToggle,
-    onSensorFallbackNotice,
-  });
+function getScreenOrientationDegrees(): number {
+  if (typeof window === 'undefined') return 0;
+  if (window.screen?.orientation && typeof window.screen.orientation.angle === 'number') {
+    return window.screen.orientation.angle;
+  }
+  const legacyOrient = (window as unknown as { orientation?: number }).orientation;
+  if (typeof legacyOrient === 'number') {
+    return legacyOrient;
+  }
+  return window.innerWidth >= window.innerHeight ? 90 : 0;
+}
+
+export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const propsRef = useRef<HighwayCanvasProps>(props);
+  propsRef.current = props;
 
   useEffect(() => {
-    propsRef.current = {
-      gameState,
-      isGarageOpen,
-      selectedCarId,
-      carUpgrades,
-      steeringMode,
-      sensitivity,
-      invertTilt,
-      neutralTiltOffsetDeg,
-      graphicsQuality,
-      hudRefs,
-      onLiveStateChange,
-      onRunEnded,
-      onRequestPauseToggle,
-      onSensorFallbackNotice,
-    };
-  });
-
-  useEffect(() => {
-    const container = mountRef.current;
+    const container = containerRef.current;
     if (!container) return;
 
-    const isHeadless =
-      navigator.webdriver || /HeadlessChrome/i.test(navigator.userAgent);
+    const quality = propsRef.current.graphicsQuality;
+    const renderer = new THREE.WebGLRenderer({
+      antialias: quality !== 'low',
+      powerPreference: 'high-performance',
+    });
 
-    // 1. Scene, Camera, Renderer Setup
-    const scene = new THREE.Scene();
-    const horizonHex = 0x090d18;
-    scene.background = new THREE.Color(horizonHex);
-    scene.fog = new THREE.FogExp2(horizonHex, 0.0085);
-
-    const camera = new THREE.PerspectiveCamera(
-      62,
-      Math.max(1, container.clientWidth) / Math.max(1, container.clientHeight),
-      0.2,
-      240
-    );
-    camera.position.set(0, 3.6, 7.2);
-
-    let renderer: THREE.WebGLRenderer;
-    try {
-      renderer = new THREE.WebGLRenderer({
-        antialias: !isHeadless && propsRef.current.graphicsQuality !== 'low',
-        powerPreference: 'high-performance',
-        preserveDrawingBuffer: isHeadless,
-      });
-    } catch {
-      return;
-    }
-
-    renderer.outputColorSpace = THREE.SRGBColorSpace;
-    renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.12;
+    const maxDpr = quality === 'high' ? 2 : quality === 'medium' ? 1.5 : 1.0;
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, maxDpr));
     renderer.setSize(container.clientWidth || window.innerWidth, container.clientHeight || window.innerHeight);
-    renderer.setPixelRatio(
-      isHeadless
-        ? 1
-        : Math.min(window.devicePixelRatio, propsRef.current.graphicsQuality === 'low' ? 1 : 2)
-    );
-    renderer.shadowMap.enabled = !isHeadless && propsRef.current.graphicsQuality === 'high';
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.18;
+    renderer.shadowMap.enabled = quality !== 'low';
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
+    renderer.domElement.style.width = '100%';
+    renderer.domElement.style.height = '100%';
+    renderer.domElement.style.display = 'block';
     container.innerHTML = '';
-    renderer.domElement.setAttribute('data-testid', 'highway-canvas');
-    renderer.domElement.className = 'w-full h-full block outline-none';
     container.appendChild(renderer.domElement);
 
-    // Studio PBR environment reflections via RoomEnvironment
-    const pmremGenerator = new THREE.PMREMGenerator(renderer);
-    const envTarget = pmremGenerator.fromScene(new RoomEnvironment(), 0.04);
-    scene.environment = envTarget.texture;
-    pmremGenerator.dispose();
+    const scene = new THREE.Scene();
+    scene.background = createSkyBackdropTexture();
+    scene.fog = new THREE.FogExp2(0x111a2e, 0.0042);
 
-    // 2. Warm/Cool Lighting Rig
-    const hemiLight = new THREE.HemisphereLight(0x38bdf8, 0x0f172a, 0.85);
-    hemiLight.position.set(0, 40, 0);
+    const pmremGenerator = new THREE.PMREMGenerator(renderer);
+    scene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
+    scene.environmentIntensity = 0.85;
+
+    const camera = new THREE.PerspectiveCamera(
+      58,
+      (container.clientWidth || window.innerWidth) /
+        Math.max(1, container.clientHeight || window.innerHeight),
+      0.2,
+      280
+    );
+    camera.position.set(0, 3.1, 6.8);
+
+    // Lighting
+    const hemiLight = new THREE.HemisphereLight(0xdbeafe, 0x1e293b, 1.35);
     scene.add(hemiLight);
 
-    const keyLight = new THREE.DirectionalLight(0xffedd5, 1.9);
-    keyLight.position.set(14, 26, 18);
-    if (!isHeadless) {
-      keyLight.castShadow = true;
-      keyLight.shadow.mapSize.set(1024, 1024);
-      const d = 16;
-      keyLight.shadow.camera.left = -d;
-      keyLight.shadow.camera.right = d;
-      keyLight.shadow.camera.top = d;
-      keyLight.shadow.camera.bottom = -d;
-      keyLight.shadow.camera.near = 1;
-      keyLight.shadow.camera.far = 65;
-      keyLight.shadow.bias = -0.0005;
+    const sunLight = new THREE.DirectionalLight(0xfffbeb, 2.5);
+    sunLight.position.set(22, 42, 26);
+    if (quality !== 'low') {
+      sunLight.castShadow = true;
+      sunLight.shadow.mapSize.set(1024, 1024);
+      sunLight.shadow.camera.near = 2;
+      sunLight.shadow.camera.far = 130;
+      const d = 24;
+      sunLight.shadow.camera.left = -d;
+      sunLight.shadow.camera.right = d;
+      sunLight.shadow.camera.top = d;
+      sunLight.shadow.camera.bottom = -d;
+      sunLight.shadow.bias = -0.0005;
     }
-    scene.add(keyLight);
+    scene.add(sunLight);
 
-    const rimLight = new THREE.DirectionalLight(0x06b6d4, 0.9);
-    rimLight.position.set(-12, 10, -20);
+    const rimLight = new THREE.DirectionalLight(0x38bdf8, 1.25);
+    rimLight.position.set(-18, 12, -24);
     scene.add(rimLight);
 
-    // 3. Highway Road & Infinite Scenery Setup
-    const maxAniso = renderer.capabilities.getMaxAnisotropy();
+    // Road & Environment
+    const maxAniso = Math.min(8, renderer.capabilities.getMaxAnisotropy());
     const { albedoMap, roughnessMap } = createRoadTextures(maxAniso);
-    albedoMap.repeat.set(1, 18);
-    roughnessMap.repeat.set(2, 18);
+    albedoMap.repeat.set(1, 20);
+    roughnessMap.repeat.set(1, 20);
 
-    const roadLength = 280;
-    const roadGeo = new THREE.PlaneGeometry(HIGHWAY_CONFIG.roadWidth, roadLength);
+    const roadGeo = new THREE.PlaneGeometry(HIGHWAY_CONFIG.roadWidth, 320, 1, 24);
     roadGeo.rotateX(-Math.PI / 2);
     const roadMat = new THREE.MeshStandardMaterial({
-      color: 0xffffff,
       map: albedoMap,
       roughnessMap,
       roughness: 0.72,
-      metalness: 0.18,
+      metalness: 0.14,
     });
     const roadMesh = new THREE.Mesh(roadGeo, roadMat);
-    roadMesh.position.set(0, 0, -roadLength * 0.38);
+    roadMesh.position.set(0, 0, -110);
     roadMesh.receiveShadow = true;
     scene.add(roadMesh);
 
-    // Outer terrain apron so road never floats in an empty void
-    const apronGeo = new THREE.PlaneGeometry(240, roadLength);
-    apronGeo.rotateX(-Math.PI / 2);
-    const apronMat = new THREE.MeshStandardMaterial({
-      color: 0x070a12,
-      roughness: 0.95,
-      metalness: 0.05,
-    });
-    const apronMesh = new THREE.Mesh(apronGeo, apronMat);
-    apronMesh.position.set(0, -0.04, -roadLength * 0.38);
-    scene.add(apronMesh);
+    const groundPlane = new THREE.Mesh(
+      new THREE.PlaneGeometry(520, 380),
+      new THREE.MeshStandardMaterial({ color: 0x0b101d, roughness: 0.95 })
+    );
+    groundPlane.rotation.x = -Math.PI / 2;
+    groundPlane.position.set(0, -0.06, -120);
+    scene.add(groundPlane);
 
-    // Highway Concrete Guardrails & Glowing Barrier Strips
-    const barrierGeo = new THREE.BoxGeometry(0.55, 0.85, roadLength);
+    // Barriers
+    const barrierGeo = new THREE.BoxGeometry(0.65, 0.9, 320);
     const barrierMat = new THREE.MeshStandardMaterial({
       color: 0x1e293b,
-      roughness: 0.65,
-      metalness: 0.3,
+      roughness: 0.52,
+      metalness: 0.38,
     });
     const leftBarrier = new THREE.Mesh(barrierGeo, barrierMat);
-    leftBarrier.position.set(-HIGHWAY_CONFIG.roadWidth * 0.5 - 0.3, 0.425, -roadLength * 0.38);
+    leftBarrier.position.set(-HIGHWAY_CONFIG.roadWidth * 0.5 - 0.32, 0.45, -110);
     const rightBarrier = new THREE.Mesh(barrierGeo, barrierMat);
-    rightBarrier.position.set(HIGHWAY_CONFIG.roadWidth * 0.5 + 0.3, 0.425, -roadLength * 0.38);
+    rightBarrier.position.set(HIGHWAY_CONFIG.roadWidth * 0.5 + 0.32, 0.45, -110);
     scene.add(leftBarrier, rightBarrier);
 
-    const railGlowGeo = new THREE.BoxGeometry(0.12, 0.1, roadLength);
-    const leftRailGlow = new THREE.Mesh(
-      railGlowGeo,
-      new THREE.MeshBasicMaterial({ color: 0xf59e0b })
+    const stripGeo = new THREE.BoxGeometry(0.1, 0.1, 320);
+    const leftStrip = new THREE.Mesh(
+      stripGeo,
+      new THREE.MeshStandardMaterial({
+        color: 0xf59e0b,
+        emissive: 0xf59e0b,
+        emissiveIntensity: 2.2,
+      })
     );
-    leftRailGlow.position.set(-HIGHWAY_CONFIG.roadWidth * 0.5, 0.72, -roadLength * 0.38);
-    const rightRailGlow = new THREE.Mesh(
-      railGlowGeo,
-      new THREE.MeshBasicMaterial({ color: 0x06b6d4 })
+    leftStrip.position.set(-HIGHWAY_CONFIG.roadWidth * 0.5 + 0.03, 0.76, -110);
+
+    const rightStrip = new THREE.Mesh(
+      stripGeo,
+      new THREE.MeshStandardMaterial({
+        color: 0x06b6d4,
+        emissive: 0x06b6d4,
+        emissiveIntensity: 2.2,
+      })
     );
-    rightRailGlow.position.set(HIGHWAY_CONFIG.roadWidth * 0.5, 0.72, -roadLength * 0.38);
-    scene.add(leftRailGlow, rightRailGlow);
+    rightStrip.position.set(HIGHWAY_CONFIG.roadWidth * 0.5 - 0.03, 0.76, -110);
+    scene.add(leftStrip, rightStrip);
 
-    // Instanced Roadside Light Arches & City Skyline Towers (Lossless Performance)
-    const archCount = 24;
-    const pillarGeo = new THREE.BoxGeometry(0.35, 7.5, 0.35);
-    const pillarMat = new THREE.MeshStandardMaterial({
-      color: 0x334155,
-      metalness: 0.6,
-      roughness: 0.4,
-    });
-    const archPillarsInst = new THREE.InstancedMesh(pillarGeo, pillarMat, archCount * 2);
-    archPillarsInst.frustumCulled = false;
-    scene.add(archPillarsInst);
-
-    const lampHeadGeo = new THREE.BoxGeometry(1.8, 0.18, 0.35);
-    const lampHeadMat = new THREE.MeshBasicMaterial({ color: 0x38bdf8 });
-    const lampHeadsInst = new THREE.InstancedMesh(lampHeadGeo, lampHeadMat, archCount * 2);
-    lampHeadsInst.frustumCulled = false;
-    scene.add(lampHeadsInst);
-
-    // Distant City Skyline Towers (InstancedMesh with per-instance color & scale variation)
-    const towerCount = 44;
-    const towerGeo = new THREE.BoxGeometry(1, 1, 1);
-    towerGeo.translate(0, 0.5, 0); // Bottom-center pivot
-    const towerMat = new THREE.MeshStandardMaterial({
-      color: 0xffffff,
-      roughness: 0.5,
-      metalness: 0.4,
-    });
-    const towersInst = new THREE.InstancedMesh(towerGeo, towerMat, towerCount);
-    towersInst.frustumCulled = false;
-
-    const towerMeta: { side: number; xOffset: number; zOffset: number; w: number; h: number; d: number }[] = [];
-    const paletteHex = [0x0f172a, 0x1e293b, 0x172554, 0x0c4a6e, 0x1e1b4b];
-    for (let i = 0; i < towerCount; i++) {
-      const side = i % 2 === 0 ? -1 : 1;
-      const xOffset = side * (16 + ((i * 7) % 28));
-      const zOffset = -180 + (i / towerCount) * 240;
-      const w = 5 + (i % 6) * 1.6;
-      const h = 14 + ((i * 13) % 38);
-      const d = 5 + ((i * 3) % 6) * 1.5;
-      towerMeta.push({ side, xOffset, zOffset, w, h, d });
-      _color.setHex(paletteHex[i % paletteHex.length]);
-      towersInst.setColorAt(i, _color);
-    }
-    if (towersInst.instanceColor) towersInst.instanceColor.needsUpdate = true;
-    scene.add(towersInst);
-
-    // Showroom Garage Turntable Ring (visible when Garage is open)
+    // Showroom Pedestal Ring (visible when Garage is open)
     const turntableGroup = new THREE.Group();
-    const padGeo = new THREE.CylinderGeometry(3.4, 3.7, 0.18, 36);
-    const padMat = new THREE.MeshStandardMaterial({
-      color: 0x111827,
-      metalness: 0.7,
-      roughness: 0.25,
-    });
-    const padMesh = new THREE.Mesh(padGeo, padMat);
-    padMesh.position.y = -0.08;
-    turntableGroup.add(padMesh);
-
-    const ringGeo = new THREE.RingGeometry(3.25, 3.42, 48);
-    ringGeo.rotateX(-Math.PI / 2);
-    const ringMesh = new THREE.Mesh(
-      ringGeo,
-      new THREE.MeshBasicMaterial({ color: 0x06b6d4, side: THREE.DoubleSide })
+    const platformDisc = new THREE.Mesh(
+      new THREE.CylinderGeometry(3.25, 3.45, 0.12, 48),
+      new THREE.MeshStandardMaterial({
+        color: 0x0f172a,
+        metalness: 0.82,
+        roughness: 0.2,
+      })
     );
-    ringMesh.position.y = 0.025;
-    turntableGroup.add(ringMesh);
+    platformDisc.position.y = 0.02;
+    const platformGlowRing = new THREE.Mesh(
+      new THREE.TorusGeometry(3.32, 0.055, 12, 48),
+      new THREE.MeshStandardMaterial({
+        color: 0x38bdf8,
+        emissive: 0x06b6d4,
+        emissiveIntensity: 2.5,
+      })
+    );
+    platformGlowRing.rotation.x = Math.PI / 2;
+    platformGlowRing.position.y = 0.07;
+    turntableGroup.add(platformDisc, platformGlowRing);
     turntableGroup.visible = false;
     scene.add(turntableGroup);
 
-    // 4. Build All 4 Player Car Rigs Upfront (Zero runtime allocations on car switch)
-    const playerCarRigs: Record<CarId, PlayerCarMeshRig> = {
-      starter_apex: buildPlayerCarMesh(CAR_CONFIGS.starter_apex),
-      vortex_interceptor: buildPlayerCarMesh(CAR_CONFIGS.vortex_interceptor),
-      nebula_hyper: buildPlayerCarMesh(CAR_CONFIGS.nebula_hyper),
-      titan_enforcer: buildPlayerCarMesh(CAR_CONFIGS.titan_enforcer),
-    };
+    // Streetlight Arches & City Towers
+    const archCount = 22;
+    const pillarGeo = new THREE.BoxGeometry(0.32, 7.8, 0.32);
+    const pillarMat = new THREE.MeshStandardMaterial({
+      color: 0x1e293b,
+      metalness: 0.65,
+      roughness: 0.35,
+    });
+    const archPillarsInst = new THREE.InstancedMesh(pillarGeo, pillarMat, archCount * 2);
+    scene.add(archPillarsInst);
 
-    const playerAnchor = new THREE.Group();
-    scene.add(playerAnchor);
-    (Object.keys(playerCarRigs) as CarId[]).forEach((cid) => {
-      playerCarRigs[cid].group.visible = cid === propsRef.current.selectedCarId;
-      playerAnchor.add(playerCarRigs[cid].group);
+    const lampHeadGeo = new THREE.BoxGeometry(2.1, 0.16, 0.38);
+    const lampHeadMat = new THREE.MeshStandardMaterial({
+      color: 0xe0f2fe,
+      emissive: 0x38bdf8,
+      emissiveIntensity: 2.4,
+    });
+    const lampHeadsInst = new THREE.InstancedMesh(lampHeadGeo, lampHeadMat, archCount * 2);
+    scene.add(lampHeadsInst);
+
+    // Overhead Tunnel Ceiling Rings for Levels Mode Tunnel Segments
+    const tunnelRingCount = 14;
+    const tunnelRoofGeo = new THREE.BoxGeometry(HIGHWAY_CONFIG.roadWidth + 1.5, 0.55, 6.5);
+    const tunnelRoofMat = new THREE.MeshStandardMaterial({
+      color: 0x0f172a,
+      roughness: 0.65,
+      metalness: 0.4,
+    });
+    const tunnelRoofInst = new THREE.InstancedMesh(tunnelRoofGeo, tunnelRoofMat, tunnelRingCount);
+    scene.add(tunnelRoofInst);
+
+    const buildingTex = createCityBuildingTexture(maxAniso);
+    const towerCount = 48;
+    const towerGeo = new THREE.BoxGeometry(1, 1, 1);
+    towerGeo.translate(0, 0.5, 0);
+    const towerMat = new THREE.MeshStandardMaterial({
+      map: buildingTex,
+      roughness: 0.38,
+      metalness: 0.55,
+    });
+    const towersInst = new THREE.InstancedMesh(towerGeo, towerMat, towerCount);
+    scene.add(towersInst);
+
+    const towerMeta = Array.from({ length: towerCount }, (_, i) => {
+      const side = i % 2 === 0 ? -1 : 1;
+      const row = Math.floor(i / 2);
+      return {
+        side,
+        xOffset: side * (16 + ((i * 7) % 18)),
+        zOffset: -row * 10.5,
+        w: 8 + ((i * 5) % 9),
+        h: 22 + ((i * 13) % 52),
+        d: 8 + ((i * 3) % 9),
+      };
     });
 
-    // 5. Object Pools: Traffic Vehicles, Coins, and Particle Ring Buffer
-    const trafficArchetypes: { type: TrafficArchetype; color: number; hw: number; hl: number }[] = [
-      { type: 'sedan', color: 0x64748b, hw: 0.95, hl: 2.1 },
-      { type: 'suv', color: 0x3b82f6, hw: 0.98, hl: 2.15 },
-      { type: 'sport', color: 0xe11d48, hw: 0.95, hl: 2.1 },
-      { type: 'truck', color: 0xd97706, hw: 1.05, hl: 2.6 },
-      { type: 'sedan', color: 0xcbd5e1, hw: 0.95, hl: 2.1 },
-      { type: 'suv', color: 0x0d9488, hw: 0.98, hl: 2.15 },
-    ];
+    // Build all 8 Player Car Rigs so switching vehicles in the Garage or Race is instantaneous!
+    const playerAnchor = new THREE.Group();
+    scene.add(playerAnchor);
 
+    const carRigs = {} as Record<CarId, PlayerCarMeshRig>;
+    for (const cId of CAR_ORDER) {
+      const rig = buildPlayerCarMesh(CAR_CONFIGS[cId]);
+      rig.group.visible = cId === propsRef.current.selectedCarId;
+      const initCust =
+        propsRef.current.carCustomizations?.[cId] ?? createDefaultCarCustomization();
+      applyCarCustomizationToRig(rig, CAR_CONFIGS[cId], initCust);
+      playerAnchor.add(rig.group);
+      carRigs[cId] = rig;
+    }
+
+    // Solo Mode Traffic & Coin Object Pools
+    const archetypes: TrafficArchetype[] = ['sedan', 'suv', 'sport', 'truck'];
     const trafficPool: PooledTrafficItem[] = [];
-    for (let i = 0; i < 14; i++) {
-      const spec = trafficArchetypes[i % trafficArchetypes.length];
-      const mesh = buildTrafficVehicleMesh(spec.type, spec.color);
+    for (let i = 0; i < 20; i++) {
+      const arch = archetypes[i % archetypes.length];
+      const color = TRAFFIC_COLORS[i % TRAFFIC_COLORS.length];
+      const mesh = buildTrafficVehicleMesh(arch, color);
       mesh.visible = false;
       scene.add(mesh);
       trafficPool.push({
@@ -430,16 +449,16 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = ({
         laneIndex: 0,
         x: 0,
         z: -200,
-        speedMs: 22,
-        halfWidth: spec.hw,
-        halfLength: spec.hl,
+        speedMs: 25,
+        halfWidth: TRAFFIC_SPECS[arch].halfWidth,
+        halfLength: TRAFFIC_SPECS[arch].halfLength,
         nearMissScored: false,
       });
     }
 
     const coinPool: PooledCoinItem[] = [];
-    for (let i = 0; i < 18; i++) {
-      const mesh = buildCoinPickupMesh();
+    for (let i = 0; i < 26; i++) {
+      const mesh = buildCoinCollectibleMesh();
       mesh.visible = false;
       scene.add(mesh);
       coinPool.push({
@@ -450,12 +469,43 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = ({
       });
     }
 
-    // Zero-GC Particle Pool (InstancedMesh)
-    const maxParticles = 48;
-    const partGeo = new THREE.BoxGeometry(0.14, 0.14, 0.42);
-    const partMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
-    const particleInst = new THREE.InstancedMesh(partGeo, partMat, maxParticles);
-    particleInst.frustumCulled = false;
+    // Levels Mode 3D Scene Objects: Start/Finish Gantries, 5 AI Opponent Car Rigs, and Course Obstacles
+    const startGantryMesh = buildStartFinishGantryMesh(false);
+    startGantryMesh.visible = false;
+    scene.add(startGantryMesh);
+
+    const finishGantryMesh = buildStartFinishGantryMesh(true);
+    finishGantryMesh.visible = false;
+    scene.add(finishGantryMesh);
+
+    const aiOpponentRigs: PlayerCarMeshRig[] = [];
+    for (let i = 0; i < 5; i++) {
+      const defaultCarId = CAR_ORDER[(i + 1) % CAR_ORDER.length];
+      const rig = buildPlayerCarMesh(CAR_CONFIGS[defaultCarId]);
+      rig.group.visible = false;
+      scene.add(rig.group);
+      aiOpponentRigs.push(rig);
+    }
+
+    const levelObstaclePool: {
+      mesh: THREE.Group;
+      type: LevelHazardType;
+    }[] = [];
+    const hazardTypes: LevelHazardType[] = ['barrier_block', 'chevron_chicane', 'energy_pylon'];
+    for (let i = 0; i < 18; i++) {
+      const hType = hazardTypes[i % hazardTypes.length];
+      const mesh = buildLevelObstacleMesh(hType);
+      mesh.visible = false;
+      scene.add(mesh);
+      levelObstaclePool.push({ mesh, type: hType });
+    }
+
+    // Particle Pool
+    const maxParticles = 60;
+    const particleGeo = new THREE.BoxGeometry(0.14, 0.14, 0.42);
+    const particleMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+    const particleInst = new THREE.InstancedMesh(particleGeo, particleMat, maxParticles);
+    particleInst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     scene.add(particleInst);
 
     const particles: ParticleData[] = Array.from({ length: maxParticles }, () => ({
@@ -467,119 +517,188 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = ({
       vy: 0,
       vz: 0,
       life: 0,
-      maxLife: 0.4,
+      maxLife: 0.5,
       scale: 1,
       colorHex: 0x38bdf8,
     }));
-    let particleCursor = 0;
 
     function spawnParticleBurst(
-      x: number,
-      y: number,
-      z: number,
+      originX: number,
+      originY: number,
+      originZ: number,
       count: number,
       colorHex: number,
       spreadSpeed: number
     ) {
-      for (let i = 0; i < count; i++) {
-        const p = particles[particleCursor];
-        particleCursor = (particleCursor + 1) % maxParticles;
-        p.active = true;
-        p.x = x + (Math.random() - 0.5) * 0.6;
-        p.y = y + (Math.random() - 0.5) * 0.3;
-        p.z = z + (Math.random() - 0.5) * 0.6;
-        p.vx = (Math.random() - 0.5) * spreadSpeed;
-        p.vy = Math.random() * spreadSpeed * 0.7 + 1.2;
-        p.vz = Math.random() * spreadSpeed + 6;
-        p.life = 0;
-        p.maxLife = 0.28 + Math.random() * 0.25;
-        p.scale = 0.7 + Math.random() * 0.8;
-        p.colorHex = colorHex;
+      let spawned = 0;
+      for (let i = 0; i < maxParticles && spawned < count; i++) {
+        if (!particles[i].active) {
+          const p = particles[i];
+          p.active = true;
+          p.x = originX + (Math.random() - 0.5) * 0.6;
+          p.y = originY + Math.random() * 0.4;
+          p.z = originZ + (Math.random() - 0.5) * 0.5;
+          p.vx = (Math.random() - 0.5) * spreadSpeed;
+          p.vy = Math.random() * spreadSpeed * 0.65 + 1.0;
+          p.vz = (Math.random() - 0.2) * spreadSpeed + 4.5;
+          p.life = 0;
+          p.maxLife = 0.26 + Math.random() * 0.28;
+          p.scale = 0.7 + Math.random() * 0.8;
+          p.colorHex = colorHex;
+          spawned++;
+        }
       }
     }
 
-    // Pre-compile shaders once to avoid first-frame stutter
-    renderer.compile(scene, camera);
+    // Pre-allocated temporaries
+    const _dummy = new THREE.Object3D();
+    const _color = new THREE.Color();
+    const _targetCamPos = new THREE.Vector3();
+    const _currentCamLook = new THREE.Vector3(0, 1.0, -18);
+    const _desiredCamLook = new THREE.Vector3(0, 1.0, -18);
 
-    // 6. Mutable Simulation State
+    // Simulation State
     const sim = {
-      previousGameState: 'title' as GameLifecycleState,
-      runIdCounter: 1,
-      currentRunId: 'run-init',
-      playerX: -1.75,
-      lateralVelocity: 0,
-      speedMs: 24,
-      topSpeedReachedKmh: 86,
+      runId: `run_${Date.now()}`,
+      speedMs: HIGHWAY_CONFIG.launchSpeedKmh / 3.6,
+      topSpeedReachedKmh: HIGHWAY_CONFIG.launchSpeedKmh,
       distanceMeters: 0,
       coinsCollected: 0,
       nearMissCount: 0,
       bonusScore: 0,
+      driftScore: 0,
+      isDrifting: false,
+      driftAudioCooldown: 0,
+      collisionsCount: 0,
+      integrity: HIGHWAY_CONFIG.maxHullIntegrity,
+      maxIntegrity: HIGHWAY_CONFIG.maxHullIntegrity,
+      cleanDriveShieldTimer: 0,
       nitroAmount: 1.0,
       isNitroActive: false,
-      integrity: HIGHWAY_CONFIG.maxHullIntegrity,
-      invulnerableTimer: 0,
-      hitstopTimer: 0,
-      defeatDelayTimer: 0,
-      isDying: false,
-      reviveUsed: false,
-      countdownTimer: 0,
-      lastReportedCountdown: null as number | null,
-      scrollOffsetZ: 0,
-      spawnWaveCooldownZ: 30,
-      coinSpawnCooldownZ: 18,
+      playerX: -1.8,
+      lateralVelocity: 0,
       filteredTiltSteer: 0,
-      cameraTrauma: 0,
-      garageYawRad: 0.55,
-      titleOrbitTime: 0,
+      invulnerableTimer: 0,
       shieldFlashTimer: 0,
+      hitstopTimer: 0,
+      cameraTrauma: 0,
+      countdownTimer: 2.4,
+      lastCountdownInt: 3 as number | null,
+      trafficSpawnTimer: 0.5,
+      coinSpawnTimer: 0.9,
+      scrollOffsetZ: 0,
+      visualCurveFactor: 0,
+      reviveUsed: false,
+      isDying: false,
+      defeatDelayTimer: 0,
       bannerIdCounter: 1,
+      titleOrbitTime: 0,
+      garageYawRad: 0.58,
+      garageSwapScale: 1.0,
+      lastInspectedCarId: propsRef.current.selectedCarId,
+      // Levels Mode active course & 5 AI opponents
+      activeCourse: generateLevelCourse(propsRef.current.levelNumber ?? 1),
+      aiOpponents: [] as AiOpponentState[],
+      elapsedRaceSec: 0,
+      playerPosition: 6,
+      lastSegmentLabel: 'Starting Grid',
     };
 
     function syncLiveHudSnapshot(
-      banner?: { text: string; subtext: string; tone: 'cyan' | 'amber' | 'danger' } | null
+      banner?: { text: string; subtext: string; tone: 'cyan' | 'amber' | 'danger' }
     ) {
+      const mode = propsRef.current.playMode ?? 'solo';
       propsRef.current.onLiveStateChange({
         integrity: sim.integrity,
-        maxIntegrity: HIGHWAY_CONFIG.maxHullIntegrity,
-        countdownValue: sim.lastReportedCountdown,
+        maxIntegrity: sim.maxIntegrity,
+        countdownValue: sim.lastCountdownInt,
         nearMissCount: sim.nearMissCount,
         comboBanner: banner
-          ? { ...banner, id: ++sim.bannerIdCounter }
+          ? { ...banner, id: sim.bannerIdCounter++ }
           : null,
         reviveUsed: sim.reviveUsed,
+        playMode: mode,
+        levelNumber: sim.activeCourse.levelNumber,
+        levelTitle: sim.activeCourse.title,
+        segmentLabel: sim.lastSegmentLabel,
+        playerPosition: sim.playerPosition,
+        totalRacers: 6,
+        isDrifting: sim.isDrifting,
+        driftScore: Math.floor(sim.driftScore),
       });
     }
 
+    function rebuildAiOpponentMeshes(opponents: AiOpponentState[]) {
+      for (let i = 0; i < 5; i++) {
+        const opp = opponents[i];
+        const oldRig = aiOpponentRigs[i];
+        scene.remove(oldRig.group);
+        if (opp) {
+          const newRig = buildPlayerCarMesh(CAR_CONFIGS[opp.carId]);
+          newRig.paintMaterial.color.setHex(opp.paintColorHex);
+          newRig.group.visible = false;
+          scene.add(newRig.group);
+          aiOpponentRigs[i] = newRig;
+        }
+      }
+    }
+
     function resetRaceSimulation() {
-      sim.runIdCounter++;
-      sim.currentRunId = `run-${Date.now()}-${sim.runIdCounter}`;
-      sim.playerX = -1.75; // Spawn cleanly in Left-Center lane
-      sim.lateralVelocity = 0;
-      sim.speedMs = HIGHWAY_CONFIG.baseMinSpeedKmh / 3.6;
-      sim.topSpeedReachedKmh = HIGHWAY_CONFIG.baseMinSpeedKmh;
+      const currentCarId = propsRef.current.selectedCarId;
+      const currentUpgrades = propsRef.current.carUpgrades[currentCarId] ?? {
+        topSpeed: 0,
+        acceleration: 0,
+        handling: 0,
+        braking: 0,
+        nitro: 0,
+      };
+      const currentProt = propsRef.current.carProtection?.[currentCarId] ?? {
+        shieldCapacity: 0,
+        shieldDuration: 0,
+      };
+      const currentCust =
+        propsRef.current.carCustomizations?.[currentCarId] ??
+        createDefaultCarCustomization();
+      const effStats = getEffectiveCarStats(
+        currentCarId,
+        currentUpgrades,
+        currentCust.wheelId,
+        currentProt
+      );
+
+      sim.runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      sim.speedMs = HIGHWAY_CONFIG.launchSpeedKmh / 3.6;
+      sim.topSpeedReachedKmh = HIGHWAY_CONFIG.launchSpeedKmh;
       sim.distanceMeters = 0;
       sim.coinsCollected = 0;
       sim.nearMissCount = 0;
       sim.bonusScore = 0;
+      sim.driftScore = 0;
+      sim.isDrifting = false;
+      sim.collisionsCount = 0;
+      sim.maxIntegrity = effStats.maxShieldCharges;
+      sim.integrity = effStats.maxShieldCharges;
+      sim.cleanDriveShieldTimer = 0;
       sim.nitroAmount = 1.0;
       sim.isNitroActive = false;
-      sim.integrity = HIGHWAY_CONFIG.maxHullIntegrity;
-      sim.invulnerableTimer = 2.0; // Safe opening grace window
-      sim.hitstopTimer = 0;
-      sim.defeatDelayTimer = 0;
-      sim.isDying = false;
-      sim.reviveUsed = false;
-      sim.countdownTimer = 1.6; // Quick, snappy 3-2-1-GO!
-      sim.lastReportedCountdown = 3;
-      sim.spawnWaveCooldownZ = 35;
-      sim.coinSpawnCooldownZ = 16;
-      sim.cameraTrauma = 0;
+      sim.playerX = -1.8;
+      sim.lateralVelocity = 0;
+      sim.filteredTiltSteer = 0;
+      sim.invulnerableTimer = 0;
       sim.shieldFlashTimer = 0;
+      sim.hitstopTimer = 0;
+      sim.cameraTrauma = 0;
+      sim.countdownTimer = 2.4;
+      sim.lastCountdownInt = 3;
+      sim.trafficSpawnTimer = 0.5;
+      sim.coinSpawnTimer = 0.8;
+      sim.visualCurveFactor = 0;
+      sim.reviveUsed = false;
+      sim.isDying = false;
+      sim.defeatDelayTimer = 0;
+      sim.elapsedRaceSec = 0;
+      sim.playerPosition = 6;
 
-      playerAnchor.position.set(sim.playerX, 0, 0);
-      playerAnchor.rotation.set(0, 0, 0);
-
-      // Clear active traffic & coins and seed an initial open vista ahead
       for (const t of trafficPool) {
         t.active = false;
         t.mesh.visible = false;
@@ -588,313 +707,364 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = ({
         c.active = false;
         c.mesh.visible = false;
       }
+      for (const obs of levelObstaclePool) {
+        obs.mesh.visible = false;
+      }
 
-      // Spawn initial fair traffic vehicles well ahead (-75m and -125m)
-      spawnTrafficWaveAtZ(-75, 0.1);
-      spawnTrafficWaveAtZ(-125, 0.15);
-      spawnCoinLineAtZ(-48, 1);
-      spawnCoinLineAtZ(-95, 2);
+      const mode = propsRef.current.playMode ?? 'solo';
+      if (mode === 'levels') {
+        const lvl = propsRef.current.levelNumber ?? 1;
+        sim.activeCourse = generateLevelCourse(lvl);
+        sim.aiOpponents = createLevelAiOpponents(lvl, effStats.topSpeedMs);
+        sim.lastSegmentLabel = sim.activeCourse.segments[0]?.label ?? 'Starting Grid';
+        rebuildAiOpponentMeshes(sim.aiOpponents);
+      } else {
+        for (const rig of aiOpponentRigs) {
+          rig.group.visible = false;
+        }
+        startGantryMesh.visible = false;
+        finishGantryMesh.visible = false;
+      }
 
-      syncLiveHudSnapshot(null);
-      soundController.startEngine();
-      soundController.playCountdownTick(false);
+      syncLiveHudSnapshot();
     }
 
-    function performRevive() {
+    function reviveCurrentRun() {
       if (sim.reviveUsed) return;
       sim.reviveUsed = true;
+      sim.integrity = Math.min(sim.maxIntegrity, 2);
+      sim.invulnerableTimer = 3.0;
+      sim.shieldFlashTimer = 0.7;
       sim.isDying = false;
       sim.defeatDelayTimer = 0;
-      sim.hitstopTimer = 0;
-      sim.integrity = HIGHWAY_CONFIG.maxHullIntegrity;
-      sim.invulnerableTimer = 3.0;
-      sim.speedMs = Math.max(25, sim.speedMs * 0.75);
-      sim.nitroAmount = 1.0;
+      sim.speedMs = Math.max(sim.speedMs, 26);
 
-      // Clear any traffic within 65m of player so revive is 100% fair
       for (const t of trafficPool) {
-        if (t.active && t.z > -65) {
+        if (t.active && t.z > -75 && t.z < 20) {
           t.active = false;
           t.mesh.visible = false;
         }
       }
       syncLiveHudSnapshot({
-        text: 'HULL RESTORED',
-        subtext: 'Temporary Shield Active',
+        text: 'SHIELD RESTORED',
+        subtext: '3.0s Invulnerability Active',
         tone: 'cyan',
       });
-      soundController.startEngine();
-      soundController.playNitroActivate();
     }
 
-    controlsRef.current.triggerRevive = performRevive;
-    controlsRef.current.triggerRestart = resetRaceSimulation;
-    controlsRef.current.rotateGarageTurntable = (deltaRad: number) => {
+    propsRef.current.controlsRef.current.triggerRestart = resetRaceSimulation;
+    propsRef.current.controlsRef.current.triggerRevive = reviveCurrentRun;
+    propsRef.current.controlsRef.current.rotateGarageTurntable = (deltaRad: number) => {
       sim.garageYawRad += deltaRad;
     };
 
-    function spawnTrafficWaveAtZ(spawnZ: number, difficulty01: number) {
-      const lanes = selectFairTrafficLanes(HIGHWAY_CONFIG.laneCount, difficulty01);
-      for (const laneIdx of lanes) {
-        const laneX = HIGHWAY_CONFIG.laneCenters[laneIdx];
-        // Ensure no existing active traffic is too close in the same lane
-        const tooClose = trafficPool.some(
-          (t) =>
-            t.active &&
-            t.laneIndex === laneIdx &&
-            Math.abs(t.z - spawnZ) < HIGHWAY_CONFIG.minLongitudinalGap
-        );
-        if (tooClose) continue;
-
-        const freeSlot = trafficPool.find((t) => !t.active);
-        if (!freeSlot) break;
-
-        freeSlot.active = true;
-        freeSlot.laneIndex = laneIdx;
-        freeSlot.x = laneX;
-        freeSlot.z = spawnZ + (Math.random() - 0.5) * 6;
-        freeSlot.speedMs = 16 + Math.random() * 10 + difficulty01 * 8;
-        freeSlot.nearMissScored = false;
-        freeSlot.mesh.position.set(freeSlot.x, 0, freeSlot.z);
-        freeSlot.mesh.visible = true;
-      }
-    }
-
-    function spawnCoinLineAtZ(startZ: number, preferredLane?: number) {
-      const laneIdx =
-        preferredLane !== undefined
-          ? preferredLane
-          : Math.floor(Math.random() * HIGHWAY_CONFIG.laneCount);
-      const laneX = HIGHWAY_CONFIG.laneCenters[laneIdx];
-
-      for (let i = 0; i < 4; i++) {
-        const zPos = startZ - i * 5.2;
-        const blockedByTraffic = trafficPool.some(
-          (t) => t.active && Math.abs(t.x - laneX) < 1.2 && Math.abs(t.z - zPos) < 4.5
-        );
-        if (blockedByTraffic) continue;
-
-        const freeCoin = coinPool.find((c) => !c.active);
-        if (!freeCoin) break;
-        freeCoin.active = true;
-        freeCoin.x = laneX;
-        freeCoin.z = zPos;
-        freeCoin.mesh.position.set(freeCoin.x, 0, freeCoin.z);
-        freeCoin.mesh.visible = true;
-      }
-    }
-
-    // Seed ambient highway scene for Title Screen
-    spawnTrafficWaveAtZ(-45, 0.1);
-    spawnTrafficWaveAtZ(-95, 0.2);
-    spawnCoinLineAtZ(-35, 2);
-
-    // 7. Keyboard, DeviceOrientation Tilt, and Pointer Input Listeners
+    // Keyboard & Turntable Drag Listeners
     const keysPressed = new Set<string>();
-
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) {
-        return;
-      }
-      const code = e.code;
-      if (
-        code === 'ArrowLeft' ||
-        code === 'ArrowRight' ||
-        code === 'ArrowUp' ||
-        code === 'ArrowDown' ||
-        code === 'Space'
-      ) {
-        if (propsRef.current.gameState === 'playing') {
-          e.preventDefault();
-        }
-      }
-
-      if ((code === 'KeyP' || code === 'Escape') && !e.repeat) {
+      keysPressed.add(e.code);
+      if (e.code === 'Escape' || e.code === 'KeyP') {
         if (
           propsRef.current.gameState === 'playing' ||
           propsRef.current.gameState === 'paused'
         ) {
           propsRef.current.onRequestPauseToggle();
-          return;
         }
       }
-
-      keysPressed.add(code);
     };
-
     const onKeyUp = (e: KeyboardEvent) => {
       keysPressed.delete(e.code);
     };
-
-    const clearHeldInputs = () => {
-      keysPressed.clear();
-      controlsRef.current.steerLeftHeld = false;
-      controlsRef.current.steerRightHeld = false;
-      controlsRef.current.nitroHeld = false;
-      controlsRef.current.brakeHeld = false;
-      controlsRef.current.dragSteerNormalized = 0;
-    };
-
-    const onVisibilityChange = () => {
-      if (document.hidden) {
-        clearHeldInputs();
-        soundController.updateEngine(0, false, true);
-      }
-    };
-
-    // DeviceOrientation Sensor Listener for Mobile Tilt Steering
-    const onDeviceOrientation = (e: DeviceOrientationEvent) => {
-      if (e.beta === null && e.gamma === null) return;
-      controlsRef.current.hasRealDeviceOrientation = true;
-
-      // Determine landscape vs portrait axis safely across Android & iOS
-      const angle =
-        typeof window.screen?.orientation?.angle === 'number'
-          ? window.screen.orientation.angle
-          : 0;
-      let rawTilt = 0;
-      if (angle === 90) {
-        rawTilt = e.beta ?? 0;
-      } else if (angle === -90 || angle === 270) {
-        rawTilt = -(e.beta ?? 0);
-      } else {
-        // Default portrait or desktop orientation sensor emulation
-        rawTilt = e.gamma ?? e.beta ?? 0;
-      }
-      controlsRef.current.lastRawDeviceTiltDeg = Math.max(-60, Math.min(60, rawTilt));
-    };
-
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
-    window.addEventListener('blur', clearHeldInputs);
-    document.addEventListener('visibilitychange', onVisibilityChange);
-    window.addEventListener('deviceorientation', onDeviceOrientation);
 
-    // ResizeObserver for responsive full-viewport canvas
-    const updateCanvasSize = () => {
-      const w = Math.max(1, container.clientWidth || window.innerWidth);
+    let isDraggingTurntable = false;
+    let lastDragClientX = 0;
+    const onPointerDownCanvas = (e: PointerEvent) => {
+      if (propsRef.current.gameState === 'title') {
+        isDraggingTurntable = true;
+        lastDragClientX = e.clientX;
+      }
+    };
+    const onPointerMoveCanvas = (e: PointerEvent) => {
+      if (isDraggingTurntable && propsRef.current.gameState === 'title') {
+        const dx = e.clientX - lastDragClientX;
+        lastDragClientX = e.clientX;
+        sim.garageYawRad += dx * 0.012;
+      }
+    };
+    const onPointerUpCanvas = () => {
+      isDraggingTurntable = false;
+    };
+    renderer.domElement.addEventListener('pointerdown', onPointerDownCanvas);
+    window.addEventListener('pointermove', onPointerMoveCanvas);
+    window.addEventListener('pointerup', onPointerUpCanvas);
+
+    // Device Motion & Orientation Listeners
+    const handleDeviceOrientation = (e: DeviceOrientationEvent) => {
+      if (typeof e.gamma !== 'number' && typeof e.beta !== 'number') return;
+      const tiltDeg = computeLandscapeTiltDegreesFromSensors({
+        screenAngle: getScreenOrientationDegrees(),
+        accelIncludingGravity: null,
+        orientation: { beta: e.beta, gamma: e.gamma },
+      });
+      if (tiltDeg !== null) {
+        propsRef.current.controlsRef.current.hasRealDeviceOrientation = true;
+        propsRef.current.controlsRef.current.motionPermissionState = 'granted';
+        propsRef.current.controlsRef.current.lastRawDeviceTiltDeg = tiltDeg;
+      }
+    };
+
+    const handleDeviceMotion = (e: DeviceMotionEvent) => {
+      const acc = e.accelerationIncludingGravity;
+      if (!acc) return;
+      const tiltDeg = computeLandscapeTiltDegreesFromSensors({
+        screenAngle: getScreenOrientationDegrees(),
+        accelIncludingGravity: { x: acc.x, y: acc.y, z: acc.z },
+        orientation: null,
+      });
+      if (tiltDeg !== null) {
+        propsRef.current.controlsRef.current.hasRealDeviceOrientation = true;
+        propsRef.current.controlsRef.current.motionPermissionState = 'granted';
+        propsRef.current.controlsRef.current.lastRawDeviceTiltDeg = tiltDeg;
+      }
+    };
+
+    window.addEventListener('deviceorientation', handleDeviceOrientation, true);
+    window.addEventListener('devicemotion', handleDeviceMotion, true);
+
+    propsRef.current.controlsRef.current.requestMotionPermission = async () => {
+      try {
+        let granted = true;
+        const DevOrient = window.DeviceOrientationEvent as unknown as {
+          requestPermission?: () => Promise<'granted' | 'denied'>;
+        };
+        const DevMotion = window.DeviceMotionEvent as unknown as {
+          requestPermission?: () => Promise<'granted' | 'denied'>;
+        };
+
+        if (DevOrient && typeof DevOrient.requestPermission === 'function') {
+          const res = await DevOrient.requestPermission();
+          if (res !== 'granted') granted = false;
+        }
+        if (DevMotion && typeof DevMotion.requestPermission === 'function') {
+          const res = await DevMotion.requestPermission();
+          if (res !== 'granted') granted = false;
+        }
+
+        propsRef.current.controlsRef.current.motionPermissionState = granted
+          ? 'granted'
+          : 'denied';
+        return granted;
+      } catch {
+        propsRef.current.controlsRef.current.motionPermissionState = 'denied';
+        return false;
+      }
+    };
+
+    const handleResize = () => {
+      if (!container) return;
+      const w = container.clientWidth || window.innerWidth;
       const h = Math.max(1, container.clientHeight || window.innerHeight);
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
-      renderer.setSize(w, h, true);
+      renderer.setSize(w, h);
     };
-    const resizeObserver = new ResizeObserver(() => {
-      updateCanvasSize();
-    });
-    resizeObserver.observe(container);
-    window.addEventListener('resize', updateCanvasSize);
-    updateCanvasSize();
+    window.addEventListener('resize', handleResize);
+    window.addEventListener('orientationchange', handleResize);
 
-    // 8. Main Animation & Physics Loop
-    let rafId = 0;
-    let lastTimeMs = performance.now();
+    // Initialize if booting straight into playing
+    if (propsRef.current.gameState === 'playing') {
+      resetRaceSimulation();
+    }
+
+    let animationFrameId = 0;
+    let lastFrameTime = performance.now();
+    let prevGameState: GameLifecycleState = propsRef.current.gameState;
     let hudUpdateAccum = 0;
 
-    const animate = (nowMs: number) => {
-      rafId = requestAnimationFrame(animate);
+    const animate = (now: number) => {
+      animationFrameId = requestAnimationFrame(animate);
+
+      const rawDt = (now - lastFrameTime) / 1000;
+      lastFrameTime = now;
+      const dt = Math.min(rawDt, 0.05);
 
       const currentProps = propsRef.current;
-      const rawDt = (nowMs - lastTimeMs) / 1000;
-      // In headless Chromium, throttle render loop so software WebGL never blocks DOM click actionability
-      if (isHeadless) {
-        const minFrameInterval = currentProps.gameState === 'playing' ? 0.08 : 0.22;
-        if (rawDt < minFrameInterval) {
-          return;
+      const controlsRef = currentProps.controlsRef;
+      const playMode = currentProps.playMode ?? 'solo';
+
+      if (prevGameState !== 'playing' && currentProps.gameState === 'playing') {
+        if (prevGameState === 'title') {
+          resetRaceSimulation();
         }
       }
-      lastTimeMs = nowMs;
-      const dt = Math.min(Math.max(0.001, rawDt), 0.05);
+      prevGameState = currentProps.gameState;
 
-      // Detect state transition into 'playing' from 'title' or 'gameover'
-      if (
-        currentProps.gameState === 'playing' &&
-        sim.previousGameState !== 'playing' &&
-        sim.previousGameState !== 'paused'
-      ) {
-        resetRaceSimulation();
+      // Sync active car model & live customization
+      const selectedCarId = currentProps.selectedCarId;
+      if (sim.lastInspectedCarId !== selectedCarId) {
+        sim.lastInspectedCarId = selectedCarId;
+        sim.garageSwapScale = 0.86;
       }
-      sim.previousGameState = currentProps.gameState;
+      sim.garageSwapScale = THREE.MathUtils.damp(sim.garageSwapScale, 1.0, 14, dt);
 
-      // Toggle visible player car rig if selectedCarId changed
-      (Object.keys(playerCarRigs) as CarId[]).forEach((cid) => {
-        playerCarRigs[cid].group.visible = cid === currentProps.selectedCarId;
-      });
-      const activeCarRig = playerCarRigs[currentProps.selectedCarId];
+      const currentCust =
+        currentProps.carCustomizations?.[selectedCarId] ??
+        createDefaultCarCustomization();
 
-      // Update showroom turntable visibility
+      for (const cId of CAR_ORDER) {
+        const isCurrent = cId === selectedCarId;
+        carRigs[cId].group.visible = isCurrent;
+        if (isCurrent) {
+          applyCarCustomizationToRig(carRigs[cId], CAR_CONFIGS[cId], currentCust);
+          carRigs[cId].group.scale.setScalar(sim.garageSwapScale);
+        }
+      }
+      const activeCarRig = carRigs[selectedCarId];
+
       turntableGroup.visible =
         currentProps.gameState === 'title' && currentProps.isGarageOpen;
-      if (turntableGroup.visible) {
-        turntableGroup.position.set(playerAnchor.position.x, 0, playerAnchor.position.z);
-      }
+      turntableGroup.position.x = playerAnchor.position.x;
 
-      // Update countdown if in playing state
-      if (currentProps.gameState === 'playing' && sim.countdownTimer > 0) {
-        sim.countdownTimer = Math.max(0, sim.countdownTimer - dt);
-        const step =
-          sim.countdownTimer > 1.1
-            ? 3
-            : sim.countdownTimer > 0.6
-              ? 2
-              : sim.countdownTimer > 0.15
-                ? 1
-                : 0;
-        if (step !== sim.lastReportedCountdown) {
-          sim.lastReportedCountdown = step;
-          soundController.playCountdownTick(step === 0);
-          syncLiveHudSnapshot(null);
+      const currentUpgrades = currentProps.carUpgrades[selectedCarId] ?? {
+        topSpeed: 0,
+        acceleration: 0,
+        handling: 0,
+        braking: 0,
+        nitro: 0,
+      };
+      const currentProt = currentProps.carProtection?.[selectedCarId] ?? {
+        shieldCapacity: 0,
+        shieldDuration: 0,
+      };
+      const effectiveStats = getEffectiveCarStats(
+        selectedCarId,
+        currentUpgrades,
+        currentCust.wheelId,
+        currentProt
+      );
+
+      // --- A. ACTIVE RACE SIMULATION ---
+      if (currentProps.gameState === 'playing') {
+        if (sim.hitstopTimer > 0) {
+          sim.hitstopTimer -= dt;
+          renderer.render(scene, camera);
+          return;
         }
-        if (sim.countdownTimer === 0 && sim.lastReportedCountdown !== null) {
-          sim.lastReportedCountdown = null;
-          syncLiveHudSnapshot(null);
+
+        if (sim.isDying) {
+          sim.defeatDelayTimer -= dt;
+          sim.speedMs = Math.max(0, sim.speedMs - 38 * dt);
+          sim.scrollOffsetZ += sim.speedMs * dt;
+
+          if (sim.defeatDelayTimer <= 0) {
+            sim.isDying = false;
+            const summary = calculateRunRewards({
+              distanceMeters: sim.distanceMeters,
+              coinsCollected: sim.coinsCollected,
+              nearMissCount: sim.nearMissCount,
+              bonusScore: sim.bonusScore + Math.floor(sim.driftScore),
+            });
+
+            if (playMode === 'levels') {
+              const standings = computeRaceStandings({
+                playerCarId: selectedCarId,
+                playerDistanceMeters: sim.distanceMeters,
+                playerFinished: false,
+                playerFinishTimeSec: null,
+                opponents: sim.aiOpponents,
+                totalLengthMeters: sim.activeCourse.totalLengthMeters,
+              });
+              const pRank = standings.find((s) => s.isPlayer)?.position ?? 6;
+              const rewards = calculateLevelRaceRewards({
+                course: sim.activeCourse,
+                position: pRank,
+                coinsCollected: sim.coinsCollected,
+                driftScore: sim.driftScore,
+                collisionsCount: sim.collisionsCount,
+              });
+              currentProps.onRunEnded({
+                runId: sim.runId,
+                playMode: 'levels',
+                summary,
+                nearMissCount: sim.nearMissCount,
+                topSpeedKmh: Math.round(sim.topSpeedReachedKmh),
+                reviveAvailable: !sim.reviveUsed,
+                levelResult: {
+                  course: sim.activeCourse,
+                  standings,
+                  playerPosition: pRank,
+                  playerFinishedCourse: false,
+                  finishTimeSec: Number(sim.elapsedRaceSec.toFixed(2)),
+                  rewards,
+                  driftScore: Math.floor(sim.driftScore),
+                  collisionsCount: sim.collisionsCount,
+                },
+              });
+            } else {
+              currentProps.onRunEnded({
+                runId: sim.runId,
+                playMode: 'solo',
+                summary,
+                nearMissCount: sim.nearMissCount,
+                topSpeedKmh: Math.round(sim.topSpeedReachedKmh),
+                reviveAvailable: !sim.reviveUsed,
+              });
+            }
+          }
+          renderer.render(scene, camera);
+          return;
         }
-      }
 
-      // Hitstop & Defeat transition handling
-      if (sim.hitstopTimer > 0) {
-        sim.hitstopTimer = Math.max(0, sim.hitstopTimer - dt);
-      }
-
-      if (sim.isDying && currentProps.gameState === 'playing') {
-        sim.defeatDelayTimer = Math.max(0, sim.defeatDelayTimer - dt);
-        if (sim.defeatDelayTimer === 0) {
-          sim.isDying = false;
-          soundController.updateEngine(0, false, true);
-          const summary = calculateRunRewards({
-            distanceMeters: sim.distanceMeters,
-            coinsCollected: sim.coinsCollected,
-            nearMissCount: sim.nearMissCount,
-            bonusScore: sim.bonusScore,
-          });
-          currentProps.onRunEnded({
-            runId: sim.currentRunId,
-            summary,
-            nearMissCount: sim.nearMissCount,
-            topSpeedKmh: Math.round(sim.topSpeedReachedKmh),
-            reviveAvailable: !sim.reviveUsed,
-          });
+        // Countdown overlay (3 -> 2 -> 1 -> GO!)
+        if (sim.countdownTimer > -0.6) {
+          sim.countdownTimer -= dt;
+          const nextInt =
+            sim.countdownTimer > 1.6
+              ? 3
+              : sim.countdownTimer > 0.8
+                ? 2
+                : sim.countdownTimer > 0.0
+                  ? 1
+                  : sim.countdownTimer > -0.55
+                    ? 0
+                    : null;
+          if (nextInt !== sim.lastCountdownInt) {
+            sim.lastCountdownInt = nextInt;
+            if (nextInt !== null) {
+              soundController.playCountdownTick(nextInt === 0);
+            }
+            syncLiveHudSnapshot();
+          }
         }
-      }
 
-      const isSimRunning =
-        currentProps.gameState === 'playing' && !sim.isDying && sim.hitstopTimer <= 0;
-      const isAmbientMenuScroll = currentProps.gameState === 'title';
+        sim.elapsedRaceSec += dt;
 
-      // --- A. ACTIVE GAMEPLAY OR AMBIENT MENU SIMULATION ---
-      if (isSimRunning) {
-        const effectiveStats = getEffectiveCarStats(
-          currentProps.selectedCarId,
-          currentProps.carUpgrades
-        );
-
-        // 1. Evaluate Steering Input (Keyboard + Selected Control Mode)
+        // 1. Evaluate Steering Input
         let kbSteer = 0;
         if (keysPressed.has('ArrowLeft') || keysPressed.has('KeyA')) kbSteer -= 1;
         if (keysPressed.has('ArrowRight') || keysPressed.has('KeyD')) kbSteer += 1;
 
         let touchButtonSteer = 0;
-        if (controlsRef.current.steerLeftHeld) touchButtonSteer -= 1;
-        if (controlsRef.current.steerRightHeld) touchButtonSteer += 1;
+        const holdMultiplier = controlsRef.current.steerLongPressActive ? 1.08 : 1.0;
+        if (controlsRef.current.steerLeftHeld) {
+          touchButtonSteer -= holdMultiplier;
+          controlsRef.current.steerTapRemainingSec = 0;
+        }
+        if (controlsRef.current.steerRightHeld) {
+          touchButtonSteer += holdMultiplier;
+          controlsRef.current.steerTapRemainingSec = 0;
+        }
+        if (
+          touchButtonSteer === 0 &&
+          (controlsRef.current.steerTapRemainingSec ?? 0) > 0
+        ) {
+          controlsRef.current.steerTapRemainingSec = Math.max(
+            0,
+            (controlsRef.current.steerTapRemainingSec ?? 0) - dt
+          );
+          touchButtonSteer = controlsRef.current.steerTapImpulse ?? 0;
+        }
 
         const rawTiltSource = controlsRef.current.hasRealDeviceOrientation
           ? controlsRef.current.lastRawDeviceTiltDeg
@@ -906,7 +1076,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = ({
           previousFilteredInput: sim.filteredTiltSteer,
           sensitivity: currentProps.sensitivity,
           invertTilt: currentProps.invertTilt,
-          smoothingFactor: Math.min(1, dt * 14),
+          smoothingFactor: Math.min(1, dt * 15),
         });
 
         let activeSteerInput = kbSteer || touchButtonSteer;
@@ -918,7 +1088,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = ({
           }
         }
 
-        // 2. Evaluate Nitro & Brake Input
+        // 2. Longitudinal Physics (Automatic Acceleration, Braking, Nitro)
         const nitroWanted =
           keysPressed.has('Space') ||
           keysPressed.has('KeyW') ||
@@ -929,45 +1099,55 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = ({
           keysPressed.has('ArrowDown') ||
           controlsRef.current.brakeHeld;
 
-        if (nitroWanted && sim.nitroAmount > 0.04) {
-          if (!sim.isNitroActive) {
-            soundController.playNitroActivate();
-          }
-          sim.isNitroActive = true;
-          sim.nitroAmount = Math.max(
-            0,
-            sim.nitroAmount - dt / Math.max(1.5, effectiveStats.nitroCapacity)
-          );
-        } else {
-          sim.isNitroActive = false;
-          sim.nitroAmount = Math.min(
-            1,
-            sim.nitroAmount + dt * HIGHWAY_CONFIG.nitroRechargeRatePerSec
-          );
+        const longStep = stepLongitudinalPhysics({
+          currentSpeedMs: sim.speedMs,
+          nitroAmount: sim.nitroAmount,
+          isNitroActive: sim.isNitroActive,
+          nitroWanted,
+          brakeWanted,
+          effectiveStats,
+          dt,
+        });
+
+        if (longStep.justActivatedNitro) {
+          soundController.playNitroActivate();
+          sim.cameraTrauma = Math.min(1, sim.cameraTrauma + 0.22);
         }
 
-        // 3. Longitudinal Speed & Lateral Movement
-        const targetMaxMs = sim.isNitroActive
-          ? effectiveStats.nitroSpeedMs
-          : effectiveStats.topSpeedMs;
-        if (brakeWanted && !sim.isNitroActive) {
-          sim.speedMs = Math.max(
-            HIGHWAY_CONFIG.baseMinSpeedKmh / 3.6,
-            sim.speedMs - effectiveStats.acceleration * 1.9 * dt
-          );
-        } else {
-          const accelRate = sim.isNitroActive
-            ? effectiveStats.acceleration * 2.1
-            : effectiveStats.acceleration * 0.85;
-          sim.speedMs = Math.min(targetMaxMs, sim.speedMs + accelRate * dt);
-        }
+        sim.speedMs = longStep.speedMs;
+        sim.nitroAmount = longStep.nitroAmount;
+        sim.isNitroActive = longStep.isNitroActive;
 
-        const currentSpeedKmh = sim.speedMs * 3.6;
+        const currentSpeedKmh = longStep.speedKmh;
         if (currentSpeedKmh > sim.topSpeedReachedKmh) {
           sim.topSpeedReachedKmh = currentSpeedKmh;
         }
 
-        const targetLatVel = activeSteerInput * effectiveStats.handling;
+        // 3. Track Curvature, Centrifugal Force & Drift Detection (Levels Mode)
+        let currentCurvature = 0;
+        if (playMode === 'levels') {
+          const sample = sampleTrackAtDistance(sim.activeCourse, sim.distanceMeters);
+          currentCurvature = sample.curvature;
+          sim.visualCurveFactor = THREE.MathUtils.damp(
+            sim.visualCurveFactor,
+            currentCurvature,
+            4.5,
+            dt
+          );
+          if (sample.segment.label !== sim.lastSegmentLabel) {
+            sim.lastSegmentLabel = sample.segment.label;
+            syncLiveHudSnapshot();
+          }
+        } else {
+          sim.visualCurveFactor = THREE.MathUtils.damp(sim.visualCurveFactor, 0, 6, dt);
+        }
+
+        const centrifugalPull =
+          playMode === 'levels'
+            ? -currentCurvature * Math.max(0, (sim.speedMs - 20) / 45) * 4.2
+            : 0;
+
+        const targetLatVel = activeSteerInput * effectiveStats.handling + centrifugalPull;
         sim.lateralVelocity = THREE.MathUtils.damp(
           sim.lateralVelocity,
           targetLatVel,
@@ -982,44 +1162,75 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = ({
 
         playerAnchor.position.x = sim.playerX;
 
-        // Animate vehicle chassis roll, pitch, and wheel spin
+        // Genuine Drift Detection when cornering hard through curves
+        const absCurve = Math.abs(currentCurvature);
+        const absSteer = Math.abs(activeSteerInput);
+        const wasDrifting = sim.isDrifting;
+        sim.isDrifting =
+          playMode === 'levels' &&
+          absCurve >= 0.32 &&
+          sim.speedMs > 30 &&
+          absSteer >= 0.35 &&
+          Math.abs(sim.playerX) < HIGHWAY_CONFIG.playerBoundX - 0.15;
+
+        if (sim.isDrifting) {
+          sim.driftScore += dt * 125 * (1 + absCurve);
+          sim.nitroAmount = Math.min(1, sim.nitroAmount + dt * 0.055);
+          sim.driftAudioCooldown -= dt;
+          if (sim.driftAudioCooldown <= 0) {
+            soundController.playDriftPulse();
+            sim.driftAudioCooldown = 0.24;
+          }
+          if (Math.random() < 0.7) {
+            spawnParticleBurst(sim.playerX - 0.7, 0.15, 1.35, 1, 0xf59e0b, 3.2);
+            spawnParticleBurst(sim.playerX + 0.7, 0.15, 1.35, 1, 0x38bdf8, 3.2);
+          }
+        }
+        if (wasDrifting !== sim.isDrifting) {
+          syncLiveHudSnapshot();
+        }
+
+        // Chassis roll, yaw (enhanced slip angle when drifting), pitch, brake lights & wheels
         const normSteer = THREE.MathUtils.clamp(
           sim.lateralVelocity / Math.max(1, effectiveStats.handling),
           -1,
           1
         );
+        const driftYawBonus = sim.isDrifting ? -Math.sign(activeSteerInput) * 0.12 : 0;
         activeCarRig.bodyGroup.rotation.z = THREE.MathUtils.damp(
           activeCarRig.bodyGroup.rotation.z,
-          -normSteer * 0.15,
+          -normSteer * 0.14,
           16,
           dt
         );
         activeCarRig.bodyGroup.rotation.y = THREE.MathUtils.damp(
           activeCarRig.bodyGroup.rotation.y,
-          -normSteer * 0.14,
+          -normSteer * 0.13 + driftYawBonus,
           16,
           dt
         );
         activeCarRig.bodyGroup.rotation.x = THREE.MathUtils.damp(
           activeCarRig.bodyGroup.rotation.x,
-          sim.isNitroActive ? -0.035 : brakeWanted ? 0.03 : 0,
+          sim.isNitroActive ? -0.038 : brakeWanted ? 0.035 : 0,
           14,
           dt
         );
 
+        activeCarRig.taillightMaterial.emissiveIntensity = brakeWanted ? 4.8 : 2.2;
+
         for (const w of activeCarRig.wheels) {
-          w.rotation.x -= sim.speedMs * dt * 1.8;
+          w.rotation.x -= sim.speedMs * dt * 1.85;
         }
         for (const flame of activeCarRig.nitroFlames) {
           flame.visible = sim.isNitroActive;
           if (sim.isNitroActive) {
-            const flicker = 0.85 + Math.random() * 0.35;
+            const flicker = 0.85 + Math.random() * 0.4;
             flame.scale.set(1, flicker, 1);
           }
         }
 
-        if (sim.isNitroActive && Math.random() < 0.55) {
-          spawnParticleBurst(sim.playerX, 0.3, 2.3, 1, 0x38bdf8, 3.5);
+        if (sim.isNitroActive && Math.random() < 0.65) {
+          spawnParticleBurst(sim.playerX, 0.3, 2.35, 1, 0x38bdf8, 4.0);
         }
 
         if (sim.invulnerableTimer > 0) {
@@ -1031,145 +1242,446 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = ({
             sim.shieldFlashTimer * 1.4;
         } else {
           (activeCarRig.shieldBubble.material as THREE.MeshBasicMaterial).opacity =
-            sim.invulnerableTimer > 0 ? 0.18 : 0;
+            sim.invulnerableTimer > 0 ? 0.22 : 0;
         }
 
-        // 4. Advance Distance, Road Scroll, Spawners, and Collisions
+        // Deflector Matrix Level 3+ auto-recharges 1 shield charge after 40s of clean driving
+        if ((currentProt.shieldDuration ?? 0) >= 3 && sim.integrity < sim.maxIntegrity) {
+          sim.cleanDriveShieldTimer += dt;
+          if (sim.cleanDriveShieldTimer >= 40) {
+            sim.cleanDriveShieldTimer = 0;
+            sim.integrity = Math.min(sim.maxIntegrity, sim.integrity + 1);
+            sim.shieldFlashTimer = 0.45;
+            syncLiveHudSnapshot({
+              text: 'SHIELD RECHARGED',
+              subtext: '+1 Deflector Matrix Layer Restored',
+              tone: 'cyan',
+            });
+          }
+        } else {
+          sim.cleanDriveShieldTimer = 0;
+        }
+
+        // 4. Advance Distance
         const stepDist = sim.speedMs * dt;
         sim.distanceMeters += stepDist;
         sim.scrollOffsetZ += stepDist;
 
-        // Progressive difficulty factor (0.0 -> 1.0 over 2,500m)
-        const difficulty01 = Math.min(1, sim.distanceMeters / 2500);
-
-        sim.spawnWaveCooldownZ -= stepDist;
-        if (sim.spawnWaveCooldownZ <= 0) {
-          const baseGap = 52 - difficulty01 * 20;
-          sim.spawnWaveCooldownZ = Math.max(28, baseGap + Math.random() * 14);
-          spawnTrafficWaveAtZ(-140, difficulty01);
-        }
-
-        sim.coinSpawnCooldownZ -= stepDist;
-        if (sim.coinSpawnCooldownZ <= 0) {
-          sim.coinSpawnCooldownZ = 38 + Math.random() * 22;
-          spawnCoinLineAtZ(-135);
-        }
-
         const playerBox = {
           x: sim.playerX,
           z: 0,
-          halfWidth: 0.92,
-          halfLength: 2.05,
+          halfWidth: 0.94,
+          halfLength: 2.18,
         };
 
-        // Update Traffic Pool
-        for (const t of trafficPool) {
-          if (!t.active) continue;
-          const relSpeed = sim.speedMs - t.speedMs;
-          t.z += relSpeed * dt;
-          t.mesh.position.set(t.x, 0, t.z);
+        // --- MODE-SPECIFIC WORLD & OPPONENTS ---
+        if (playMode === 'solo') {
+          const difficulty01 = Math.min(1, sim.distanceMeters / 3500);
 
-          if (t.z > HIGHWAY_CONFIG.despawnDistanceBehind * -1 || t.z < -210) {
-            t.active = false;
-            t.mesh.visible = false;
-            continue;
+          sim.trafficSpawnTimer -= dt;
+          if (sim.trafficSpawnTimer <= 0) {
+            const chosenLanes = selectFairTrafficLanes(HIGHWAY_CONFIG.laneCount, difficulty01);
+            const spawnZ = -HIGHWAY_CONFIG.minSpawnDistanceAhead - Math.random() * 40;
+
+            for (const laneIdx of chosenLanes) {
+              const laneCenterX = HIGHWAY_CONFIG.laneCenters[laneIdx];
+              const tooClose = trafficPool.some(
+                (t) =>
+                  t.active &&
+                  t.laneIndex === laneIdx &&
+                  Math.abs(t.z - spawnZ) < HIGHWAY_CONFIG.minLongitudinalGap
+              );
+              if (tooClose) continue;
+
+              const inactiveItem = trafficPool.find((t) => !t.active);
+              if (inactiveItem) {
+                inactiveItem.active = true;
+                inactiveItem.laneIndex = laneIdx;
+                inactiveItem.x = laneCenterX;
+                inactiveItem.z = spawnZ - Math.random() * 12;
+                inactiveItem.speedMs = 20 + Math.random() * 14 + difficulty01 * 5;
+                inactiveItem.nearMissScored = false;
+                inactiveItem.mesh.position.set(inactiveItem.x, 0, inactiveItem.z);
+                inactiveItem.mesh.visible = true;
+              }
+            }
+
+            sim.trafficSpawnTimer = Math.max(
+              0.55,
+              1.35 - difficulty01 * 0.6 + Math.random() * 0.25
+            );
           }
 
-          const check = evaluateVehicleInteraction(
-            playerBox,
-            {
-              x: t.x,
-              z: t.z,
-              halfWidth: t.halfWidth,
-              halfLength: t.halfLength,
-            },
-            t.nearMissScored
-          );
+          sim.coinSpawnTimer -= dt;
+          if (sim.coinSpawnTimer <= 0) {
+            const laneIdx = Math.floor(Math.random() * HIGHWAY_CONFIG.laneCount);
+            const laneX = HIGHWAY_CONFIG.laneCenters[laneIdx];
+            const baseZ = -95;
 
-          if (check.collided && sim.invulnerableTimer <= 0) {
-            sim.integrity = Math.max(0, sim.integrity - 1);
-            sim.cameraTrauma = Math.min(1, sim.cameraTrauma + 0.78);
-            sim.shieldFlashTimer = 0.45;
-            spawnParticleBurst(sim.playerX, 0.65, -1.2, 18, 0xf59e0b, 9);
+            for (let c = 0; c < 4; c++) {
+              const coinItem = coinPool.find((item) => !item.active);
+              if (coinItem) {
+                coinItem.active = true;
+                coinItem.x = laneX;
+                coinItem.z = baseZ - c * 7.5;
+                coinItem.mesh.position.set(coinItem.x, 0.9, coinItem.z);
+                coinItem.mesh.visible = true;
+              }
+            }
+            sim.coinSpawnTimer = 1.9 + Math.random() * 1.2;
+          }
 
-            if (sim.integrity <= 0) {
-              // Fatal collision -> hitstop + short KO transition
-              soundController.playCollision(true);
-              sim.hitstopTimer = 0.06;
-              sim.isDying = true;
-              sim.defeatDelayTimer = 0.45;
-              syncLiveHudSnapshot({
-                text: 'CRITICAL IMPACT',
-                subtext: 'Hull Integrity Depleted',
-                tone: 'danger',
-              });
-            } else {
-              // Non-fatal shield impact -> push traffic vehicle away and grant brief invulnerability
-              soundController.playCollision(false);
-              sim.hitstopTimer = 0.04;
-              sim.invulnerableTimer = 1.4;
-              sim.speedMs = Math.max(20, sim.speedMs * 0.72);
+          // Move Traffic & Check Collisions / Near-Misses
+          for (const t of trafficPool) {
+            if (!t.active) continue;
+            const relSpeedMs = sim.speedMs - t.speedMs;
+            t.z += relSpeedMs * dt;
+            t.mesh.position.set(t.x, 0, t.z);
+
+            if (t.z > Math.abs(HIGHWAY_CONFIG.despawnDistanceBehind)) {
               t.active = false;
               t.mesh.visible = false;
+              continue;
+            }
+
+            const check = evaluateVehicleInteraction(
+              playerBox,
+              {
+                x: t.x,
+                z: t.z,
+                halfWidth: t.halfWidth,
+                halfLength: t.halfLength,
+              },
+              t.nearMissScored
+            );
+
+            if (check.collided && sim.invulnerableTimer <= 0) {
+              sim.collisionsCount += 1;
+              sim.cleanDriveShieldTimer = 0;
+              sim.integrity = Math.max(0, sim.integrity - 1);
+              sim.cameraTrauma = Math.min(1, sim.cameraTrauma + 0.78);
+              sim.shieldFlashTimer = 0.55;
+              spawnParticleBurst(sim.playerX, 0.65, -1.2, 18, 0xf59e0b, 9);
+
+              if (sim.integrity <= 0) {
+                soundController.playCollision(true);
+                sim.hitstopTimer = 0.06;
+                sim.isDying = true;
+                sim.defeatDelayTimer = 0.45;
+                syncLiveHudSnapshot({
+                  text: 'CRITICAL IMPACT',
+                  subtext: 'Hull Shield Depleted',
+                  tone: 'danger',
+                });
+              } else {
+                soundController.playCollision(false);
+                sim.hitstopTimer = 0.04;
+                sim.invulnerableTimer = effectiveStats.shieldInvulnerabilitySec;
+                sim.speedMs = Math.max(
+                  18,
+                  sim.speedMs * effectiveStats.collisionSpeedRetention
+                );
+                t.active = false;
+                t.mesh.visible = false;
+                syncLiveHudSnapshot({
+                  text: 'SHIELD IMPACT ABSORBED',
+                  subtext: `${sim.integrity}/${sim.maxIntegrity} Shield Charges Remaining`,
+                  tone: 'danger',
+                });
+              }
+            } else if (check.nearMiss) {
+              t.nearMissScored = true;
+              sim.nearMissCount += 1;
+              sim.nitroAmount = Math.min(
+                1,
+                sim.nitroAmount + HIGHWAY_CONFIG.nearMissNitroBonus
+              );
+              soundController.playNearMiss();
+              spawnParticleBurst(sim.playerX, 0.5, 0, 8, 0x06b6d4, 5);
               syncLiveHudSnapshot({
-                text: 'SHIELD IMPACT',
-                subtext: `${sim.integrity} Hull Integrity Remaining`,
-                tone: 'danger',
+                text: `NEAR MISS +${HIGHWAY_CONFIG.nearMissScoreBonus}`,
+                subtext: `+${HIGHWAY_CONFIG.nearMissCoinBonus} Coins · +Nitro Boost`,
+                tone: 'cyan',
               });
             }
-          } else if (check.nearMiss) {
-            t.nearMissScored = true;
-            sim.nearMissCount += 1;
-            sim.nitroAmount = Math.min(
-              1,
-              sim.nitroAmount + HIGHWAY_CONFIG.nearMissNitroBonus
-            );
-            soundController.playNearMiss();
-            spawnParticleBurst(sim.playerX, 0.5, 0, 8, 0x06b6d4, 5);
-            syncLiveHudSnapshot({
-              text: `NEAR MISS +${HIGHWAY_CONFIG.nearMissScoreBonus}`,
-              subtext: `+${HIGHWAY_CONFIG.nearMissCoinBonus} Coins · +Nitro Boost`,
-              tone: 'cyan',
+          }
+
+          // Move Solo Coins
+          for (const c of coinPool) {
+            if (!c.active) continue;
+            c.z += sim.speedMs * dt;
+            c.mesh.position.set(c.x, 0.9, c.z);
+            c.mesh.rotation.y += dt * 3.8;
+
+            if (c.z > 16) {
+              c.active = false;
+              c.mesh.visible = false;
+              continue;
+            }
+
+            if (Math.abs(c.z) < 2.2 && Math.abs(c.x - sim.playerX) < 1.65) {
+              c.active = false;
+              c.mesh.visible = false;
+              sim.coinsCollected += 1;
+              soundController.playCoinPickup();
+              spawnParticleBurst(c.x, 0.9, 0, 7, 0xfacc15, 4.5);
+            }
+          }
+        } else {
+          // --- LEVELS MODE: 5 AI OPPONENTS, PROCEDURAL OBSTACLES, START & FINISH GANTRIES ---
+          const course = sim.activeCourse;
+
+          // Position Start & Finish Line Gantries relative to player distance
+          const startRelZ = sim.distanceMeters - 0; // behind player as distance increases
+          if (startRelZ < 35) {
+            startGantryMesh.visible = true;
+            startGantryMesh.position.set(0, 0, startRelZ);
+          } else {
+            startGantryMesh.visible = false;
+          }
+
+          const finishRelZ = -(course.totalLengthMeters - sim.distanceMeters);
+          if (finishRelZ > -220 && finishRelZ < 35) {
+            const curveShiftFinish =
+              sim.visualCurveFactor * Math.pow(Math.max(0, -finishRelZ) / 70, 1.5) * 4.5;
+            finishGantryMesh.visible = true;
+            finishGantryMesh.position.set(curveShiftFinish, 0, finishRelZ);
+          } else {
+            finishGantryMesh.visible = false;
+          }
+
+          // Step & Render the 5 AI Opponents (6 racing cars total)
+          for (let i = 0; i < sim.aiOpponents.length; i++) {
+            const ai = sim.aiOpponents[i];
+            stepAiOpponent({
+              ai,
+              allOpponents: sim.aiOpponents,
+              playerX: sim.playerX,
+              playerDist: sim.distanceMeters,
+              course,
+              elapsedRaceSec: sim.elapsedRaceSec,
+              dt,
             });
+
+            const aiRig = aiOpponentRigs[i];
+            const relZ = -(ai.distanceMeters - sim.distanceMeters);
+            if (relZ > -210 && relZ < 32) {
+              const curveShift =
+                sim.visualCurveFactor * Math.pow(Math.max(0, -relZ) / 70, 1.5) * 4.5;
+              aiRig.group.visible = true;
+              aiRig.group.position.set(ai.x + curveShift, 0, relZ);
+              for (const w of aiRig.wheels) {
+                w.rotation.x -= ai.speedMs * dt * 1.8;
+              }
+              for (const f of aiRig.nitroFlames) {
+                f.visible = ai.isNitroActive;
+              }
+            } else {
+              aiRig.group.visible = false;
+            }
+
+            // Player vs AI side-to-side contact check (non-fatal racing rub unless direct rear-end)
+            if (Math.abs(relZ) < 3.6 && Math.abs(ai.x - sim.playerX) < 1.72) {
+              const pushDir = sim.playerX >= ai.x ? 1 : -1;
+              sim.playerX = THREE.MathUtils.clamp(
+                sim.playerX + pushDir * 0.25,
+                -HIGHWAY_CONFIG.playerBoundX,
+                HIGHWAY_CONFIG.playerBoundX
+              );
+              ai.x = THREE.MathUtils.clamp(
+                ai.x - pushDir * 0.25,
+                -HIGHWAY_CONFIG.playerBoundX,
+                HIGHWAY_CONFIG.playerBoundX
+              );
+              if (relZ < -1.2 && sim.speedMs > ai.speedMs + 4) {
+                // Player bumped the rear of AI ahead
+                sim.speedMs = Math.max(ai.speedMs, sim.speedMs * 0.9);
+                spawnParticleBurst(sim.playerX, 0.5, -1.5, 6, 0x38bdf8, 5);
+              }
+            }
           }
-        }
 
-        // Update Coins Pool
-        for (const c of coinPool) {
-          if (!c.active) continue;
-          c.z += sim.speedMs * dt;
-          c.mesh.position.set(c.x, 0, c.z);
-          c.mesh.children[1].rotation.y += dt * 3.4;
+          // Render & Check Visible Course Obstacles (Barriers / Chicanes / Pylons)
+          let poolIdx = 0;
+          for (let i = 0; i < course.obstacles.length; i++) {
+            const obs = course.obstacles[i];
+            const relZ = -(obs.distanceMeters - sim.distanceMeters);
+            if (relZ > -185 && relZ < 18 && poolIdx < levelObstaclePool.length) {
+              const item = levelObstaclePool[poolIdx++];
+              const curveShift =
+                sim.visualCurveFactor * Math.pow(Math.max(0, -relZ) / 70, 1.5) * 4.5;
+              item.mesh.visible = true;
+              item.mesh.position.set(obs.x + curveShift, 0, relZ);
 
-          if (c.z > 18) {
-            c.active = false;
-            c.mesh.visible = false;
-            continue;
+              // Check collision with Player
+              if (
+                sim.invulnerableTimer <= 0 &&
+                Math.abs(relZ) < obs.halfLength + 1.85 &&
+                Math.abs(obs.x - sim.playerX) < obs.halfWidth + 0.72
+              ) {
+                sim.collisionsCount += 1;
+                sim.cleanDriveShieldTimer = 0;
+                sim.integrity = Math.max(0, sim.integrity - 1);
+                sim.cameraTrauma = Math.min(1, sim.cameraTrauma + 0.75);
+                sim.shieldFlashTimer = 0.55;
+                spawnParticleBurst(sim.playerX, 0.65, -1.2, 16, 0xf59e0b, 8);
+
+                if (sim.integrity <= 0) {
+                  soundController.playCollision(true);
+                  sim.hitstopTimer = 0.06;
+                  sim.isDying = true;
+                  sim.defeatDelayTimer = 0.45;
+                  syncLiveHudSnapshot({
+                    text: 'CRITICAL BARRIER IMPACT',
+                    subtext: 'Hull Shield Depleted',
+                    tone: 'danger',
+                  });
+                } else {
+                  soundController.playCollision(false);
+                  sim.hitstopTimer = 0.04;
+                  sim.invulnerableTimer = effectiveStats.shieldInvulnerabilitySec;
+                  sim.speedMs = Math.max(
+                    20,
+                    sim.speedMs * effectiveStats.collisionSpeedRetention
+                  );
+                  syncLiveHudSnapshot({
+                    text: 'SHIELD DEFLECTED HAZARD',
+                    subtext: `${sim.integrity}/${sim.maxIntegrity} Shield Charges Remaining`,
+                    tone: 'amber',
+                  });
+                }
+              }
+            }
+          }
+          for (let k = poolIdx; k < levelObstaclePool.length; k++) {
+            levelObstaclePool[k].mesh.visible = false;
           }
 
-          if (Math.abs(c.z) < 2.2 && Math.abs(c.x - sim.playerX) < 1.55) {
-            c.active = false;
-            c.mesh.visible = false;
-            sim.coinsCollected += 1;
-            soundController.playCoinPickup();
-            spawnParticleBurst(c.x, 0.85, c.z, 6, 0xfbbf24, 4.5);
+          // Render & Collect Course Coins
+          let coinIdx = 0;
+          for (let i = 0; i < course.coins.length; i++) {
+            const c = course.coins[i];
+            if (c.collected) continue;
+            const relZ = -(c.distanceMeters - sim.distanceMeters);
+            if (relZ > -160 && relZ < 14 && coinIdx < coinPool.length) {
+              const poolCoin = coinPool[coinIdx++];
+              const curveShift =
+                sim.visualCurveFactor * Math.pow(Math.max(0, -relZ) / 70, 1.5) * 4.5;
+              poolCoin.mesh.visible = true;
+              poolCoin.mesh.position.set(c.x + curveShift, 0.9, relZ);
+              poolCoin.mesh.rotation.y += dt * 3.8;
+
+              if (Math.abs(relZ) < 2.2 && Math.abs(c.x - sim.playerX) < 1.65) {
+                c.collected = true;
+                poolCoin.mesh.visible = false;
+                sim.coinsCollected += 1;
+                soundController.playCoinPickup();
+                spawnParticleBurst(sim.playerX, 0.9, 0, 7, 0xfacc15, 4.5);
+              }
+            }
+          }
+          for (let k = coinIdx; k < coinPool.length; k++) {
+            coinPool[k].mesh.visible = false;
+          }
+
+          // Update Live 1/6 Standings & Check Finish Line Crossing
+          const standings = computeRaceStandings({
+            playerCarId: selectedCarId,
+            playerDistanceMeters: sim.distanceMeters,
+            playerFinished: sim.distanceMeters >= course.totalLengthMeters,
+            playerFinishTimeSec:
+              sim.distanceMeters >= course.totalLengthMeters
+                ? Number(sim.elapsedRaceSec.toFixed(2))
+                : null,
+            opponents: sim.aiOpponents,
+            totalLengthMeters: course.totalLengthMeters,
+          });
+          const newPos = standings.find((s) => s.isPlayer)?.position ?? 6;
+          if (newPos !== sim.playerPosition) {
+            sim.playerPosition = newPos;
+            syncLiveHudSnapshot();
+          }
+
+          if (sim.distanceMeters >= course.totalLengthMeters) {
+            // Player crossed the Finish Line!
+            sim.distanceMeters = course.totalLengthMeters;
+            const finishTime = Number(sim.elapsedRaceSec.toFixed(2));
+            const finalStandings = computeRaceStandings({
+              playerCarId: selectedCarId,
+              playerDistanceMeters: course.totalLengthMeters,
+              playerFinished: true,
+              playerFinishTimeSec: finishTime,
+              opponents: sim.aiOpponents,
+              totalLengthMeters: course.totalLengthMeters,
+            });
+            const finalRank = finalStandings.find((s) => s.isPlayer)?.position ?? 1;
+            const rewards = calculateLevelRaceRewards({
+              course,
+              position: finalRank,
+              coinsCollected: sim.coinsCollected,
+              driftScore: sim.driftScore,
+              collisionsCount: sim.collisionsCount,
+            });
+            const summary = calculateRunRewards({
+              distanceMeters: course.totalLengthMeters,
+              coinsCollected: sim.coinsCollected,
+              nearMissCount: sim.nearMissCount,
+              bonusScore: rewards.totalScore,
+            });
+
+            soundController.playRaceFinish(finalRank <= 3);
+            currentProps.onRunEnded({
+              runId: sim.runId,
+              playMode: 'levels',
+              summary,
+              nearMissCount: sim.nearMissCount,
+              topSpeedKmh: Math.round(sim.topSpeedReachedKmh),
+              reviveAvailable: false,
+              levelResult: {
+                course,
+                standings: finalStandings,
+                playerPosition: finalRank,
+                playerFinishedCourse: true,
+                finishTimeSec: finishTime,
+                rewards,
+                driftScore: Math.floor(sim.driftScore),
+                collisionsCount: sim.collisionsCount,
+              },
+            });
+            return;
           }
         }
 
         soundController.updateEngine(currentSpeedKmh, sim.isNitroActive, false);
-      } else if (isAmbientMenuScroll) {
-        // Ambient highway cruise on Title / Garage screen
+      } else if (currentProps.gameState === 'title') {
         const menuSpeedMs = currentProps.isGarageOpen ? 0 : 24;
         sim.scrollOffsetZ += menuSpeedMs * dt;
-        // Stage hero car in right-center lane (+1.75) on Title Screen so left-third Title Card sits over calm negative space
+        sim.visualCurveFactor = THREE.MathUtils.damp(sim.visualCurveFactor, 0, 6, dt);
+
+        for (const t of trafficPool) {
+          if (t.active) t.mesh.visible = !currentProps.isGarageOpen;
+        }
+        for (const c of coinPool) {
+          if (c.active) c.mesh.visible = false;
+        }
+        for (const obs of levelObstaclePool) {
+          obs.mesh.visible = false;
+        }
+        for (const aiRig of aiOpponentRigs) {
+          aiRig.group.visible = false;
+        }
+        startGantryMesh.visible = false;
+        finishGantryMesh.visible = false;
+
         sim.playerX = THREE.MathUtils.damp(
           sim.playerX,
           currentProps.isGarageOpen ? 0 : 1.75,
-          6,
+          7,
           dt
         );
         playerAnchor.position.x = sim.playerX;
         activeCarRig.bodyGroup.rotation.set(0, 0, 0);
+        activeCarRig.taillightMaterial.emissiveIntensity = 2.2;
         for (const flame of activeCarRig.nitroFlames) {
           flame.visible = false;
         }
@@ -1178,11 +1690,10 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = ({
         }
         soundController.updateEngine(0, false, true);
       } else {
-        // Paused or GameOver
         soundController.updateEngine(0, false, true);
       }
 
-      // --- B. UPDATE SCROLLING ROAD, ARCHES, SKYLINE & PARTICLES ---
+      // --- B. UPDATE SCROLLING ROAD, ARCHES, TUNNELS, SKYLINE & PARTICLES ---
       albedoMap.offset.y = -(sim.scrollOffsetZ * 0.065) % 1;
       roughnessMap.offset.y = -(sim.scrollOffsetZ * 0.065) % 1;
 
@@ -1191,37 +1702,59 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = ({
       for (let i = 0; i < archCount; i++) {
         const z =
           ((i * archSpacing + sim.scrollOffsetZ) % archWrapSpan) - archWrapSpan + 24;
+        const curveX =
+          sim.visualCurveFactor * Math.pow(Math.max(0, -z) / 70, 1.5) * 4.5;
 
-        // Left pillar & lamp
-        _dummy.position.set(-HIGHWAY_CONFIG.roadWidth * 0.5 - 0.6, 3.75, z);
+        _dummy.position.set(-HIGHWAY_CONFIG.roadWidth * 0.5 - 0.6 + curveX, 3.9, z);
         _dummy.rotation.set(0, 0, 0);
         _dummy.scale.set(1, 1, 1);
         _dummy.updateMatrix();
         archPillarsInst.setMatrixAt(i * 2, _dummy.matrix);
 
-        _dummy.position.set(-HIGHWAY_CONFIG.roadWidth * 0.5 + 0.3, 7.4, z);
+        _dummy.position.set(-HIGHWAY_CONFIG.roadWidth * 0.5 + 0.35 + curveX, 7.6, z);
         _dummy.updateMatrix();
         lampHeadsInst.setMatrixAt(i * 2, _dummy.matrix);
 
-        // Right pillar & lamp
-        _dummy.position.set(HIGHWAY_CONFIG.roadWidth * 0.5 + 0.6, 3.75, z);
+        _dummy.position.set(HIGHWAY_CONFIG.roadWidth * 0.5 + 0.6 + curveX, 3.9, z);
         _dummy.updateMatrix();
         archPillarsInst.setMatrixAt(i * 2 + 1, _dummy.matrix);
 
-        _dummy.position.set(HIGHWAY_CONFIG.roadWidth * 0.5 - 0.3, 7.4, z);
+        _dummy.position.set(HIGHWAY_CONFIG.roadWidth * 0.5 - 0.35 + curveX, 7.6, z);
         _dummy.updateMatrix();
         lampHeadsInst.setMatrixAt(i * 2 + 1, _dummy.matrix);
       }
       archPillarsInst.instanceMatrix.needsUpdate = true;
       lampHeadsInst.instanceMatrix.needsUpdate = true;
 
-      const towerSpan = 240;
+      // Update Tunnel Roof Rings if in Levels Mode
+      const showTunnels =
+        currentProps.gameState === 'playing' &&
+        playMode === 'levels' &&
+        sampleTrackAtDistance(sim.activeCourse, sim.distanceMeters + 40).isTunnel;
+      for (let i = 0; i < tunnelRingCount; i++) {
+        if (!showTunnels) {
+          _dummy.position.set(0, -50, 0);
+          _dummy.scale.set(0.001, 0.001, 0.001);
+        } else {
+          const z = -i * 12 + (sim.scrollOffsetZ % 12);
+          const curveX =
+            sim.visualCurveFactor * Math.pow(Math.max(0, -z) / 70, 1.5) * 4.5;
+          _dummy.position.set(curveX, 7.85, z);
+          _dummy.rotation.set(0, 0, 0);
+          _dummy.scale.set(1, 1, 1);
+        }
+        _dummy.updateMatrix();
+        tunnelRoofInst.setMatrixAt(i, _dummy.matrix);
+      }
+      tunnelRoofInst.instanceMatrix.needsUpdate = true;
+
+      const towerSpan = 250;
       for (let i = 0; i < towerCount; i++) {
         const tm = towerMeta[i];
         const z =
           (((tm.zOffset + sim.scrollOffsetZ * 0.45) % towerSpan) + towerSpan) %
             towerSpan -
-          200;
+          205;
         _dummy.position.set(tm.xOffset, -0.04, z);
         _dummy.rotation.set(0, 0, 0);
         _dummy.scale.set(tm.w, tm.h, tm.d);
@@ -1259,43 +1792,58 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = ({
       particleInst.instanceMatrix.needsUpdate = true;
       if (particleInst.instanceColor) particleInst.instanceColor.needsUpdate = true;
 
-      // --- C. SMOOTH CAMERA RIG CHOREOGRAPHY ---
+      // --- C. SMOOTH LANDSCAPE CAMERA RIG CHOREOGRAPHY ---
       sim.cameraTrauma = Math.max(0, sim.cameraTrauma - dt * 2.2);
       const shakeMag = sim.cameraTrauma * sim.cameraTrauma * 0.35;
       const shakeX = (Math.random() - 0.5) * shakeMag;
       const shakeY = (Math.random() - 0.5) * shakeMag;
 
       if (currentProps.gameState === 'title' && currentProps.isGarageOpen) {
-        // Garage Turntable Camera: Orbit around the showcased vehicle in the upper-center viewport
-        sim.garageYawRad += dt * 0.35;
-        const radius = 5.2;
+        if (!isDraggingTurntable) {
+          sim.garageYawRad += dt * 0.38;
+        }
+        const radius = 6.15;
+        const sinYaw = Math.sin(sim.garageYawRad);
+        const cosYaw = Math.cos(sim.garageYawRad);
         _targetCamPos.set(
-          playerAnchor.position.x + Math.sin(sim.garageYawRad) * radius,
-          2.1,
-          Math.cos(sim.garageYawRad) * radius
+          playerAnchor.position.x + sinYaw * radius,
+          1.88,
+          cosYaw * radius
         );
-        _desiredCamLook.set(playerAnchor.position.x, 0.25, 0);
-        camera.fov = THREE.MathUtils.damp(camera.fov, 50, 8, dt);
+        // Frame the 3D showroom car on the left half of the landscape screen
+        const rightShift = window.innerWidth >= 640 ? 1.45 : 0;
+        _desiredCamLook.set(
+          playerAnchor.position.x + cosYaw * rightShift,
+          0.55,
+          -sinYaw * rightShift
+        );
+        camera.fov = THREE.MathUtils.damp(camera.fov, 44, 8, dt);
       } else if (currentProps.gameState === 'title') {
-        // Live World Hero Camera on Title Screen: Frame car on the right side of viewport
         sim.titleOrbitTime += dt * 0.45;
         _targetCamPos.set(
           -0.6 + Math.sin(sim.titleOrbitTime) * 0.35,
-          2.25,
-          5.2 + Math.cos(sim.titleOrbitTime) * 0.4
+          2.2,
+          5.1 + Math.cos(sim.titleOrbitTime) * 0.35
         );
-        _desiredCamLook.set(0.4, 0.85, -14);
-        camera.fov = THREE.MathUtils.damp(camera.fov, 58, 8, dt);
+        _desiredCamLook.set(0.45, 0.85, -14);
+        camera.fov = THREE.MathUtils.damp(camera.fov, 56, 8, dt);
       } else {
-        // Third-Person Chase Camera positioned behind and slightly above player's car
         const chaseX = sim.playerX * 0.72 + shakeX;
-        const chaseY = (sim.isNitroActive ? 2.75 : 3.05) + shakeY;
-        const chaseZ = sim.isNitroActive ? 6.1 : 6.75;
+        const chaseY = (sim.isNitroActive ? 2.55 : 2.78) + shakeY;
+        const chaseZ = sim.isNitroActive ? 5.85 : 6.45;
         _targetCamPos.set(chaseX, chaseY, chaseZ);
-        _desiredCamLook.set(sim.playerX * 0.88, 0.95, -22);
+        _desiredCamLook.set(
+          sim.playerX * 0.88 + sim.visualCurveFactor * 5.2,
+          0.25,
+          -24
+        );
+        const speedAboveLaunch = Math.max(
+          0,
+          sim.speedMs * 3.6 - HIGHWAY_CONFIG.launchSpeedKmh
+        );
         const targetFov = sim.isNitroActive
           ? 74
-          : 60 + Math.min(10, (sim.speedMs - 20) * 0.18);
+          : 58 + Math.min(11, speedAboveLaunch * 0.05);
         camera.fov = THREE.MathUtils.damp(camera.fov, targetFov, 8, dt);
       }
 
@@ -1315,17 +1863,23 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = ({
         const liveScore =
           distInt * 4 +
           sim.nearMissCount * HIGHWAY_CONFIG.nearMissScoreBonus +
-          sim.coinsCollected * HIGHWAY_CONFIG.coinPickupScore;
+          sim.coinsCollected * HIGHWAY_CONFIG.coinPickupScore +
+          Math.floor(sim.driftScore);
         const liveCoinsEarned =
           sim.coinsCollected * HIGHWAY_CONFIG.coinPickupValue +
-          Math.floor(distInt / 25) +
+          Math.floor(distInt / 20) +
           sim.nearMissCount * HIGHWAY_CONFIG.nearMissCoinBonus;
 
         if (refs.speedValueRef.current) {
           refs.speedValueRef.current.textContent = String(speedKmhInt);
         }
         if (refs.distanceValueRef.current) {
-          refs.distanceValueRef.current.textContent = `${distInt}m`;
+          if (playMode === 'levels') {
+            const rem = Math.max(0, Math.ceil(sim.activeCourse.totalLengthMeters - sim.distanceMeters));
+            refs.distanceValueRef.current.textContent = `${rem}m`;
+          } else {
+            refs.distanceValueRef.current.textContent = `${distInt}m`;
+          }
         }
         if (refs.scoreValueRef.current) {
           refs.scoreValueRef.current.textContent = String(liveScore);
@@ -1334,46 +1888,59 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = ({
           refs.coinsValueRef.current.textContent = String(liveCoinsEarned);
         }
         if (refs.nitroFillRef.current) {
-          const pct = Math.round(sim.nitroAmount * 100);
-          refs.nitroFillRef.current.style.transform = `scaleX(${Math.max(0, Math.min(1, sim.nitroAmount))})`;
-          if (refs.nitroPctRef.current) {
-            refs.nitroPctRef.current.textContent = `${pct}%`;
-          }
+          refs.nitroFillRef.current.style.transform = `scaleX(${sim.nitroAmount.toFixed(3)})`;
+        }
+        if (refs.nitroPctRef.current) {
+          refs.nitroPctRef.current.textContent = `${Math.round(sim.nitroAmount * 100)}%`;
         }
         if (refs.tiltAngleBadgeRef.current) {
-          const deg = Math.round(
-            (controlsRef.current.hasRealDeviceOrientation
-              ? controlsRef.current.lastRawDeviceTiltDeg
-              : controlsRef.current.simulatedTiltDeg) -
-              currentProps.neutralTiltOffsetDeg
+          const rawTilt = controlsRef.current.hasRealDeviceOrientation
+            ? controlsRef.current.lastRawDeviceTiltDeg
+            : controlsRef.current.simulatedTiltDeg;
+          const calTilt = Math.round(rawTilt - currentProps.neutralTiltOffsetDeg);
+          refs.tiltAngleBadgeRef.current.textContent = `${calTilt > 0 ? '+' : ''}${calTilt}°`;
+        }
+        if (refs.steerIndicatorBarRef.current) {
+          const pct = Math.round(sim.filteredTiltSteer * 50);
+          refs.steerIndicatorBarRef.current.style.transform = `translateX(${pct}%)`;
+        }
+        if (refs.racePositionValueRef?.current && playMode === 'levels') {
+          refs.racePositionValueRef.current.textContent = `${sim.playerPosition}/6`;
+        }
+        if (refs.levelProgressFillRef?.current && playMode === 'levels') {
+          const prog = Math.max(
+            0,
+            Math.min(1, sim.distanceMeters / Math.max(1, sim.activeCourse.totalLengthMeters))
           );
-          refs.tiltAngleBadgeRef.current.textContent = `${deg > 0 ? '+' : ''}${deg}°`;
+          refs.levelProgressFillRef.current.style.transform = `scaleX(${prog.toFixed(3)})`;
         }
       }
 
       renderer.render(scene, camera);
     };
 
-    rafId = requestAnimationFrame(animate);
+    animationFrameId = requestAnimationFrame(animate);
 
     return () => {
-      cancelAnimationFrame(rafId);
-      resizeObserver.disconnect();
-      window.removeEventListener('resize', updateCanvasSize);
+      cancelAnimationFrame(animationFrameId);
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
-      window.removeEventListener('blur', clearHeldInputs);
-      document.removeEventListener('visibilitychange', onVisibilityChange);
-      window.removeEventListener('deviceorientation', onDeviceOrientation);
-      soundController.stopEngine();
+      renderer.domElement.removeEventListener('pointerdown', onPointerDownCanvas);
+      window.removeEventListener('pointermove', onPointerMoveCanvas);
+      window.removeEventListener('pointerup', onPointerUpCanvas);
+      window.removeEventListener('deviceorientation', handleDeviceOrientation, true);
+      window.removeEventListener('devicemotion', handleDeviceMotion, true);
+      window.removeEventListener('resize', handleResize);
+      window.removeEventListener('orientationchange', handleResize);
+      pmremGenerator.dispose();
       renderer.dispose();
     };
-  }, []);
+  }, [props.graphicsQuality]);
 
   return (
     <div
-      ref={mountRef}
-      className="fixed inset-0 w-full h-full overflow-hidden bg-[#090d18] select-none"
+      ref={containerRef}
+      className="fixed inset-0 z-0 overflow-hidden bg-[#070b16]"
       aria-label="Velocity Rush 3D Highway Viewport"
     />
   );
