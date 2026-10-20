@@ -74,6 +74,7 @@ export interface LevelsProgressionData {
 }
 
 export interface UserSettingsData {
+  musicEnabled: boolean;     // Persistent background music on/off toggle
   musicVolume: number;       // 0 to 1
   sfxVolume: number;         // 0 to 1
   vibrationEnabled: boolean;
@@ -187,6 +188,7 @@ export function createDefaultSaveData(): SaveGameData {
       claimedChallengeIds: [],
     },
     settings: {
+      musicEnabled: true,
       musicVolume: 0.65,
       sfxVolume: 0.85,
       vibrationEnabled: true,
@@ -474,6 +476,9 @@ export function validateAndSanitizeSave(raw: unknown): SaveGameData {
   const settings = { ...defaults.settings };
   if (obj.settings && typeof obj.settings === 'object') {
     const st = obj.settings as Record<string, unknown>;
+    if (typeof st.musicEnabled === 'boolean') {
+      settings.musicEnabled = st.musicEnabled;
+    }
     if (typeof st.musicVolume === 'number' && Number.isFinite(st.musicVolume)) {
       settings.musicVolume = Math.max(0, Math.min(1, st.musicVolume));
     }

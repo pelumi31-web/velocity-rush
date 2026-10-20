@@ -1,0 +1,702 @@
+# VELOCITY RUSH — GAMEPLAY BUG FIXES, GARAGE CAMERA, AUDIO, RACE STARTS AND DRIFT TRACKS
+
+## YOUR ROLE
+
+Act as a senior mobile racing-game developer, 3D camera engineer, gameplay programmer, UI/UX specialist, audio engineer, and quality assurance engineer.
+
+You are working on my EXISTING Velocity Rush racing game project in Google AI Studio.
+
+Inspect the current implementation and fix the issues described below. Modify the actual source code and connect the fixes to the existing gameplay systems.
+
+Do not create a new project, replace the game with a mockup, or remove previously working features. Preserve the existing framework, garage, two game modes, vehicle customization, currency system, racing physics, AI opponents, and level progression.
+
+The game must remain landscape-first and playable on mobile.
+
+Follow this priority order:
+
+1. Fix garage vehicle visibility and rotation.
+2. Repair pause functionality in both game modes.
+3. Fix score and coin displays during races and after races.
+4. Remove the unwanted weather effects.
+5. Integrate the supplied background music with seamless looping.
+6. Synchronize all six cars at the beginning of every competitive race.
+7. Add proper U-shaped curves and drift-focused sections to Levels Mode.
+
+Inspect the existing code before making changes. Trace each bug to its underlying cause instead of applying a visual workaround.
+
+---
+
+# PRIORITY 1 — FIX THE GARAGE CAR PREVIEW AND ROTATION
+
+## Current problem
+
+The garage displays only part of the selected vehicle, and the rotation controls do not allow the car to be viewed properly.
+
+The entire car must be visible in the showroom, and the player must be able to inspect it from multiple angles.
+
+## Required improvements
+
+### A. Fit the entire car inside the preview
+
+1. Display the complete vehicle, including the front, rear, sides, roof, wheels, and other major visible parts.
+2. Do not crop the front or rear of the vehicle.
+3. Keep the entire car inside its designated preview area, even when switching between vehicles with different dimensions.
+4. Correct the camera position, viewing angle, field of view, zoom, model scale, and framing as appropriate.
+5. Center the vehicle within the showroom.
+6. Leave suitable space around the vehicle so its shape remains visible.
+7. Prevent the model from being hidden behind UI panels or clipped at the edges of the preview container.
+8. Ensure the preview adapts correctly to landscape mobile screens with different aspect ratios.
+9. Calculate the framing using the actual bounds of the selected vehicle wherever the rendering engine supports it.
+10. Recalculate the view when another car is selected or the viewport changes.
+
+Do not solve a framing problem by arbitrarily shrinking every car until it becomes too small to inspect.
+
+Make the camera automatically fit vehicles of different lengths, widths, heights, and body styles while keeping them visually prominent.
+
+### B. Implement genuine 360-degree vehicle inspection
+
+The vehicle must be rotatable smoothly.
+
+Provide:
+
+- Dragging left and right to rotate the vehicle around its vertical axis.
+- Visible Rotate Left and Rotate Right controls where appropriate.
+- Smooth rotational animation without abrupt jumps.
+- Consistent rotation around the vehicle's center rather than around an incorrect pivot.
+- The ability to inspect the front, side, rear, and opposite side.
+- Optional automatic showroom rotation when the player is not interacting.
+- A reset-view option if useful.
+
+Rotation must work for every selected car, not just the starter vehicle.
+
+### C. Make the rotation controls work properly
+
+The rotation buttons currently provide only a limited view.
+
+Fix their event handling and rotation logic so that pressing either button visibly rotates the selected vehicle through a useful angle. Holding the button may continue rotation where appropriate.
+
+Prevent multiple active rotation loops from accumulating when the player repeatedly switches between cars.
+
+Ensure that interacting with the vehicle preview does not accidentally activate garage navigation buttons.
+
+### D. Preserve the same customized vehicle
+
+The garage preview must use the actual selected vehicle model and its saved configuration.
+
+It must display the selected car's real:
+
+- Body geometry.
+- Paint colour.
+- Wheel design.
+- Compatible body accessories.
+- Upgrades and performance information.
+
+When the selected car changes, update the model and camera framing together.
+
+When the player enters Solo Mode or Levels Mode, load the same equipped vehicle configuration into the race.
+
+Do not replace the real vehicle with a generic model or an image-only preview.
+
+---
+
+# PRIORITY 2 — FIX PAUSE FUNCTIONALITY IN BOTH GAME MODES
+
+Pause is a core gameplay function. It must work correctly in Solo Mode and Levels Mode.
+
+## A. Correct the pause implementation
+
+When the player presses Pause during Solo Mode or Levels Mode:
+
+- Freeze the player's vehicle movement.
+- Stop acceleration, braking, and nitro processing.
+- Disable steering input until the race resumes.
+- Stop AI opponent movement.
+- Stop traffic movement in Solo Mode.
+- Stop applicable collision and obstacle movement.
+- Freeze race timers.
+- Freeze distance calculations.
+- Freeze score calculations.
+- Pause collectible spawning.
+- Stop new race events from being triggered.
+- Freeze level countdowns and completion timers.
+- Prevent rewards or race results from being calculated more than once.
+
+The game must not continue silently in the background while the pause menu is open.
+
+Use a centralized and reliable game-state or pause manager rather than implementing unrelated pause behavior in individual UI buttons.
+
+Make sure every relevant gameplay system obeys the same paused state.
+
+### B. Pause overlay
+
+Create a polished landscape pause overlay that matches the existing game design.
+
+Include:
+
+- Resume.
+- Restart Race.
+- Settings.
+- Return to Garage or Main Menu, as appropriate.
+
+The overlay must be visible above the frozen gameplay without destroying the current scene.
+
+Buttons must have actual working handlers.
+
+### C. Resume correctly
+
+When Resume is pressed:
+
+- Close the pause overlay.
+- Restore the race state.
+- Restore AI movement and applicable gameplay timers.
+- Re-enable player input.
+- Resume race progression without a sudden jump in position or speed.
+- Ensure the game does not run multiple copies of timers, update loops, or event listeners.
+
+Do not restart the countdown or reset the score when resuming a paused race.
+
+### D. Restart safely
+
+When Restart Race is selected:
+
+- Reset the appropriate race state.
+- Reset race-specific score, distance, pickups, timers, shields, and other temporary statistics.
+- Restore a clean starting state.
+- Ensure AI opponents return to their valid starting positions in Levels Mode.
+- Preserve persistent coins, unlocked cars, customization, upgrades, and previously completed levels.
+- Prevent rewards from the abandoned attempt from being granted twice.
+
+For Levels Mode, restarting must create a new valid starting grid rather than leaving opponents at their former positions.
+
+### E. Handle application interruptions
+
+If the browser loses focus or the application becomes inactive during a race, handle the transition safely.
+
+Prevent the race from progressing unexpectedly while the player cannot control the vehicle. Resume only through a controlled state transition where appropriate.
+
+Test pause, resume, restart, and return-to-menu separately in both modes.
+
+---
+
+# PRIORITY 3 — FIX SCORE AND COIN DISPLAYS
+
+## Current problem
+
+The game is not consistently displaying the player's coin count and score during gameplay and at the end of a race.
+
+These must be real, connected values rather than decorative numbers or static labels.
+
+## A. Correct the race HUD
+
+### Solo Mode
+
+Display the following during a run:
+
+- Current speed in km/h.
+- Distance travelled.
+- Current race score.
+- Coins collected during the current run.
+- Current shield status where applicable.
+- Nitro energy.
+- Pause control.
+
+### Levels Mode
+
+Display:
+
+- Current speed.
+- Current position out of six.
+- Distance remaining.
+- Current race score.
+- Coins collected during the race.
+- Shield status.
+- Nitro energy.
+- Pause control.
+- Level number and track name.
+
+Keep all elements visible in landscape orientation and ensure they do not cover important road or vehicle information.
+
+Use clear labels and appropriate icons.
+
+### B. Distinguish race coins from the permanent coin balance
+
+Maintain a clear distinction between:
+
+1. Coins collected during the current race.
+2. Total coins owned by the player in the persistent garage economy.
+
+During gameplay, show the current race's collected coins and, where space permits, the player's total coin balance separately.
+
+Do not repeatedly add the same collected coins to the permanent balance on every HUD refresh.
+
+Define exactly when collected coins become permanently credited to the player's balance. Ensure that this happens once according to the existing reward rules.
+
+### C. Make score updates reliable
+
+The race score must be calculated using actual gameplay events.
+
+Use the existing scoring mechanics where possible, including valid contributions from:
+
+- Distance.
+- Successful near misses.
+- Collectibles.
+- Drifting achievements where supported.
+- Level race objectives.
+- Other implemented bonuses.
+
+Update the display whenever the score changes.
+
+Do not update the score visually while leaving the underlying score unchanged.
+
+Ensure the displayed score matches the authoritative score manager.
+
+### D. Correct the results screen
+
+At the end of Solo Mode, display:
+
+- Final score.
+- Final distance.
+- Total coins collected.
+- Base race reward.
+- Additional bonuses.
+- Final coins awarded.
+- Best score if a new record was achieved.
+
+At the end of Levels Mode, display:
+
+- Level number.
+- Track name.
+- Finishing position out of six.
+- Final score.
+- Race time.
+- Coins collected during the race.
+- Position-based prize.
+- Applicable skill or objective bonuses.
+- Total coins earned.
+- Next-level unlock status when applicable.
+
+All values must be calculated from the completed race.
+
+Do not display zero, a blank value, an old value from a previous race, or a hard-coded demonstration number when real data exists.
+
+### E. Repair reward consistency
+
+Use one authoritative reward-calculation system.
+
+Ensure:
+- Score is calculated once.
+- Race coins are counted correctly.
+- Reward breakdowns add up to the actual reward.
+- Position-based prizes are applied correctly.
+- The permanent coin balance is updated once.
+- Reopening a results screen cannot grant duplicate rewards.
+- Restarting a race cannot accidentally claim the previous attempt's reward again.
+- Coin and score data persist correctly across navigation and reloads.
+
+Use reliable formatting for large numbers and currency values.
+
+After changes, verify both the in-race HUD and the final results screen in both game modes.
+
+---
+
+# PRIORITY 4 — REMOVE THE UNWANTED WEATHER EFFECTS
+
+I previously added weather effects, but I now want them removed.
+
+Remove all weather features associated with the added fog, snow, and rain systems.
+
+### Remove the following
+
+- Falling snow particles.
+- Rain particles.
+- Rain streaks.
+- Weather-related ground wetness or puddles added specifically for rain.
+- Fog particles and weather-driven fog layers.
+- Weather-specific post-processing effects.
+- Automatic weather transitions.
+- Weather timers and random weather selection.
+- Weather-specific screen overlays.
+- Weather controls or settings added exclusively for those effects.
+- Audio loops that exist only for the removed rain or weather.
+- Any persistent weather state that incorrectly affects newly loaded scenes.
+
+Remove the actual effect generators and their integration with the rendering and game systems. Do not simply hide the weather visually while leaving unnecessary systems running.
+
+Preserve unrelated road materials, building details, normal lighting, shadows, and environmental assets.
+
+Keep the city visually clear, sharp, and readable, with consistent lighting and good road visibility.
+
+Do not eliminate ordinary distance and shading cues that are necessary for realistic depth; remove the specific unwanted weather effects.
+
+Ensure both Solo Mode and Levels Mode load without rain, snow, or weather-generated fog.
+
+---
+
+# PRIORITY 5 — ADD MY DOWNLOADED MUSIC AND PLAY IT IN A LOOP
+
+I have a music file that I intend to attach to the project.
+
+Inspect the supplied audio asset and integrate the actual file. Do not invent a filename or use a remote music URL.
+
+If the file is not available to your current environment, tell me exactly where and how to place it in the project and complete the remaining implementation using a configurable audio-asset reference.
+
+## A. Background music behavior
+
+Use the supplied track as the game's background music.
+
+Requirements:
+
+1. Play the track continuously during normal gameplay and appropriate menus.
+2. Enable genuine looping so the music starts again automatically when it reaches the end.
+3. Avoid creating multiple simultaneous copies of the same music track.
+4. Prevent repeated menu navigation from starting duplicate music players.
+5. Handle scene changes without unnecessary interruptions.
+6. Ensure the song loops without a large artificial gap between repetitions where the source file permits seamless playback.
+7. Use the actual audio file's supported format and loading method.
+8. Do not rely on an external streaming URL.
+9. Ensure music continues to work when the game is running as a deployed web app.
+
+Use the project's existing audio architecture if it is reliable. Otherwise, implement one centralized background music controller.
+
+## B. Browser audio restrictions
+
+Account for mobile browser autoplay restrictions.
+
+Where browser policy prevents playback before user interaction, initialize or resume audio after the player's first legitimate interaction, such as pressing Play or enabling music.
+
+Do not assume that a browser will always permit audible playback immediately on page load.
+
+Once playback has been enabled, the music should loop continuously according to the game's audio settings.
+
+## C. Music controls
+
+Add or repair the music settings.
+
+Provide:
+- Music on/off.
+- Music volume.
+- Persistent volume preference.
+
+Default to a suitable, moderate volume.
+
+Audio must respond immediately when the player changes the setting.
+
+Do not confuse the background soundtrack with engine sounds, collision sounds, or UI sound effects.
+
+## D. Interaction with Pause
+
+When the player pauses, either continue the background music at its existing volume or reduce it gracefully. Choose a consistent behavior and keep it configurable if necessary.
+
+The racing engine, acceleration, traffic, and active gameplay audio should respond appropriately to pausing.
+
+When resuming, avoid duplicated audio playback or sudden jumps in volume.
+
+Music must not stop permanently after the first loop, after switching game modes, or after returning to the main menu.
+
+---
+
+# PRIORITY 6 — MAKE ALL SIX COMPETITIVE RACERS START FAIRLY
+
+## Current problem
+
+In Levels Mode, some AI opponents are already ahead when the race begins.
+
+This makes the competition unfair and gives the appearance that the racers are not starting together.
+
+Fix the underlying race initialization logic.
+
+## A. Create a genuine six-car starting grid
+
+Every competitive level must contain exactly six racing vehicles:
+
+- One player-controlled car.
+- Five AI opponent cars.
+
+At the beginning of the race, position all six vehicles on a visible starting grid associated with the same start line.
+
+Use valid road-aligned starting positions, such as a two-row or staggered grid, if the road is not wide enough for all six cars to stand side by side.
+
+No vehicle may start beyond the designated start line.
+
+All starting positions must be safe, non-overlapping, and aligned with the road.
+
+Ensure vehicle rotation, orientation, and position correspond to the actual direction of travel.
+
+### B. Reset every race participant
+
+Before beginning each race:
+
+1. Stop and reset all AI movement controllers.
+2. Reset the player's race-specific state.
+3. Clear stale movement targets and timers.
+4. Place the player and all five AI vehicles in their assigned starting slots.
+5. Reset each vehicle's starting speed and acceleration state.
+6. Reset position-tracking data.
+7. Reset distance, score, race timer, and finishing status.
+8. Reset temporary shields and nitro state according to the existing race rules.
+9. Ensure previous race progress cannot influence the new starting positions.
+
+Do not reuse an opponent's previous world coordinates without validating them against the current course.
+
+Do not let an AI controller begin moving merely because its object was initialized before the race countdown.
+
+## C. Synchronized starting countdown
+
+Implement a clear race countdown:
+
+3 → 2 → 1 → GO!
+
+During the countdown:
+- All six vehicles remain stationary at their assigned starting positions.
+- AI controllers do not accelerate.
+- Traffic or obstacles cannot push a vehicle ahead of the line.
+- Player acceleration is disabled.
+- The race timer does not count active racing time.
+
+When the countdown reaches GO:
+- Release all six vehicles together.
+- Enable player controls.
+- Enable AI driving.
+- Start the official race timer.
+- Begin scoring and race-distance tracking.
+
+Use one authoritative start event for all racing vehicles.
+
+Avoid starting the player's physics, the AI controllers, and the race timer in unrelated callbacks that execute at different times.
+
+### D. Prevent false starting advantages
+
+No opponent should receive an unearned starting advantage.
+
+Difficulty may affect an opponent's driving skill and performance within balanced limits, but not its starting location or the time at which it is released.
+
+Keep all cars correctly positioned at the start line across retries, new levels, and procedural track generation.
+
+### E. Test start synchronization
+
+Verify that:
+- All six vehicles are behind or aligned with the starting line.
+- No cars overlap.
+- None begins driving early.
+- Every car begins moving after the same GO event.
+- The displayed race timer begins at the appropriate moment.
+- Retry returns every vehicle to the correct grid.
+- The result is consistent across multiple races.
+
+---
+
+# PRIORITY 7 — ADD U-SHAPED ROADS, HAIRPINS, AND REAL DRIFT SECTIONS
+
+I want Levels Mode to include proper curved sections where players can use drifting to navigate the road.
+
+The courses must contain more variety than straight city highways.
+
+Introduce broad U-shaped curves, hairpin bends, sweeping corners, drift sections, and linked corner combinations that demand more driving skill as the levels increase.
+
+## A. Road geometry
+
+Create actual curved road geometry.
+
+A bend must change the direction and shape of the road, not merely rotate the background or move the camera while the road remains straight.
+
+Implement road segments using the existing rendering and track system.
+
+Include:
+- Broad U-shaped bends.
+- Hairpin turns where appropriate.
+- Long sweeping corners.
+- S-bends.
+- Chicanes.
+- Tunnel approaches and exits.
+- Mixed straight and curved sections.
+
+Ensure the road surface, road markings, shoulders, guardrails, collision boundaries, AI navigation path, and camera follow behavior all follow the same underlying track geometry.
+
+Do not create visual curves that the vehicle's collision system still treats as straight roads.
+
+## B. Fair and drivable bends
+
+Every bend must be physically or geometrically traversable using the available steering and handling model.
+
+Requirements:
+- Provide adequate track width.
+- Use sensible turning radii for the expected vehicle speeds.
+- Avoid sudden impossible changes in road direction.
+- Align barriers with the road.
+- Keep obstacles clear of unavoidable driving lines.
+- Maintain a valid route for all six vehicles.
+- Ensure AI navigation follows the curve rather than steering into the barriers.
+- Avoid camera movements that hide upcoming turns.
+- Ensure the start and finish lines remain correctly aligned with the track.
+
+Use gentle turns in early levels and introduce tighter curves progressively.
+
+## C. Drift mechanics
+
+Integrate the curved sections with the actual vehicle handling system.
+
+Where the game supports drifting:
+- Allow the player to initiate controlled drifting through suitable steering and speed conditions.
+- Produce visible but restrained vehicle yaw and lateral movement.
+- Give the vehicle a predictable response when entering and leaving a drift.
+- Prevent uncontrolled spinning or constant sideways sliding.
+- Restore directional stability smoothly after a successful turn.
+- Use appropriate tyre sound and visual effects when available.
+- Preserve a readable driving direction and collision boundary.
+- Let car-specific handling and upgrades affect drift stability.
+
+Do not implement drifting as a decorative sideways animation that ignores the vehicle's actual movement.
+
+If the existing game uses lane-based movement rather than full vehicle physics, implement a coherent arcade drift mechanic compatible with that system instead of attempting to introduce incompatible simulation physics.
+
+## D. Drift scoring
+
+Add or repair drift scoring only if there is a real drift state.
+
+Award configurable points for a valid, controlled drift and scale the reward according to suitable criteria such as duration, successful corner completion, or distance.
+
+Prevent:
+- Scoring while stationary.
+- Infinite score from holding one button.
+- Repeated scoring from the same drift event.
+- Rewards when the vehicle is in a collision or invalid state.
+- Score multiplication from duplicate update loops.
+
+Display drift feedback and earned bonuses clearly without obscuring the upcoming road.
+
+## E. AI behavior on curves
+
+All five AI opponents must navigate U-shaped bends, hairpins, and drift sections.
+
+They should adjust steering and speed to the actual road curvature.
+
+Allow controlled differences in AI driving skill, racing lines, braking discipline, and cornering ability.
+
+Do not let the AI follow a straight line through a curved road or skip track boundaries.
+
+Difficulty progression may introduce tighter turns and more complex sequences, but every course must remain completable.
+
+---
+
+# PRIORITY 8 — MAINTAIN CONSISTENT GAME STATE AND PERFORMANCE
+
+While making these changes, preserve the existing game's functional systems.
+
+Keep the following consistent:
+
+- Current player car.
+- Vehicle customizations.
+- Vehicle performance statistics.
+- Solo Mode traffic and score.
+- Levels Mode AI opponents.
+- Shield and nitro mechanics.
+- Currency and rewards.
+- Level progression.
+- Race pause and resume.
+- Background music and sound settings.
+- Saved player preferences.
+
+Use the existing managers and services when they are functioning properly.
+
+Avoid:
+- Duplicate game managers.
+- Duplicate music players.
+- Multiple independent pause flags.
+- Multiple competing race timers.
+- Duplicate score and coin calculations.
+- Repeated event subscriptions.
+- Multiple racing update loops.
+- Unnecessary per-frame object creation.
+- Broken scene or UI references.
+
+Use clear ownership of the active race state.
+
+After pausing, restarting, changing modes, or returning to the garage, ensure the game returns to a consistent state.
+
+Maintain responsive performance on landscape mobile devices.
+
+---
+
+# PRIORITY 9 — TEST THE ACTUAL IMPLEMENTATION
+
+Do not consider the task finished when the source code has merely been edited.
+
+Run the existing application and test the fixes in the available browser preview. Repair the bugs found during testing.
+
+### Garage tests
+
+1. The complete selected vehicle is visible in the showroom.
+2. No section of the vehicle is accidentally cropped.
+3. Vehicle framing adjusts when selecting cars of different dimensions.
+4. Drag rotation works.
+5. Rotate Left and Rotate Right function correctly.
+6. The player can inspect the front, rear, and sides of the selected vehicle.
+7. The selected wheels and paint are visible.
+8. The camera remains correctly framed after changing vehicles.
+9. The selected vehicle appears correctly in the next race.
+
+### Pause tests
+
+10. Pause works in Solo Mode.
+11. Pause works in Levels Mode.
+12. All applicable movement, timers, score updates, and AI motion stop while paused.
+13. Resume continues the same race without unwanted resets.
+14. Restart produces a clean race state.
+15. Returning to the menu does not leave orphaned timers, AI controllers, or music players.
+
+### Score and coin tests
+
+16. Solo Mode displays score and race coins during gameplay.
+17. Levels Mode displays score and race coins during gameplay.
+18. Both modes show accurate final scores and coin rewards.
+19. The permanent coin balance updates correctly.
+20. Results cannot grant duplicated rewards.
+21. The garage displays the correct saved balance after a race.
+
+### Weather and music tests
+
+22. No rain, snow, or weather-generated fog remains in either mode.
+23. The city remains clearly visible and visually coherent.
+24. The supplied music file is used when available.
+25. Music repeats automatically after reaching the end of the track.
+26. Music volume settings work.
+27. The game does not create multiple copies of the background music player.
+28. Audio works under the browser's supported user-interaction and autoplay rules.
+
+### Starting-grid tests
+
+29. Levels Mode contains exactly six racing cars.
+30. All six cars are correctly positioned before the race.
+31. No AI opponent starts beyond the start line.
+32. All six cars wait during the countdown.
+33. All six are released on the same GO event.
+34. The race timer begins at the correct time.
+35. Restarting the race recreates the same fair starting conditions.
+
+### Drift and course tests
+
+36. Levels Mode includes real U-shaped road geometry.
+37. Road markings and barriers align with the curved road.
+38. The player can steer through the bends.
+39. AI opponents can navigate the bends without consistently leaving the track.
+40. Drift mechanics and rewards operate only under valid gameplay conditions.
+41. The course has a valid finish line and a traversable route.
+
+If a test requires a physical mobile device or cannot be performed by the available environment, state that limitation honestly.
+
+## FINAL DELIVERY
+
+After making the changes, report:
+
+1. The main bugs fixed.
+2. The files and components modified.
+3. How the garage camera and rotation now work.
+4. How pause and restart operate in both game modes.
+5. How score and coin displays are connected to real gameplay values.
+6. Whether the supplied music file was successfully integrated.
+7. How the six-car starting countdown works.
+8. How the new curved and drift sections work.
+9. The tests actually performed and their observed results.
+10. Any remaining issues or device-specific tests that I need to complete.
+
+Start by inspecting the existing implementation, then make the changes directly. Do not replace the current game with a different prototype or return only a plan.

@@ -229,14 +229,34 @@ export default function App() {
     }
   }, [showToastNotice]);
 
-  // Synchronize document.body.dataset.state immediately on state change
+  // Synchronize document.body.dataset.state and audio pause state immediately on state change
   useEffect(() => {
     document.body.dataset.state = gameState;
+    soundController.setGamePaused(gameState === 'paused');
   }, [gameState]);
 
-  // Persist saveData to localStorage whenever it updates
+  // Automatically pause active gameplay when the browser tab/app is backgrounded
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        setGameState((prev) => {
+          if (prev === 'playing') {
+            document.body.dataset.state = 'paused';
+            soundController.setGamePaused(true);
+            return 'paused';
+          }
+          return prev;
+        });
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange);
+  }, []);
+
+  // Persist saveData to localStorage whenever it updates and sync audio settings
   useEffect(() => {
     writeSaveToStorage(saveData);
+    soundController.setMusicEnabled(saveData.settings.musicEnabled ?? true);
     soundController.setVolumes(
       saveData.settings.musicVolume,
       saveData.settings.sfxVolume
@@ -349,6 +369,21 @@ export default function App() {
     if (!nextMuted) {
       soundController.startMusicLoop();
     }
+  }, []);
+
+  const handleToggleMusicEnabled = useCallback(() => {
+    soundController.playButtonClick();
+    setSaveData((prev) => {
+      const nextEnabled = !(prev.settings.musicEnabled ?? true);
+      soundController.setMusicEnabled(nextEnabled);
+      return {
+        ...prev,
+        settings: {
+          ...prev.settings,
+          musicEnabled: nextEnabled,
+        },
+      };
+    });
   }, []);
 
   // Automatically start the intense soundtrack on the user's very first pointer/touch/key gesture
@@ -728,6 +763,15 @@ export default function App() {
           onRotateTurntable={(delta) =>
             controlsRef.current.rotateGarageTurntable?.(delta)
           }
+          onSetGarageRotateHoldDir={(dir) =>
+            controlsRef.current.setGarageRotateHoldDir?.(dir)
+          }
+          onResetGarageTurntableView={() =>
+            controlsRef.current.resetGarageTurntableView?.()
+          }
+          onToggleGarageAutoRotate={() =>
+            controlsRef.current.toggleGarageAutoRotate?.() ?? true
+          }
           musicTrack={musicTrack}
           isMuted={isMuted}
           onCycleMusicTrack={handleCycleMusicTrack}
@@ -753,6 +797,8 @@ export default function App() {
           onRequestMotionPermission={handleRequestMotionPermission}
           isMuted={isMuted}
           onToggleMute={handleToggleMute}
+          musicEnabled={saveData.settings.musicEnabled ?? true}
+          onToggleMusicEnabled={handleToggleMusicEnabled}
           musicTrackTitle={musicTrack.title}
           onCycleMusicTrack={handleCycleMusicTrack}
           onPauseToggle={handlePauseToggle}
@@ -773,6 +819,7 @@ export default function App() {
           }}
           lastRunPayload={lastRunPayload}
           bestScore={saveData.bestScore}
+          totalCoinsBalance={saveData.coins}
           rewardedBonusClaimed={rewardedBonusClaimed}
           adsOffline={saveData.settings.simulatedAdsOffline}
           onWatchRewardedAdForBonus={handleWatchRewardedAdForBonus}

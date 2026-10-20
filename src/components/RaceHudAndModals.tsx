@@ -25,6 +25,8 @@ interface RaceHudAndModalsProps {
   onRequestMotionPermission: () => void;
   isMuted: boolean;
   onToggleMute: () => void;
+  musicEnabled?: boolean;
+  onToggleMusicEnabled?: () => void;
   musicTrackTitle?: string;
   onCycleMusicTrack?: () => void;
   onPauseToggle: () => void;
@@ -36,6 +38,7 @@ interface RaceHudAndModalsProps {
   onOpenSettingsFromPause: () => void;
   lastRunPayload: CompletedRunPayload | null;
   bestScore: number;
+  totalCoinsBalance?: number;
   rewardedBonusClaimed: boolean;
   adsOffline: boolean;
   onWatchRewardedAdForBonus: (sdkConfirmed: boolean) => void;
@@ -54,6 +57,8 @@ export const RaceHudAndModals: React.FC<RaceHudAndModalsProps> = ({
   onRequestMotionPermission,
   isMuted,
   onToggleMute,
+  musicEnabled = true,
+  onToggleMusicEnabled,
   musicTrackTitle,
   onCycleMusicTrack,
   onPauseToggle,
@@ -65,6 +70,7 @@ export const RaceHudAndModals: React.FC<RaceHudAndModalsProps> = ({
   onOpenSettingsFromPause,
   lastRunPayload,
   bestScore,
+  totalCoinsBalance = 0,
   rewardedBonusClaimed,
   adsOffline,
   onWatchRewardedAdForBonus,
@@ -202,46 +208,46 @@ export const RaceHudAndModals: React.FC<RaceHudAndModalsProps> = ({
   return (
     <div className="fixed inset-0 z-10 pointer-events-none flex flex-col justify-between p-2.5 sm:p-4 select-none overflow-hidden">
       {/* 1. TOP PERIMETER HUD CLUSTERS */}
-      <div className="flex items-start justify-between gap-2.5">
+      <div className="w-full flex items-start justify-between gap-2">
         {/* Top-Left Cluster: Speedometer, Distance/Remaining & Shield Charges */}
-        <div className="bg-[#0b0f19]/88 border border-slate-800/90 rounded-xl px-3.5 py-2 shadow-xl flex items-center gap-3.5 pointer-events-auto">
+        <div className="bg-[#0b0f19]/88 border border-slate-800/90 rounded-xl px-2.5 py-1.5 shadow-xl flex items-center gap-2.5 pointer-events-auto shrink-0">
           <div>
-            <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+            <div className="text-[9px] font-bold uppercase tracking-wider text-slate-400">
               SPEED KM/H
             </div>
             <div className="flex items-baseline gap-1">
               <span
                 ref={hudRefs.speedValueRef}
                 data-testid="hud-speed"
-                className="text-2xl sm:text-3xl font-bold font-mono tabular-nums text-cyan-400 leading-none"
+                className="text-xl sm:text-2xl font-bold font-mono tabular-nums text-cyan-400 leading-none"
               >
-                62
+                0
               </span>
             </div>
           </div>
 
-          <div className="border-l border-slate-800 pl-3">
-            <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+          <div className="border-l border-slate-800 pl-2.5">
+            <div className="text-[9px] font-bold uppercase tracking-wider text-slate-400">
               {isLevels ? 'TO FINISH' : 'DISTANCE'}
             </div>
             <span
               ref={hudRefs.distanceValueRef}
               data-testid="hud-distance"
-              className="text-lg sm:text-xl font-bold font-mono tabular-nums text-slate-100 leading-none"
+              className="text-base sm:text-lg font-bold font-mono tabular-nums text-slate-100 leading-none"
             >
               0m
             </span>
           </div>
 
           {isLevels && (
-            <div className="border-l border-slate-800 pl-3">
-              <div className="text-[10px] font-bold uppercase tracking-wider text-amber-400">
-                POSITION
+            <div className="border-l border-slate-800 pl-2.5">
+              <div className="text-[9px] font-bold uppercase tracking-wider text-amber-400">
+                POS
               </div>
               <span
                 ref={hudRefs.racePositionValueRef}
                 data-testid="hud-position"
-                className="text-lg sm:text-xl font-black font-mono tabular-nums text-amber-400 leading-none"
+                className="text-base sm:text-lg font-black font-mono tabular-nums text-amber-400 leading-none"
               >
                 {liveSnapshot.playerPosition ?? 6}/6
               </span>
@@ -249,12 +255,12 @@ export const RaceHudAndModals: React.FC<RaceHudAndModalsProps> = ({
           )}
 
           {/* Discrete Hull Shield Sockets */}
-          <div className="border-l border-slate-800 pl-3">
-            <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1">
+          <div className="border-l border-slate-800 pl-2.5">
+            <div className="text-[9px] font-bold uppercase tracking-wider text-slate-400 mb-0.5">
               SHIELD ({liveSnapshot.integrity}/{liveSnapshot.maxIntegrity})
             </div>
             <div
-              className="flex items-center gap-1"
+              className="flex items-center gap-0.5"
               aria-label={`Hull Shield ${liveSnapshot.integrity} of ${liveSnapshot.maxIntegrity}`}
             >
               {Array.from({ length: liveSnapshot.maxIntegrity }, (_, i) => {
@@ -263,7 +269,7 @@ export const RaceHudAndModals: React.FC<RaceHudAndModalsProps> = ({
                   <svg
                     key={i}
                     viewBox="0 0 24 24"
-                    className={`w-4 h-4 transition-colors ${
+                    className={`w-3.5 h-3.5 transition-colors ${
                       active ? 'text-cyan-400' : 'text-slate-700'
                     }`}
                     fill={active ? 'currentColor' : 'none'}
@@ -278,61 +284,15 @@ export const RaceHudAndModals: React.FC<RaceHudAndModalsProps> = ({
           </div>
         </div>
 
-        {/* Top-Center Transient Countdown, Weather/Grip Telemetry, Course Progress & Callouts */}
-        <div className="flex flex-col items-center gap-1.5 pointer-events-none">
-          <button
-            type="button"
-            data-testid="hud-weather-btn"
-            onClick={(e) => {
-              e.currentTarget.blur();
-              soundController.playButtonClick();
-              controlsRef.current.cycleWeather?.();
-            }}
-            title="Click to cycle Weather Condition (Clear / Rain / Fog / Snow)"
-            className="pointer-events-auto bg-[#0b0f19]/90 hover:bg-slate-800/90 border border-slate-800 rounded-xl px-3 py-1 shadow-lg flex items-center gap-2 text-[10px] sm:text-[11px] font-bold tracking-wider uppercase transition-colors cursor-pointer"
-          >
-            <span className="text-cyan-400">
-              {liveSnapshot.weatherCondition === 'rain'
-                ? '🌧 RAIN'
-                : liveSnapshot.weatherCondition === 'fog'
-                  ? '🌫 FOG'
-                  : liveSnapshot.weatherCondition === 'snow'
-                    ? '❄ SNOW'
-                    : '☀ CLEAR'}
-            </span>
-            <span className="text-slate-600" aria-hidden="true">
-              ·
-            </span>
-            <span
-              data-testid="hud-grip-pct"
-              className={
-                (liveSnapshot.trackGripPct ?? 100) < 80
-                  ? 'text-amber-400 font-mono'
-                  : (liveSnapshot.trackGripPct ?? 100) < 95
-                    ? 'text-cyan-300 font-mono'
-                    : 'text-emerald-400 font-mono'
-              }
-            >
-              GRIP {liveSnapshot.trackGripPct ?? 100}%
-            </span>
-            <span className="text-slate-600 hidden sm:inline" aria-hidden="true">
-              ·
-            </span>
-            <span
-              data-testid="hud-visibility-pct"
-              className="text-slate-300 font-mono hidden sm:inline"
-            >
-              VIS {liveSnapshot.visibilityPct ?? 100}%
-            </span>
-          </button>
-
+        {/* Top-Center Transient Countdown, Course Progress & Drift / Near-Miss Callout */}
+        <div className="flex flex-col items-center gap-1 pointer-events-none min-w-0 flex-1 max-w-[230px]">
           {isLevels && (
-            <div className="bg-[#0b0f19]/88 border border-slate-800 px-3 py-1 rounded-xl flex flex-col items-center gap-1 min-w-[180px] sm:min-w-[230px]">
-              <div className="flex items-center justify-between w-full text-[10px] font-bold">
+            <div className="bg-[#0b0f19]/88 border border-slate-800 px-2.5 py-1 rounded-xl flex flex-col items-center gap-1 w-full">
+              <div className="flex items-center justify-between w-full text-[9px] font-bold gap-1">
                 <span className="text-amber-400 uppercase truncate">
                   {liveSnapshot.levelTitle ?? `Level ${liveSnapshot.levelNumber ?? 1}`}
                 </span>
-                <span className="text-slate-400 ml-2 truncate">
+                <span className="text-slate-300 truncate shrink-0">
                   {liveSnapshot.segmentLabel ?? 'City Circuit'}
                 </span>
               </div>
@@ -347,8 +307,8 @@ export const RaceHudAndModals: React.FC<RaceHudAndModalsProps> = ({
           )}
 
           {liveSnapshot.countdownValue !== null && (
-            <div className="bg-[#0b0f19]/92 border border-cyan-500/50 px-6 py-2 rounded-2xl shadow-2xl">
-              <span className="text-2xl sm:text-4xl font-extrabold font-mono text-cyan-400 tracking-wider">
+            <div className="bg-[#0b0f19]/92 border border-cyan-500/50 px-5 py-1.5 rounded-2xl shadow-2xl">
+              <span className="text-2xl sm:text-3xl font-extrabold font-mono text-cyan-400 tracking-wider">
                 {liveSnapshot.countdownValue === 0
                   ? 'GO!'
                   : liveSnapshot.countdownValue}
@@ -357,15 +317,15 @@ export const RaceHudAndModals: React.FC<RaceHudAndModalsProps> = ({
           )}
 
           {liveSnapshot.isDrifting && (
-            <div className="px-3.5 py-1 rounded-xl border bg-amber-950/90 border-amber-400 text-amber-200 text-xs font-extrabold uppercase tracking-wider shadow-lg">
-              DRIFTING · +{liveSnapshot.driftScore ?? 0} PTS
+            <div className="px-3 py-0.5 rounded-xl border bg-amber-950/90 border-amber-400 text-amber-200 text-[11px] font-extrabold uppercase tracking-wider shadow-lg">
+              DRIFT · +{liveSnapshot.driftScore ?? 0} PTS
             </div>
           )}
 
           {liveSnapshot.comboBanner && (
             <div
               key={liveSnapshot.comboBanner.id}
-              className={`px-4 py-1.5 rounded-xl border shadow-xl text-center ${
+              className={`px-3 py-1 rounded-xl border shadow-xl text-center ${
                 liveSnapshot.comboBanner.tone === 'danger'
                   ? 'bg-red-950/90 border-red-500/60 text-red-200'
                   : liveSnapshot.comboBanner.tone === 'amber'
@@ -373,7 +333,7 @@ export const RaceHudAndModals: React.FC<RaceHudAndModalsProps> = ({
                     : 'bg-cyan-950/90 border-cyan-500/60 text-cyan-200'
               }`}
             >
-              <div className="text-xs sm:text-sm font-extrabold uppercase tracking-wider">
+              <div className="text-xs font-extrabold uppercase tracking-wider">
                 {liveSnapshot.comboBanner.text}
               </div>
               <div className="text-[10px] opacity-85">
@@ -384,51 +344,57 @@ export const RaceHudAndModals: React.FC<RaceHudAndModalsProps> = ({
         </div>
 
         {/* Top-Right Cluster: Score, Coins & Utility Controls */}
-        <div className="flex items-center gap-2 pointer-events-auto">
-          <div className="bg-[#0b0f19]/88 border border-slate-800/90 rounded-xl px-3.5 py-2 shadow-xl flex items-center gap-3.5">
+        <div className="flex items-center gap-1.5 pointer-events-auto shrink-0">
+          <div className="bg-[#0b0f19]/88 border border-slate-800/90 rounded-xl px-2.5 py-1.5 shadow-xl flex items-center gap-2.5">
             <div className="text-right">
-              <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+              <div className="text-[9px] font-bold uppercase tracking-wider text-slate-400">
                 SCORE
               </div>
               <span
                 ref={hudRefs.scoreValueRef}
                 data-testid="hud-score"
-                className="text-lg sm:text-xl font-bold font-mono tabular-nums text-slate-100 leading-none"
+                className="text-base sm:text-lg font-bold font-mono tabular-nums text-slate-100 leading-none"
               >
                 0
               </span>
             </div>
 
-            <div className="border-l border-slate-800 pl-3.5 text-right">
-              <div className="text-[10px] font-bold uppercase tracking-wider text-amber-400">
+            <div className="border-l border-slate-800 pl-2.5 text-right">
+              <div className="text-[9px] font-bold uppercase tracking-wider text-amber-400">
                 COINS
               </div>
               <span
                 ref={hudRefs.coinsValueRef}
                 data-testid="hud-coins"
-                className="text-lg sm:text-xl font-bold font-mono tabular-nums text-amber-400 leading-none"
+                className="text-base sm:text-lg font-bold font-mono tabular-nums text-amber-400 leading-none"
               >
                 0
               </span>
             </div>
           </div>
 
-          <div className="flex items-center gap-1.5">
-            {onCycleMusicTrack && (
+          <div className="flex items-center gap-1">
+            {onToggleMusicEnabled && (
               <button
                 type="button"
-                aria-label={`Switch Soundtrack (${musicTrackTitle ?? 'Cyber Overdrive'})`}
-                title={`Switch Soundtrack: ${musicTrackTitle ?? 'Cyber Overdrive'}`}
+                data-testid="hud-music-toggle-btn"
+                aria-label={musicEnabled ? 'Turn Music Off' : 'Turn Music On'}
+                title={musicEnabled ? 'Music On (Click to turn off)' : 'Music Off (Click to turn on)'}
                 onClick={(e) => {
                   e.currentTarget.blur();
-                  onCycleMusicTrack();
+                  onToggleMusicEnabled();
                 }}
-                className="h-10 sm:h-11 px-2.5 rounded-xl bg-[#0b0f19]/90 hover:bg-slate-800 border border-cyan-500/40 flex items-center justify-center gap-1 text-cyan-300 text-xs font-bold cursor-pointer"
+                className={`w-9 h-9 sm:w-10 sm:h-10 rounded-xl border flex items-center justify-center cursor-pointer ${
+                  musicEnabled && !isMuted
+                    ? 'bg-[#0b0f19]/90 hover:bg-slate-800 border-cyan-500/40 text-cyan-300'
+                    : 'bg-[#0b0f19]/90 hover:bg-slate-800 border-slate-700 text-slate-500'
+                }`}
               >
-                <span aria-hidden="true">♪</span>
-                <span className="hidden md:inline max-w-[90px] truncate">
-                  {musicTrackTitle ?? 'Track'}
-                </span>
+                <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2.2}>
+                  <path d="M9 18V5l12-2v13" strokeLinecap="round" strokeLinejoin="round" />
+                  <circle cx="6" cy="18" r="3" />
+                  <circle cx="18" cy="16" r="3" />
+                </svg>
               </button>
             )}
 
@@ -439,9 +405,23 @@ export const RaceHudAndModals: React.FC<RaceHudAndModalsProps> = ({
                 e.currentTarget.blur();
                 onToggleMute();
               }}
-              className="w-10 h-10 sm:w-11 sm:h-11 rounded-xl bg-[#0b0f19]/90 hover:bg-slate-800 border border-slate-700 flex items-center justify-center text-slate-200 cursor-pointer"
+              className={`w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-[#0b0f19]/90 hover:bg-slate-800 border flex items-center justify-center cursor-pointer ${
+                isMuted ? 'border-amber-500/50 text-amber-400' : 'border-slate-700 text-slate-200'
+              }`}
             >
-              {isMuted ? '🔇' : '🔊'}
+              {isMuted ? (
+                <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2.2}>
+                  <path d="M11 5L6 9H2v6h4l5 4V5z" strokeLinecap="round" strokeLinejoin="round" />
+                  <line x1="23" y1="9" x2="17" y2="15" strokeLinecap="round" />
+                  <line x1="17" y1="9" x2="23" y2="15" strokeLinecap="round" />
+                </svg>
+              ) : (
+                <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2.2}>
+                  <path d="M11 5L6 9H2v6h4l5 4V5z" strokeLinecap="round" strokeLinejoin="round" />
+                  <path d="M15.54 8.46a5 5 0 0 1 0 7.07" strokeLinecap="round" />
+                  <path d="M19.07 4.93a10 10 0 0 1 0 14.14" strokeLinecap="round" />
+                </svg>
+              )}
             </button>
 
             <button
@@ -452,9 +432,9 @@ export const RaceHudAndModals: React.FC<RaceHudAndModalsProps> = ({
                 e.currentTarget.blur();
                 onPauseToggle();
               }}
-              className="w-10 h-10 sm:w-11 sm:h-11 rounded-xl bg-[#0b0f19]/90 hover:bg-slate-800 border border-slate-700 flex items-center justify-center text-slate-200 cursor-pointer"
+              className="w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-[#0b0f19]/90 hover:bg-slate-800 border border-slate-700 flex items-center justify-center text-slate-200 cursor-pointer"
             >
-              <svg viewBox="0 0 24 24" className="w-5 h-5" fill="currentColor">
+              <svg viewBox="0 0 24 24" className="w-4 h-4" fill="currentColor">
                 <rect x="6" y="4" width="4" height="16" rx="1" />
                 <rect x="14" y="4" width="4" height="16" rx="1" />
               </svg>
@@ -732,6 +712,7 @@ export const RaceHudAndModals: React.FC<RaceHudAndModalsProps> = ({
         <div
           role="dialog"
           aria-label="Race Paused"
+          data-testid="pause-modal"
           className="my-auto max-w-md w-full mx-auto bg-[#0b0f19]/95 border border-slate-800 rounded-2xl p-5 shadow-2xl pointer-events-auto text-center"
         >
           <div className="text-xs font-bold uppercase tracking-widest text-cyan-400 mb-1">
@@ -744,6 +725,7 @@ export const RaceHudAndModals: React.FC<RaceHudAndModalsProps> = ({
           <div className="flex flex-col gap-2.5">
             <button
               type="button"
+              data-testid="pause-resume-btn"
               onClick={onPauseToggle}
               className="w-full py-3 rounded-xl bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-extrabold text-sm uppercase tracking-wider cursor-pointer"
             >
@@ -752,11 +734,52 @@ export const RaceHudAndModals: React.FC<RaceHudAndModalsProps> = ({
 
             <button
               type="button"
+              data-testid="pause-restart-btn"
               onClick={onRestartRace}
               className="w-full py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-100 font-semibold text-xs sm:text-sm cursor-pointer"
             >
               Restart Race
             </button>
+
+            {/* Quick In-Pause Audio / Music Controls */}
+            <div className="grid grid-cols-2 gap-2">
+              {onToggleMusicEnabled && (
+                <button
+                  type="button"
+                  data-testid="pause-music-toggle-btn"
+                  onClick={onToggleMusicEnabled}
+                  className={`py-2 px-3 rounded-xl border font-semibold text-xs cursor-pointer ${
+                    musicEnabled && !isMuted
+                      ? 'bg-cyan-950/60 border-cyan-500/50 text-cyan-300'
+                      : 'bg-slate-900 border-slate-800 text-slate-400'
+                  }`}
+                >
+                  {musicEnabled ? '♪ Music: ON' : '♪ Music: OFF'}
+                </button>
+              )}
+              <button
+                type="button"
+                data-testid="pause-mute-toggle-btn"
+                onClick={onToggleMute}
+                className={`py-2 px-3 rounded-xl border font-semibold text-xs cursor-pointer ${
+                  !isMuted
+                    ? 'bg-slate-900 border-slate-700 text-slate-200'
+                    : 'bg-amber-950/50 border-amber-500/40 text-amber-300'
+                }`}
+              >
+                {isMuted ? '🔇 Audio: Muted' : '🔊 Audio: Active'}
+              </button>
+            </div>
+
+            {onCycleMusicTrack && (
+              <button
+                type="button"
+                onClick={onCycleMusicTrack}
+                className="w-full py-2 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 font-semibold text-xs cursor-pointer"
+              >
+                Soundtrack: {musicTrackTitle ?? 'Velocity Rush Anthem'} (Tap to Switch)
+              </button>
+            )}
 
             <button
               type="button"
@@ -778,10 +801,11 @@ export const RaceHudAndModals: React.FC<RaceHudAndModalsProps> = ({
 
             <button
               type="button"
+              data-testid="pause-quit-btn"
               onClick={onExitToMenu}
               className="w-full py-2 rounded-xl bg-slate-950 hover:bg-slate-900 border border-slate-800 text-slate-400 font-semibold text-xs cursor-pointer"
             >
-              Main Menu
+              Quit to Main Menu
             </button>
           </div>
         </div>
@@ -1017,6 +1041,9 @@ export const RaceHudAndModals: React.FC<RaceHudAndModalsProps> = ({
                   >
                     +{lastRunPayload.summary.totalCoinsEarned}
                     {rewardedBonusClaimed ? ' (2x!)' : ''}
+                  </div>
+                  <div className="text-[10px] font-mono text-slate-400 mt-0.5">
+                    Pickups: {lastRunPayload.coinsCollected} · Wallet: {totalCoinsBalance}
                   </div>
                 </div>
               </div>

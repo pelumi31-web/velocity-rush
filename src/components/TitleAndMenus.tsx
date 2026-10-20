@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useState } from 'react';
 import {
   AD_CONFIG,
   BUMPER_OPTIONS,
@@ -95,6 +95,9 @@ interface TitleAndMenusProps {
   onRequestMotionPermission: () => void;
   onToggleFullscreen: () => void;
   onRotateTurntable: (deltaRad: number) => void;
+  onSetGarageRotateHoldDir?: (dir: -1 | 0 | 1) => void;
+  onResetGarageTurntableView?: () => void;
+  onToggleGarageAutoRotate?: () => boolean;
   musicTrack?: MusicTrackMeta;
   isMuted?: boolean;
   onCycleMusicTrack?: () => void;
@@ -123,6 +126,9 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
   onRequestMotionPermission,
   onToggleFullscreen,
   onRotateTurntable,
+  onSetGarageRotateHoldDir,
+  onResetGarageTurntableView,
+  onToggleGarageAutoRotate,
   musicTrack,
   isMuted = false,
   onCycleMusicTrack,
@@ -139,9 +145,7 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
   const [unityDocTab, setUnityDocTab] = useState<'architecture' | 'csharp' | 'admob' | 'apk'>(
     'architecture'
   );
-
-  // Touch swipe tracking for Garage car browsing
-  const swipeStartXRef = useRef<number | null>(null);
+  const [autoSpinActive, setAutoSpinActive] = useState<boolean>(true);
 
   const selectedCar = CAR_CONFIGS[saveData.selectedCarId] ?? CAR_CONFIGS.starter_apex;
   const inspectedCar = CAR_CONFIGS[inspectCarId] ?? CAR_CONFIGS.starter_apex;
@@ -210,7 +214,7 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
             </span>
             <div>
               <div className="text-[9px] uppercase tracking-wider text-slate-400">
-                COINS
+                TOTAL COINS
               </div>
               <div
                 data-testid="menu-coins"
@@ -225,7 +229,7 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
 
           <div>
             <div className="text-[9px] uppercase tracking-wider text-slate-400">
-              BEST SOLO
+              HIGH SCORE
             </div>
             <div
               data-testid="menu-best-score"
@@ -259,18 +263,26 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
-          {onCycleMusicTrack && (
-            <button
-              type="button"
-              data-testid="menu-cycle-music-btn"
-              onClick={onCycleMusicTrack}
-              title="Switch Intense Soundtrack Theme (Shortcut: T)"
-              className="bg-[#0b0f19]/90 hover:bg-slate-800/90 border border-cyan-500/40 text-cyan-300 px-2.5 py-1.5 rounded-xl text-xs font-semibold transition-colors cursor-pointer flex items-center gap-1 whitespace-nowrap shrink-0"
-            >
-              <span aria-hidden="true">♪</span>
-              <span className="hidden sm:inline">{musicTrack?.title ?? 'Cyber Overdrive'}</span>
-            </button>
-          )}
+          <button
+            type="button"
+            data-testid="menu-music-toggle-btn"
+            onClick={() =>
+              onUpdateSettings({
+                musicEnabled: !(saveData.settings.musicEnabled ?? true),
+              })
+            }
+            title="Toggle Background Music On/Off"
+            className={`px-2.5 py-1.5 rounded-xl text-xs font-semibold border transition-colors cursor-pointer flex items-center gap-1 whitespace-nowrap shrink-0 ${
+              (saveData.settings.musicEnabled ?? true) && !isMuted
+                ? 'bg-[#0b0f19]/90 hover:bg-slate-800/90 border-cyan-500/40 text-cyan-300'
+                : 'bg-[#0b0f19]/90 hover:bg-slate-800/90 border-slate-800 text-slate-400'
+            }`}
+          >
+            <span aria-hidden="true">♪</span>
+            <span className="hidden sm:inline">
+              {(saveData.settings.musicEnabled ?? true) ? 'Music On' : 'Music Off'}
+            </span>
+          </button>
           {onToggleMute && (
             <button
               type="button"
@@ -278,7 +290,7 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
               onClick={onToggleMute}
               className="bg-[#0b0f19]/90 hover:bg-slate-800/90 border border-slate-800 text-slate-200 px-2.5 py-1.5 rounded-xl text-xs font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0"
             >
-              {isMuted ? 'Muted' : 'Audio On'}
+              {isMuted ? 'Muted' : 'SFX On'}
             </button>
           )}
           <button
@@ -556,126 +568,164 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
 
       {/* 3. PREMIUM LANDSCAPE GARAGE (Split-Screen: B. 3D Showroom Left + C/D. 6-Category Customizer Right) */}
       {activeModal === 'garage' && (
-        <div
-          className="my-auto w-full flex flex-col sm:flex-row items-stretch justify-between gap-2.5 pointer-events-none max-h-[calc(100vh-4.2rem)]"
-          onTouchStart={(e) => {
-            swipeStartXRef.current = e.touches[0]?.clientX ?? null;
-          }}
-          onTouchEnd={(e) => {
-            if (swipeStartXRef.current === null) return;
-            const endX = e.changedTouches[0]?.clientX ?? swipeStartXRef.current;
-            const deltaX = endX - swipeStartXRef.current;
-            swipeStartXRef.current = null;
-            if (Math.abs(deltaX) > 65) {
-              cycleInspectedCar(deltaX < 0 ? 1 : -1);
-            }
-          }}
-        >
+        <div className="my-auto w-full flex flex-col sm:flex-row items-stretch justify-between gap-2.5 pointer-events-none h-[calc(100vh-4.1rem)]">
           {/* AREA B: LARGE VEHICLE 3D SHOWROOM OVERLAY (Left 44% of Landscape Screen) */}
-          <div className="w-full sm:w-5/12 flex flex-col justify-between items-start gap-2 pointer-events-none">
-            {/* Top-Left Vehicle Identity & Live Stat Bars */}
-            <div className="pointer-events-auto bg-[#0b0f19]/84 border border-slate-800/90 rounded-xl px-3 py-2 backdrop-blur-md shadow-xl w-full max-w-sm">
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-[10px] font-bold uppercase tracking-wider text-cyan-400">
-                  {inspectedCar.category}
-                </span>
-                <span
-                  className={`px-1.5 py-0.5 rounded text-[9px] font-bold uppercase ${
-                    isInspectedSelected
-                      ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
+          <div className="w-full sm:w-5/12 flex flex-col justify-between items-center gap-1 pointer-events-none h-full">
+            {/* Compact Top-Left Vehicle Identity & 5-Stat Strip */}
+            <div className="pointer-events-auto bg-[#0b0f19]/88 border border-slate-800/90 rounded-xl px-2.5 py-1.5 backdrop-blur-md shadow-xl w-full">
+              <div className="flex items-center justify-between gap-1.5">
+                <div className="flex items-center gap-2 min-w-0">
+                  <h2
+                    data-testid="garage-car-title"
+                    className="text-sm sm:text-base font-black text-white tracking-tight truncate"
+                  >
+                    {inspectedCar.name}
+                  </h2>
+                  <span
+                    className={`px-1.5 py-0.5 rounded text-[9px] font-bold uppercase shrink-0 ${
+                      isInspectedSelected
+                        ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
+                        : isInspectedUnlocked
+                          ? 'bg-emerald-500/20 text-emerald-300'
+                          : 'bg-amber-500/20 text-amber-300'
+                    }`}
+                  >
+                    {isInspectedSelected
+                      ? 'Equipped'
                       : isInspectedUnlocked
-                        ? 'bg-emerald-500/20 text-emerald-300'
-                        : 'bg-amber-500/20 text-amber-300'
-                  }`}
-                >
-                  {isInspectedSelected
-                    ? 'Equipped'
-                    : isInspectedUnlocked
-                      ? 'Owned'
-                      : `${inspectedCar.unlockCost} Coins`}
-                </span>
-              </div>
-              <div className="flex items-center justify-between gap-2 mt-0.5">
-                <h2
-                  data-testid="garage-car-title"
-                  className="text-base sm:text-lg font-black text-white tracking-tight truncate"
-                >
-                  {inspectedCar.name}
-                </h2>
+                        ? 'Owned'
+                        : `${inspectedCar.unlockCost} Coins`}
+                  </span>
+                </div>
+
                 <div className="flex items-center gap-1 shrink-0">
                   <button
                     type="button"
                     aria-label="Previous Car"
                     onClick={() => cycleInspectedCar(-1)}
-                    className="w-6 h-6 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold flex items-center justify-center cursor-pointer"
+                    className="w-6 h-5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-[10px] font-bold flex items-center justify-center cursor-pointer"
                   >
-                    ◀
+                    ‹
                   </button>
-                  <span className="text-[10px] font-mono text-slate-400 px-1">
+                  <span className="text-[10px] font-mono text-slate-400 px-0.5">
                     {CAR_ORDER.indexOf(inspectCarId) + 1}/{CAR_ORDER.length}
                   </span>
                   <button
                     type="button"
                     aria-label="Next Car"
                     onClick={() => cycleInspectedCar(1)}
-                    className="w-6 h-6 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold flex items-center justify-center cursor-pointer"
+                    className="w-6 h-5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-[10px] font-bold flex items-center justify-center cursor-pointer"
                   >
-                    ▶
+                    ›
                   </button>
                 </div>
               </div>
 
-              {/* Compact 5-Stat Telemetry Strip */}
-              <div className="grid grid-cols-5 gap-1 mt-1.5 pt-1.5 border-t border-slate-800/80 text-center">
+              {/* Ultra-Compact 5-Stat Telemetry Strip */}
+              <div className="grid grid-cols-5 gap-1 mt-1 pt-1 border-t border-slate-800/80 text-center">
                 <div>
-                  <div className="text-[8px] uppercase text-slate-400">Speed</div>
-                  <div className="text-[11px] font-mono font-bold text-cyan-400">
+                  <span className="text-[8px] uppercase text-slate-400 mr-1">SPD</span>
+                  <span className="text-[10px] font-mono font-bold text-cyan-400">
                     {effectiveStats.topSpeedKmh}
-                  </div>
+                  </span>
                 </div>
                 <div>
-                  <div className="text-[8px] uppercase text-slate-400">Accel</div>
-                  <div className="text-[11px] font-mono font-bold text-slate-200">
+                  <span className="text-[8px] uppercase text-slate-400 mr-1">ACC</span>
+                  <span className="text-[10px] font-mono font-bold text-slate-200">
                     {effectiveStats.acceleration}
-                  </div>
+                  </span>
                 </div>
                 <div>
-                  <div className="text-[8px] uppercase text-slate-400">Grip</div>
-                  <div className="text-[11px] font-mono font-bold text-slate-200">
+                  <span className="text-[8px] uppercase text-slate-400 mr-1">GRP</span>
+                  <span className="text-[10px] font-mono font-bold text-slate-200">
                     {effectiveStats.handling}
-                  </div>
+                  </span>
                 </div>
                 <div>
-                  <div className="text-[8px] uppercase text-slate-400">Brake</div>
-                  <div className="text-[11px] font-mono font-bold text-slate-200">
+                  <span className="text-[8px] uppercase text-slate-400 mr-1">BRK</span>
+                  <span className="text-[10px] font-mono font-bold text-slate-200">
                     {effectiveStats.brakingDecelMs2}
-                  </div>
+                  </span>
                 </div>
                 <div>
-                  <div className="text-[8px] uppercase text-slate-400">Shield</div>
-                  <div className="text-[11px] font-mono font-bold text-emerald-400">
+                  <span className="text-[8px] uppercase text-slate-400 mr-1">SHD</span>
+                  <span className="text-[10px] font-mono font-bold text-emerald-400">
                     {effectiveStats.maxShieldCharges}x
-                  </div>
+                  </span>
                 </div>
               </div>
             </div>
 
-            {/* Bottom-Left 360° Turntable Rotation + Primary Car Unlock/Equip Action */}
-            <div className="pointer-events-auto flex flex-wrap items-center gap-1.5 bg-[#0b0f19]/88 border border-slate-800/90 rounded-xl px-2.5 py-1.5 backdrop-blur-md shadow-xl">
-              <button
-                type="button"
-                onClick={() => onRotateTurntable(-0.65)}
-                className="px-2 py-1 text-[11px] font-semibold bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-700 rounded-lg cursor-pointer"
-              >
-                ↺ Rotate
-              </button>
-              <button
-                type="button"
-                onClick={() => onRotateTurntable(0.65)}
-                className="px-2 py-1 text-[11px] font-semibold bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-700 rounded-lg cursor-pointer"
-              >
-                Rotate ↻
-              </button>
+            {/* Centered 360° Turntable Rotation Dock + Primary Car Unlock/Equip Action */}
+            <div
+              data-testid="garage-rotation-dock"
+              className="pointer-events-auto w-full flex items-center justify-between gap-1.5 bg-[#0b0f19]/90 border border-slate-800/90 rounded-xl px-2.5 py-1.5 backdrop-blur-md shadow-xl"
+            >
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  data-testid="garage-rotate-left-btn"
+                  aria-label="Rotate Vehicle Left"
+                  onPointerDown={() => onSetGarageRotateHoldDir?.(-1)}
+                  onPointerUp={() => onSetGarageRotateHoldDir?.(0)}
+                  onPointerLeave={() => onSetGarageRotateHoldDir?.(0)}
+                  onPointerCancel={() => onSetGarageRotateHoldDir?.(0)}
+                  onClick={() => onRotateTurntable(-0.55)}
+                  className="px-2 py-1 text-[10px] font-bold bg-slate-900 hover:bg-slate-800 active:bg-cyan-500 active:text-slate-950 text-slate-100 border border-slate-700 rounded-lg cursor-pointer select-none flex items-center gap-1"
+                >
+                  <svg viewBox="0 0 20 20" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2.2}>
+                    <path d="M12 5L7 10l5 5" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                  <span>Rotate</span>
+                </button>
+
+                <button
+                  type="button"
+                  data-testid="garage-reset-view-btn"
+                  aria-label="Reset Showroom Angle"
+                  onClick={() => {
+                    onResetGarageTurntableView?.();
+                    setAutoSpinActive(true);
+                  }}
+                  className="px-2 py-1 text-[10px] font-semibold bg-slate-900 hover:bg-slate-800 text-cyan-300 border border-slate-700 rounded-lg cursor-pointer select-none"
+                >
+                  Reset 360°
+                </button>
+
+                <button
+                  type="button"
+                  data-testid="garage-autospin-btn"
+                  aria-label="Toggle Auto-Spin"
+                  onClick={() => {
+                    const next = onToggleGarageAutoRotate?.() ?? !autoSpinActive;
+                    setAutoSpinActive(next);
+                  }}
+                  className={`px-2 py-1 text-[10px] font-bold rounded-lg border cursor-pointer select-none ${
+                    autoSpinActive
+                      ? 'bg-cyan-500/20 border-cyan-500/50 text-cyan-300'
+                      : 'bg-slate-900 border-slate-700 text-slate-400'
+                  }`}
+                >
+                  {autoSpinActive ? 'Spin: ON' : 'Spin: OFF'}
+                </button>
+
+                <button
+                  type="button"
+                  data-testid="garage-rotate-right-btn"
+                  aria-label="Rotate Vehicle Right"
+                  onPointerDown={() => onSetGarageRotateHoldDir?.(1)}
+                  onPointerUp={() => onSetGarageRotateHoldDir?.(0)}
+                  onPointerLeave={() => onSetGarageRotateHoldDir?.(0)}
+                  onPointerCancel={() => onSetGarageRotateHoldDir?.(0)}
+                  onClick={() => onRotateTurntable(0.55)}
+                  className="px-2 py-1 text-[10px] font-bold bg-slate-900 hover:bg-slate-800 active:bg-cyan-500 active:text-slate-950 text-slate-100 border border-slate-700 rounded-lg cursor-pointer select-none flex items-center gap-1"
+                >
+                  <span>Rotate</span>
+                  <svg viewBox="0 0 20 20" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2.2}>
+                    <path d="M8 5l5 5-5 5" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                </button>
+              </div>
 
               {!isInspectedUnlocked ? (
                 <button
@@ -689,18 +739,18 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
                       onTriggerFeedbackNotice(`Unlocked & Equipped ${inspectedCar.name}!`);
                     }
                   }}
-                  className="px-3 py-1 rounded-lg bg-amber-400 hover:bg-amber-300 text-slate-950 font-extrabold text-xs uppercase tracking-wider cursor-pointer"
+                  className="px-2.5 py-1 rounded-lg bg-amber-400 hover:bg-amber-300 text-slate-950 font-extrabold text-[10px] uppercase tracking-wider cursor-pointer shrink-0"
                 >
-                  Unlock · {inspectedCar.unlockCost} Coins
+                  Unlock · {inspectedCar.unlockCost}
                 </button>
               ) : isInspectedSelected ? (
                 <button
                   type="button"
                   data-testid="garage-race-btn"
                   onClick={() => setActiveModal('modes')}
-                  className="px-3 py-1 rounded-lg bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-extrabold text-xs uppercase tracking-wider cursor-pointer"
+                  className="px-2.5 py-1 rounded-lg bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-extrabold text-[10px] uppercase tracking-wider cursor-pointer shrink-0"
                 >
-                  Equipped · Select Mode
+                  Race Now
                 </button>
               ) : (
                 <button
@@ -710,9 +760,9 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
                     onSelectCar(inspectCarId);
                     onTriggerFeedbackNotice(`Equipped ${inspectedCar.name}`);
                   }}
-                  className="px-3 py-1 rounded-lg bg-emerald-400 hover:bg-emerald-300 text-slate-950 font-extrabold text-xs uppercase tracking-wider cursor-pointer"
+                  className="px-2.5 py-1 rounded-lg bg-emerald-400 hover:bg-emerald-300 text-slate-950 font-extrabold text-[10px] uppercase tracking-wider cursor-pointer shrink-0"
                 >
-                  Equip Vehicle
+                  Equip
                 </button>
               )}
             </div>
@@ -1704,14 +1754,39 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
                 Audio, Soundtrack & Graphics
               </div>
 
+              <div className="flex items-center justify-between py-1 px-2.5 rounded-lg bg-slate-950 border border-slate-800">
+                <div>
+                  <div className="text-slate-200 font-semibold">Background Music</div>
+                  <div className="text-[10px] text-slate-400">
+                    Continuous looping race soundtrack
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  data-testid="settings-music-toggle"
+                  onClick={() =>
+                    onUpdateSettings({
+                      musicEnabled: !(saveData.settings.musicEnabled ?? true),
+                    })
+                  }
+                  className={`px-3 py-1 rounded-lg font-bold text-xs cursor-pointer ${
+                    (saveData.settings.musicEnabled ?? true)
+                      ? 'bg-cyan-400 text-slate-950'
+                      : 'bg-slate-800 text-slate-400'
+                  }`}
+                >
+                  {(saveData.settings.musicEnabled ?? true) ? 'ON' : 'OFF'}
+                </button>
+              </div>
+
               {onSelectMusicTrack && (
                 <div>
                   <label className="block text-slate-400 mb-1">
-                    Intense Racing Soundtrack
+                    Soundtrack Channel
                   </label>
                   <div className="grid grid-cols-1 gap-1.5">
                     {MUSIC_TRACKS.map((tr) => {
-                      const active = (musicTrack?.id ?? 'cyber_overdrive') === tr.id;
+                      const active = (musicTrack?.id ?? 'supplied_soundtrack') === tr.id;
                       return (
                         <button
                           key={tr.id}

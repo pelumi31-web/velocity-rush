@@ -26,26 +26,21 @@ import {
 import {
   AiOpponentState,
   calculateLevelRaceRewards,
+  computeCurvedRoadCenterAtWorldZ,
   computeRaceStandings,
   createLevelAiOpponents,
   GeneratedLevelCourse,
   generateLevelCourse,
   LevelHazardType,
   LevelRaceRewardsBreakdown,
+  PLAYER_GRID_START_DIST,
+  PLAYER_GRID_START_X,
   RacerStandingEntry,
   sampleTrackAtDistance,
   stepAiOpponent,
 } from '../game/levelsMode';
 import { CarCustomizationState, createDefaultCarCustomization } from '../game/saveSystem';
 import { soundController } from '../game/audio';
-import {
-  createInitialWeatherState,
-  selectNextRandomWeather,
-  stepWeatherInterpolation,
-  WEATHER_ORDER,
-  WEATHER_PROFILES,
-  WeatherConditionId,
-} from '../game/weather';
 import {
   applyCarCustomizationToRig,
   buildCoinCollectibleMesh,
@@ -93,18 +88,15 @@ export interface LiveRaceSnapshot {
   totalRacers?: number;    // 6
   isDrifting?: boolean;
   driftScore?: number;
-  weatherCondition?: WeatherConditionId;
-  weatherLabel?: string;
-  surfaceConditionLabel?: string;
-  trackGripPct?: number;
-  visibilityPct?: number;
 }
 
 export interface CompletedRunPayload {
   runId: string;
   playMode: GamePlayMode;
   summary: RunRewardsSummary;
+  coinsCollected: number;
   nearMissCount: number;
+  driftScore: number;
   topSpeedKmh: number;
   reviveAvailable: boolean;
   levelResult?: {
@@ -114,6 +106,7 @@ export interface CompletedRunPayload {
     playerFinishedCourse: boolean;
     finishTimeSec: number;
     rewards: LevelRaceRewardsBreakdown;
+    coinsCollected: number;
     driftScore: number;
     collisionsCount: number;
   };
@@ -135,9 +128,10 @@ export interface TouchInputControlsRef {
   triggerRevive?: () => void;
   triggerRestart?: () => void;
   rotateGarageTurntable?: (deltaRad: number) => void;
+  setGarageRotateHoldDir?: (dir: -1 | 0 | 1) => void;
+  resetGarageTurntableView?: () => void;
+  toggleGarageAutoRotate?: () => boolean;
   requestMotionPermission?: () => Promise<boolean>;
-  cycleWeather?: () => WeatherConditionId;
-  setWeatherCondition?: (condition: WeatherConditionId) => void;
 }
 
 interface HighwayCanvasProps {
@@ -195,6 +189,14 @@ interface ParticleData {
   colorHex: number;
 }
 
+interface CarBoundsMetadata {
+  radius: number;
+  centerY: number;
+  length: number;
+  width: number;
+  height: number;
+}
+
 const TRAFFIC_COLORS = [
   0xe2e8f0, 0x38bdf8, 0xf59e0b, 0xef4444, 0x10b981, 0xa855f7, 0x64748b, 0xf97316,
 ];
@@ -208,6 +210,8 @@ const TRAFFIC_SPECS: Record<
   sport: { halfWidth: 0.94, halfLength: 2.15, minSpeedMs: 28, maxSpeedMs: 39 },
   truck: { halfWidth: 1.15, halfLength: 3.55, minSpeedMs: 17, maxSpeedMs: 24 },
 };
+
+const DEFAULT_GARAGE_YAW_RAD = 0.62;
 
 function getScreenOrientationDegrees(): number {
   if (typeof window === 'undefined') return 0;
@@ -238,7 +242,10 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
 
     const maxDpr = quality === 'high' ? 2 : quality === 'medium' ? 1.5 : 1.0;
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, maxDpr));
-    renderer.setSize(container.clientWidth || window.innerWidth, container.clientHeight || window.innerHeight);
+    renderer.setSize(
+      container.clientWidth || window.innerWidth,
+      container.clientHeight || window.innerHeight
+    );
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.18;
     renderer.shadowMap.enabled = quality !== 'low';
@@ -252,11 +259,12 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
 
     const scene = new THREE.Scene();
     scene.background = createSkyBackdropTexture();
-    scene.fog = new THREE.FogExp2(0x111a2e, 0.0042);
+    // Clean, consistent distance depth cue without any weather fog
+    scene.fog = new THREE.FogExp2(0x111a2e, 0.0038);
 
     const pmremGenerator = new THREE.PMREMGenerator(renderer);
     scene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
-    scene.environmentIntensity = 0.85;
+    scene.environmentIntensity = 0.88;
 
     const camera = new THREE.PerspectiveCamera(
       58,
@@ -267,8 +275,8 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
     );
     camera.position.set(0, 3.1, 6.8);
 
-    // Lighting
-    const hemiLight = new THREE.HemisphereLight(0xdbeafe, 0x1e293b, 1.35);
+    // Clear, consistent lighting
+    const hemiLight = new THREE.HemisphereLight(0xdbeafe, 0x1e293b, 1.38);
     scene.add(hemiLight);
 
     const sunLight = new THREE.DirectionalLight(0xfffbeb, 2.5);
@@ -291,14 +299,27 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
     rimLight.position.set(-18, 12, -24);
     scene.add(rimLight);
 
-    // Road & Environment
+    // Deformable Segmented Road & Barrier Geometry for True U-Shaped Curves & Hairpins
     const maxAniso = Math.min(8, renderer.capabilities.getMaxAnisotropy());
     const { albedoMap, roughnessMap } = createRoadTextures(maxAniso);
     albedoMap.repeat.set(1, 20);
     roughnessMap.repeat.set(1, 20);
 
-    const roadGeo = new THREE.PlaneGeometry(HIGHWAY_CONFIG.roadWidth, 320, 1, 24);
+    const roadZSegments = 56;
+    const roadLength = 320;
+    const roadCenterZ = -110;
+    const roadGeo = new THREE.PlaneGeometry(HIGHWAY_CONFIG.roadWidth, roadLength, 1, roadZSegments);
     roadGeo.rotateX(-Math.PI / 2);
+    roadGeo.translate(0, 0, roadCenterZ);
+
+    const roadPosAttr = roadGeo.attributes.position as THREE.BufferAttribute;
+    const roadBaseX = new Float32Array(roadPosAttr.count);
+    const roadBaseZ = new Float32Array(roadPosAttr.count);
+    for (let i = 0; i < roadPosAttr.count; i++) {
+      roadBaseX[i] = roadPosAttr.getX(i);
+      roadBaseZ[i] = roadPosAttr.getZ(i);
+    }
+
     const roadMat = new THREE.MeshStandardMaterial({
       map: albedoMap,
       roughnessMap,
@@ -306,66 +327,97 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       metalness: 0.14,
     });
     const roadMesh = new THREE.Mesh(roadGeo, roadMat);
-    roadMesh.position.set(0, 0, -110);
     roadMesh.receiveShadow = true;
     scene.add(roadMesh);
 
     const groundPlane = new THREE.Mesh(
-      new THREE.PlaneGeometry(520, 380),
+      new THREE.PlaneGeometry(560, 420),
       new THREE.MeshStandardMaterial({ color: 0x0b101d, roughness: 0.95 })
     );
     groundPlane.rotation.x = -Math.PI / 2;
     groundPlane.position.set(0, -0.06, -120);
     scene.add(groundPlane);
 
-    // Barriers
-    const barrierGeo = new THREE.BoxGeometry(0.65, 0.9, 320);
+    // Segmented Barriers & Neon Strips that follow the curved road geometry
+    function createCurvableWallMesh(
+      width: number,
+      height: number,
+      baseXOffset: number,
+      baseYOffset: number,
+      material: THREE.Material
+    ) {
+      const geo = new THREE.BoxGeometry(width, height, roadLength, 1, 1, roadZSegments);
+      geo.translate(baseXOffset, baseYOffset, roadCenterZ);
+      const pos = geo.attributes.position as THREE.BufferAttribute;
+      const origX = new Float32Array(pos.count);
+      const origZ = new Float32Array(pos.count);
+      for (let i = 0; i < pos.count; i++) {
+        origX[i] = pos.getX(i);
+        origZ[i] = pos.getZ(i);
+      }
+      const mesh = new THREE.Mesh(geo, material);
+      scene.add(mesh);
+      return { geo, pos, origX, origZ, mesh };
+    }
+
     const barrierMat = new THREE.MeshStandardMaterial({
       color: 0x1e293b,
       roughness: 0.52,
       metalness: 0.38,
     });
-    const leftBarrier = new THREE.Mesh(barrierGeo, barrierMat);
-    leftBarrier.position.set(-HIGHWAY_CONFIG.roadWidth * 0.5 - 0.32, 0.45, -110);
-    const rightBarrier = new THREE.Mesh(barrierGeo, barrierMat);
-    rightBarrier.position.set(HIGHWAY_CONFIG.roadWidth * 0.5 + 0.32, 0.45, -110);
-    scene.add(leftBarrier, rightBarrier);
+    const leftBarrier = createCurvableWallMesh(
+      0.65,
+      0.9,
+      -HIGHWAY_CONFIG.roadWidth * 0.5 - 0.32,
+      0.45,
+      barrierMat
+    );
+    const rightBarrier = createCurvableWallMesh(
+      0.65,
+      0.9,
+      HIGHWAY_CONFIG.roadWidth * 0.5 + 0.32,
+      0.45,
+      barrierMat
+    );
 
-    const stripGeo = new THREE.BoxGeometry(0.1, 0.1, 320);
-    const leftStrip = new THREE.Mesh(
-      stripGeo,
+    const leftStrip = createCurvableWallMesh(
+      0.1,
+      0.1,
+      -HIGHWAY_CONFIG.roadWidth * 0.5 + 0.03,
+      0.76,
       new THREE.MeshStandardMaterial({
         color: 0xf59e0b,
         emissive: 0xf59e0b,
         emissiveIntensity: 2.2,
       })
     );
-    leftStrip.position.set(-HIGHWAY_CONFIG.roadWidth * 0.5 + 0.03, 0.76, -110);
-
-    const rightStrip = new THREE.Mesh(
-      stripGeo,
+    const rightStrip = createCurvableWallMesh(
+      0.1,
+      0.1,
+      HIGHWAY_CONFIG.roadWidth * 0.5 - 0.03,
+      0.76,
       new THREE.MeshStandardMaterial({
         color: 0x06b6d4,
         emissive: 0x06b6d4,
         emissiveIntensity: 2.2,
       })
     );
-    rightStrip.position.set(HIGHWAY_CONFIG.roadWidth * 0.5 - 0.03, 0.76, -110);
-    scene.add(leftStrip, rightStrip);
+
+    const curvableRoadWalls = [leftBarrier, rightBarrier, leftStrip, rightStrip];
 
     // Showroom Pedestal Ring (visible when Garage is open)
     const turntableGroup = new THREE.Group();
     const platformDisc = new THREE.Mesh(
-      new THREE.CylinderGeometry(3.25, 3.45, 0.12, 48),
+      new THREE.CylinderGeometry(3.15, 3.35, 0.12, 48),
       new THREE.MeshStandardMaterial({
         color: 0x0f172a,
         metalness: 0.82,
         roughness: 0.2,
       })
     );
-    platformDisc.position.y = 0.02;
+    platformDisc.position.y = -0.05;
     const platformGlowRing = new THREE.Mesh(
-      new THREE.TorusGeometry(3.32, 0.055, 12, 48),
+      new THREE.TorusGeometry(3.22, 0.055, 12, 48),
       new THREE.MeshStandardMaterial({
         color: 0x38bdf8,
         emissive: 0x06b6d4,
@@ -373,7 +425,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       })
     );
     platformGlowRing.rotation.x = Math.PI / 2;
-    platformGlowRing.position.y = 0.07;
+    platformGlowRing.position.y = 0.01;
     turntableGroup.add(platformDisc, platformGlowRing);
     turntableGroup.visible = false;
     scene.add(turntableGroup);
@@ -434,17 +486,42 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       };
     });
 
-    // Build all 8 Player Car Rigs so switching vehicles in the Garage or Race is instantaneous!
+    // Build all 8 Player Car Rigs and compute their exact 3D bounding boxes for Garage camera framing
     const playerAnchor = new THREE.Group();
     scene.add(playerAnchor);
 
     const carRigs = {} as Record<CarId, PlayerCarMeshRig>;
+    const carBounds = {} as Record<CarId, CarBoundsMetadata>;
+    const _bbox = new THREE.Box3();
+    const _bsphere = new THREE.Sphere();
+    const _bsize = new THREE.Vector3();
+
     for (const cId of CAR_ORDER) {
       const rig = buildPlayerCarMesh(CAR_CONFIGS[cId]);
-      rig.group.visible = cId === propsRef.current.selectedCarId;
       const initCust =
         propsRef.current.carCustomizations?.[cId] ?? createDefaultCarCustomization();
       applyCarCustomizationToRig(rig, CAR_CONFIGS[cId], initCust);
+
+      // Measure actual 3D bounds of the vehicle (excluding the invisible shield bubble)
+      rig.shieldBubble.visible = false;
+      rig.group.updateMatrixWorld(true);
+      _bbox.setFromObject(rig.bodyGroup);
+      for (const w of rig.wheels) {
+        _bbox.expandByObject(w);
+      }
+      _bbox.getSize(_bsize);
+      _bbox.getBoundingSphere(_bsphere);
+      rig.shieldBubble.visible = true;
+
+      carBounds[cId] = {
+        radius: Math.max(2.2, Math.min(3.1, _bsphere.radius)),
+        centerY: Math.max(0.52, Math.min(0.95, _bsphere.center.y)),
+        length: Math.max(4.0, _bsize.z),
+        width: Math.max(1.8, _bsize.x),
+        height: Math.max(1.1, _bsize.y),
+      };
+
+      rig.group.visible = cId === propsRef.current.selectedCarId;
       playerAnchor.add(rig.group);
       carRigs[cId] = rig;
     }
@@ -515,7 +592,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       levelObstaclePool.push({ mesh, type: hType });
     }
 
-    // Particle Pool
+    // Particle Pool (sparks, drift tyre smoke, nitro exhaust, coin pickup bursts)
     const maxParticles = 60;
     const particleGeo = new THREE.BoxGeometry(0.14, 0.14, 0.42);
     const particleMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
@@ -565,59 +642,19 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       }
     }
 
-    // Weather Precipitation Pool (Rain streaks, Snowflakes & Mist motes)
-    const maxWeatherParticles = 400;
-    const weatherDropGeo = new THREE.BoxGeometry(1, 1, 1);
-    const weatherDropMat = new THREE.MeshBasicMaterial({
-      color: 0xffffff,
-      transparent: true,
-      opacity: 0.76,
-      depthWrite: false,
-    });
-    const weatherPrecipInst = new THREE.InstancedMesh(
-      weatherDropGeo,
-      weatherDropMat,
-      maxWeatherParticles
-    );
-    weatherPrecipInst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-    scene.add(weatherPrecipInst);
-
-    const weatherParticles = Array.from({ length: maxWeatherParticles }, (_, idx) => ({
-      x: (Math.random() - 0.5) * 34,
-      y: Math.random() * 14,
-      z: -Math.random() * 72 + 8,
-      phase: idx * 0.37,
-      speedScale: 0.85 + Math.random() * 0.35,
-    }));
-
     // Pre-allocated temporaries
     const _dummy = new THREE.Object3D();
     const _color = new THREE.Color();
-    const _targetFogColor = new THREE.Color();
-    const _targetSkyColor = new THREE.Color();
-    const _targetGroundColor = new THREE.Color();
-    const _targetRoadTint = new THREE.Color();
     const _targetCamPos = new THREE.Vector3();
     const _currentCamLook = new THREE.Vector3(0, 1.0, -18);
     const _desiredCamLook = new THREE.Vector3(0, 1.0, -18);
 
-    const resolveUrlWeatherParam = (): WeatherConditionId | null => {
-      if (typeof window === 'undefined') return null;
-      const w = new URLSearchParams(window.location.search).get('weather');
-      if (w === 'clear' || w === 'rain' || w === 'fog' || w === 'snow') {
-        return w;
-      }
-      return null;
-    };
-
-    const initialWeatherId: WeatherConditionId =
-      resolveUrlWeatherParam() ?? selectNextRandomWeather('clear');
-
     // Simulation State
     const sim = {
       runId: `run_${Date.now()}`,
-      speedMs: HIGHWAY_CONFIG.launchSpeedKmh / 3.6,
-      topSpeedReachedKmh: HIGHWAY_CONFIG.launchSpeedKmh,
+      runEndedFired: false,
+      speedMs: 0,
+      topSpeedReachedKmh: 0,
       distanceMeters: 0,
       coinsCollected: 0,
       nearMissCount: 0,
@@ -631,7 +668,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       cleanDriveShieldTimer: 0,
       nitroAmount: 1.0,
       isNitroActive: false,
-      playerX: -1.8,
+      playerX: PLAYER_GRID_START_X,
       lateralVelocity: 0,
       filteredTiltSteer: 0,
       invulnerableTimer: 0,
@@ -640,7 +677,8 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       cameraTrauma: 0,
       countdownTimer: 2.4,
       lastCountdownInt: 3 as number | null,
-      trafficSpawnTimer: 0.5,
+      raceReleasedGo: false,
+      trafficSpawnTimer: 0.6,
       coinSpawnTimer: 0.9,
       scrollOffsetZ: 0,
       visualCurveFactor: 0,
@@ -649,31 +687,26 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       defeatDelayTimer: 0,
       bannerIdCounter: 1,
       titleOrbitTime: 0,
-      garageYawRad: 0.58,
+      // Garage 360° Turntable state
+      garageYawRad: DEFAULT_GARAGE_YAW_RAD,
+      garageTargetYawRad: DEFAULT_GARAGE_YAW_RAD,
+      garageHoldDir: 0 as -1 | 0 | 1,
+      garageAutoRotate: true,
+      garageManualPauseTimer: 0,
       garageSwapScale: 1.0,
       lastInspectedCarId: propsRef.current.selectedCarId,
       // Levels Mode active course & 5 AI opponents
       activeCourse: generateLevelCourse(propsRef.current.levelNumber ?? 1),
       aiOpponents: [] as AiOpponentState[],
       elapsedRaceSec: 0,
-      playerPosition: 6,
+      playerPosition: 1,
       lastSegmentLabel: 'Starting Grid',
-      // Dynamic Weather System State
-      targetWeatherId: initialWeatherId,
-      weatherState: createInitialWeatherState(initialWeatherId),
-      weatherChangeTimer: 24 + Math.random() * 10,
-      weatherLockedByUser: resolveUrlWeatherParam() !== null,
-      lastReportedGripPct: Math.round(WEATHER_PROFILES[initialWeatherId].gripMultiplier * 100),
     };
 
     function syncLiveHudSnapshot(
       banner?: { text: string; subtext: string; tone: 'cyan' | 'amber' | 'danger' }
     ) {
       const mode = propsRef.current.playMode ?? 'solo';
-      const activeProfile = WEATHER_PROFILES[sim.targetWeatherId] ?? WEATHER_PROFILES.clear;
-      const gripPct = Math.round(sim.weatherState.gripMultiplier * 100);
-      sim.lastReportedGripPct = gripPct;
-
       propsRef.current.onLiveStateChange({
         integrity: sim.integrity,
         maxIntegrity: sim.maxIntegrity,
@@ -691,28 +724,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
         totalRacers: 6,
         isDrifting: sim.isDrifting,
         driftScore: Math.floor(sim.driftScore),
-        weatherCondition: sim.targetWeatherId,
-        weatherLabel: activeProfile.name,
-        surfaceConditionLabel: activeProfile.surfaceConditionLabel,
-        trackGripPct: gripPct,
-        visibilityPct: sim.weatherState.visibilityPct,
       });
-    }
-
-    function applyWeatherTransition(nextWeather: WeatherConditionId, announceBanner: boolean) {
-      sim.targetWeatherId = nextWeather;
-      sim.weatherChangeTimer = 24 + Math.random() * 12;
-      const profile = WEATHER_PROFILES[nextWeather];
-      if (announceBanner && propsRef.current.gameState === 'playing') {
-        const gripPct = Math.round(profile.gripMultiplier * 100);
-        syncLiveHudSnapshot({
-          text: `WEATHER: ${profile.name.toUpperCase()}`,
-          subtext: `${profile.surfaceConditionLabel} · Track Grip ${gripPct}% · Visibility ${profile.visibilityPct}%`,
-          tone: nextWeather === 'snow' || nextWeather === 'rain' ? 'amber' : 'cyan',
-        });
-      } else {
-        syncLiveHudSnapshot();
-      }
     }
 
     function rebuildAiOpponentMeshes(opponents: AiOpponentState[]) {
@@ -727,6 +739,29 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
           scene.add(newRig.group);
           aiOpponentRigs[i] = newRig;
         }
+      }
+    }
+
+    function updateRoadAndBarrierGeometry(
+      course: GeneratedLevelCourse | null,
+      playerDistanceMeters: number
+    ) {
+      for (let i = 0; i < roadPosAttr.count; i++) {
+        const bz = roadBaseZ[i];
+        const bx = roadBaseX[i];
+        const { xOffset } = computeCurvedRoadCenterAtWorldZ(course, playerDistanceMeters, bz);
+        roadPosAttr.setX(i, bx + xOffset);
+      }
+      roadPosAttr.needsUpdate = true;
+
+      for (const wall of curvableRoadWalls) {
+        for (let i = 0; i < wall.pos.count; i++) {
+          const bz = wall.origZ[i];
+          const bx = wall.origX[i];
+          const { xOffset } = computeCurvedRoadCenterAtWorldZ(course, playerDistanceMeters, bz);
+          wall.pos.setX(i, bx + xOffset);
+        }
+        wall.pos.needsUpdate = true;
       }
     }
 
@@ -754,9 +789,11 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       );
 
       sim.runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-      sim.speedMs = HIGHWAY_CONFIG.launchSpeedKmh / 3.6;
-      sim.topSpeedReachedKmh = HIGHWAY_CONFIG.launchSpeedKmh;
-      sim.distanceMeters = 0;
+      sim.runEndedFired = false;
+      // Stationary during 3 -> 2 -> 1 countdown; released on GO!
+      sim.speedMs = 0;
+      sim.topSpeedReachedKmh = 0;
+      sim.distanceMeters = PLAYER_GRID_START_DIST;
       sim.coinsCollected = 0;
       sim.nearMissCount = 0;
       sim.bonusScore = 0;
@@ -768,7 +805,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       sim.cleanDriveShieldTimer = 0;
       sim.nitroAmount = 1.0;
       sim.isNitroActive = false;
-      sim.playerX = -1.8;
+      sim.playerX = PLAYER_GRID_START_X;
       sim.lateralVelocity = 0;
       sim.filteredTiltSteer = 0;
       sim.invulnerableTimer = 0;
@@ -777,25 +814,15 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       sim.cameraTrauma = 0;
       sim.countdownTimer = 2.4;
       sim.lastCountdownInt = 3;
-      sim.trafficSpawnTimer = 0.5;
+      sim.raceReleasedGo = false;
+      sim.trafficSpawnTimer = 0.6;
       sim.coinSpawnTimer = 0.8;
       sim.visualCurveFactor = 0;
       sim.reviveUsed = false;
       sim.isDying = false;
       sim.defeatDelayTimer = 0;
       sim.elapsedRaceSec = 0;
-      sim.playerPosition = 6;
-      sim.weatherChangeTimer = 22 + Math.random() * 10;
-
-      const urlWeather = resolveUrlWeatherParam();
-      if (urlWeather) {
-        sim.targetWeatherId = urlWeather;
-        sim.weatherState = createInitialWeatherState(urlWeather);
-      } else if (!sim.weatherLockedByUser) {
-        const nextRandWeather = selectNextRandomWeather(sim.targetWeatherId);
-        sim.targetWeatherId = nextRandWeather;
-        sim.weatherState = createInitialWeatherState(nextRandWeather);
-      }
+      sim.playerPosition = 1;
 
       for (const t of trafficPool) {
         t.active = false;
@@ -808,6 +835,9 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       for (const obs of levelObstaclePool) {
         obs.mesh.visible = false;
       }
+      for (const p of particles) {
+        p.active = false;
+      }
 
       const mode = propsRef.current.playMode ?? 'solo';
       if (mode === 'levels') {
@@ -816,12 +846,32 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
         sim.aiOpponents = createLevelAiOpponents(lvl, effStats.topSpeedMs);
         sim.lastSegmentLabel = sim.activeCourse.segments[0]?.label ?? 'Starting Grid';
         rebuildAiOpponentMeshes(sim.aiOpponents);
+        updateRoadAndBarrierGeometry(sim.activeCourse, 0);
       } else {
         for (const rig of aiOpponentRigs) {
           rig.group.visible = false;
         }
         startGantryMesh.visible = false;
         finishGantryMesh.visible = false;
+        updateRoadAndBarrierGeometry(null, 0);
+      }
+
+      // Reset DOM HUD elements immediately to clean 0 state
+      const refs = propsRef.current.hudRefs;
+      if (refs.speedValueRef.current) refs.speedValueRef.current.textContent = '0';
+      if (refs.distanceValueRef.current) {
+        refs.distanceValueRef.current.textContent =
+          mode === 'levels' ? `${sim.activeCourse.totalLengthMeters}m` : '0m';
+      }
+      if (refs.scoreValueRef.current) refs.scoreValueRef.current.textContent = '0';
+      if (refs.coinsValueRef.current) refs.coinsValueRef.current.textContent = '0';
+      if (refs.nitroFillRef.current) refs.nitroFillRef.current.style.transform = 'scaleX(1)';
+      if (refs.nitroPctRef.current) refs.nitroPctRef.current.textContent = '100%';
+      if (refs.racePositionValueRef?.current && mode === 'levels') {
+        refs.racePositionValueRef.current.textContent = '1/6';
+      }
+      if (refs.levelProgressFillRef?.current && mode === 'levels') {
+        refs.levelProgressFillRef.current.style.transform = 'scaleX(0)';
       }
 
       syncLiveHudSnapshot();
@@ -830,6 +880,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
     function reviveCurrentRun() {
       if (sim.reviveUsed) return;
       sim.reviveUsed = true;
+      sim.runEndedFired = false;
       sim.integrity = Math.min(sim.maxIntegrity, 2);
       sim.invulnerableTimer = 3.0;
       sim.shieldFlashTimer = 0.7;
@@ -853,18 +904,24 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
     propsRef.current.controlsRef.current.triggerRestart = resetRaceSimulation;
     propsRef.current.controlsRef.current.triggerRevive = reviveCurrentRun;
     propsRef.current.controlsRef.current.rotateGarageTurntable = (deltaRad: number) => {
-      sim.garageYawRad += deltaRad;
+      sim.garageTargetYawRad += deltaRad;
+      sim.garageManualPauseTimer = 4.0;
     };
-    propsRef.current.controlsRef.current.cycleWeather = () => {
-      const idx = WEATHER_ORDER.indexOf(sim.targetWeatherId);
-      const next = WEATHER_ORDER[(idx + 1) % WEATHER_ORDER.length];
-      sim.weatherLockedByUser = true;
-      applyWeatherTransition(next, true);
-      return next;
+    propsRef.current.controlsRef.current.setGarageRotateHoldDir = (dir: -1 | 0 | 1) => {
+      sim.garageHoldDir = dir;
+      if (dir !== 0) {
+        sim.garageManualPauseTimer = 4.0;
+      }
     };
-    propsRef.current.controlsRef.current.setWeatherCondition = (cond: WeatherConditionId) => {
-      sim.weatherLockedByUser = true;
-      applyWeatherTransition(cond, true);
+    propsRef.current.controlsRef.current.resetGarageTurntableView = () => {
+      sim.garageTargetYawRad = DEFAULT_GARAGE_YAW_RAD;
+      sim.garageYawRad = DEFAULT_GARAGE_YAW_RAD;
+      sim.garageHoldDir = 0;
+      sim.garageManualPauseTimer = 2.0;
+    };
+    propsRef.current.controlsRef.current.toggleGarageAutoRotate = () => {
+      sim.garageAutoRotate = !sim.garageAutoRotate;
+      return sim.garageAutoRotate;
     };
 
     // Keyboard & Turntable Drag Listeners
@@ -892,13 +949,16 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       if (propsRef.current.gameState === 'title') {
         isDraggingTurntable = true;
         lastDragClientX = e.clientX;
+        sim.garageManualPauseTimer = 4.5;
       }
     };
     const onPointerMoveCanvas = (e: PointerEvent) => {
       if (isDraggingTurntable && propsRef.current.gameState === 'title') {
         const dx = e.clientX - lastDragClientX;
         lastDragClientX = e.clientX;
-        sim.garageYawRad += dx * 0.012;
+        sim.garageTargetYawRad += dx * 0.014;
+        sim.garageYawRad = sim.garageTargetYawRad;
+        sim.garageManualPauseTimer = 4.5;
       }
     };
     const onPointerUpCanvas = () => {
@@ -996,7 +1056,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
 
       const rawDt = (now - lastFrameTime) / 1000;
       lastFrameTime = now;
-      const dt = Math.min(rawDt, 0.05);
+      const dt = Math.min(Math.max(0, rawDt), 0.05);
 
       const currentProps = propsRef.current;
       const controlsRef = currentProps.controlsRef;
@@ -1013,7 +1073,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       const selectedCarId = currentProps.selectedCarId;
       if (sim.lastInspectedCarId !== selectedCarId) {
         sim.lastInspectedCarId = selectedCarId;
-        sim.garageSwapScale = 0.86;
+        sim.garageSwapScale = 0.9;
       }
       sim.garageSwapScale = THREE.MathUtils.damp(sim.garageSwapScale, 1.0, 14, dt);
 
@@ -1031,9 +1091,11 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       }
       const activeCarRig = carRigs[selectedCarId];
 
-      turntableGroup.visible =
+      const isGaragePreview =
         currentProps.gameState === 'title' && currentProps.isGarageOpen;
-      turntableGroup.position.x = playerAnchor.position.x;
+
+      turntableGroup.visible = isGaragePreview;
+      turntableGroup.position.set(playerAnchor.position.x, 0, 0);
 
       const currentUpgrades = currentProps.carUpgrades[selectedCarId] ?? {
         topSpeed: 0,
@@ -1053,8 +1115,17 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
         currentProt
       );
 
+      // --- PAUSED STATE: FREEZE ALL RACE MOVEMENT, TIMERS, AI, AND AUDIO ---
+      if (currentProps.gameState === 'paused') {
+        soundController.updateEngine(0, false, true);
+        renderer.render(scene, camera);
+        return;
+      }
+
       // --- A. ACTIVE RACE SIMULATION ---
       if (currentProps.gameState === 'playing') {
+        playerAnchor.rotation.set(0, 0, 0);
+
         if (sim.hitstopTimer > 0) {
           sim.hitstopTimer -= dt;
           renderer.render(scene, camera);
@@ -1066,8 +1137,9 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
           sim.speedMs = Math.max(0, sim.speedMs - 38 * dt);
           sim.scrollOffsetZ += sim.speedMs * dt;
 
-          if (sim.defeatDelayTimer <= 0) {
+          if (sim.defeatDelayTimer <= 0 && !sim.runEndedFired) {
             sim.isDying = false;
+            sim.runEndedFired = true;
             const summary = calculateRunRewards({
               distanceMeters: sim.distanceMeters,
               coinsCollected: sim.coinsCollected,
@@ -1096,7 +1168,9 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
                 runId: sim.runId,
                 playMode: 'levels',
                 summary,
+                coinsCollected: sim.coinsCollected,
                 nearMissCount: sim.nearMissCount,
+                driftScore: Math.floor(sim.driftScore),
                 topSpeedKmh: Math.round(sim.topSpeedReachedKmh),
                 reviveAvailable: !sim.reviveUsed,
                 levelResult: {
@@ -1106,6 +1180,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
                   playerFinishedCourse: false,
                   finishTimeSec: Number(sim.elapsedRaceSec.toFixed(2)),
                   rewards,
+                  coinsCollected: sim.coinsCollected,
                   driftScore: Math.floor(sim.driftScore),
                   collisionsCount: sim.collisionsCount,
                 },
@@ -1115,7 +1190,9 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
                 runId: sim.runId,
                 playMode: 'solo',
                 summary,
+                coinsCollected: sim.coinsCollected,
                 nearMissCount: sim.nearMissCount,
+                driftScore: Math.floor(sim.driftScore),
                 topSpeedKmh: Math.round(sim.topSpeedReachedKmh),
                 reviveAvailable: !sim.reviveUsed,
               });
@@ -1125,7 +1202,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
           return;
         }
 
-        // Countdown overlay (3 -> 2 -> 1 -> GO!)
+        // Synchronized 3 -> 2 -> 1 -> GO! Countdown
         if (sim.countdownTimer > -0.6) {
           sim.countdownTimer -= dt;
           const nextInt =
@@ -1147,554 +1224,381 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
           }
         }
 
-        sim.elapsedRaceSec += dt;
+        // PRIORITY 6: While countdownTimer > 0 (3, 2, 1), keep all 6 cars stationary on the Starting Grid!
+        if (sim.countdownTimer > 0) {
+          sim.speedMs = 0;
+          sim.distanceMeters = PLAYER_GRID_START_DIST;
+          sim.elapsedRaceSec = 0;
+          playerAnchor.position.x = sim.playerX;
+          activeCarRig.bodyGroup.rotation.set(0, 0, 0);
+          activeCarRig.taillightMaterial.emissiveIntensity = 3.2;
 
-        // Dynamic Random Weather Progression (cycles every ~25-35s unless locked)
-        if (!sim.weatherLockedByUser) {
-          sim.weatherChangeTimer -= dt;
-          if (sim.weatherChangeTimer <= 0) {
-            const nextRandom = selectNextRandomWeather(sim.targetWeatherId);
-            applyWeatherTransition(nextRandom, true);
+          if (playMode === 'levels') {
+            startGantryMesh.visible = true;
+            startGantryMesh.position.set(0, 0, 0);
+            finishGantryMesh.visible = false;
+
+            for (let i = 0; i < sim.aiOpponents.length; i++) {
+              const ai = sim.aiOpponents[i];
+              const aiRig = aiOpponentRigs[i];
+              const relZ = -(ai.distanceMeters - sim.distanceMeters);
+              aiRig.group.visible = true;
+              aiRig.group.position.set(ai.x, 0, relZ);
+              aiRig.group.rotation.set(0, 0, 0);
+              for (const f of aiRig.nitroFlames) {
+                f.visible = false;
+              }
+            }
           }
-        }
-        sim.weatherState = stepWeatherInterpolation(
-          sim.weatherState,
-          sim.targetWeatherId,
-          dt,
-          0.65
-        );
-        const currentGripPct = Math.round(sim.weatherState.gripMultiplier * 100);
-        if (Math.abs(currentGripPct - sim.lastReportedGripPct) >= 2) {
-          syncLiveHudSnapshot();
-        }
-
-        // 1. Evaluate Steering Input
-        let kbSteer = 0;
-        if (keysPressed.has('ArrowLeft') || keysPressed.has('KeyA')) kbSteer -= 1;
-        if (keysPressed.has('ArrowRight') || keysPressed.has('KeyD')) kbSteer += 1;
-
-        let touchButtonSteer = 0;
-        const holdMultiplier = controlsRef.current.steerLongPressActive ? 1.08 : 1.0;
-        if (controlsRef.current.steerLeftHeld) {
-          touchButtonSteer -= holdMultiplier;
-          controlsRef.current.steerTapRemainingSec = 0;
-        }
-        if (controlsRef.current.steerRightHeld) {
-          touchButtonSteer += holdMultiplier;
-          controlsRef.current.steerTapRemainingSec = 0;
-        }
-        if (
-          touchButtonSteer === 0 &&
-          (controlsRef.current.steerTapRemainingSec ?? 0) > 0
-        ) {
-          controlsRef.current.steerTapRemainingSec = Math.max(
-            0,
-            (controlsRef.current.steerTapRemainingSec ?? 0) - dt
-          );
-          touchButtonSteer = controlsRef.current.steerTapImpulse ?? 0;
-        }
-
-        const rawTiltSource = controlsRef.current.hasRealDeviceOrientation
-          ? controlsRef.current.lastRawDeviceTiltDeg
-          : controlsRef.current.simulatedTiltDeg;
-
-        sim.filteredTiltSteer = processTiltInput({
-          rawAngleDeg: rawTiltSource,
-          neutralOffsetDeg: currentProps.neutralTiltOffsetDeg,
-          previousFilteredInput: sim.filteredTiltSteer,
-          sensitivity: currentProps.sensitivity,
-          invertTilt: currentProps.invertTilt,
-          smoothingFactor: Math.min(1, dt * 15),
-        });
-
-        let activeSteerInput = kbSteer || touchButtonSteer;
-        if (activeSteerInput === 0) {
-          if (currentProps.steeringMode === 'tilt') {
-            activeSteerInput = sim.filteredTiltSteer;
-          } else if (currentProps.steeringMode === 'drag') {
-            activeSteerInput = controlsRef.current.dragSteerNormalized;
+          soundController.updateEngine(45, false, false);
+        } else {
+          // Authoritative simultaneous release on GO!
+          if (!sim.raceReleasedGo) {
+            sim.raceReleasedGo = true;
+            sim.speedMs = HIGHWAY_CONFIG.launchSpeedKmh / 3.6;
+            sim.topSpeedReachedKmh = HIGHWAY_CONFIG.launchSpeedKmh;
+            for (const ai of sim.aiOpponents) {
+              ai.speedMs = HIGHWAY_CONFIG.launchSpeedKmh / 3.6;
+            }
           }
-        }
 
-        // 2. Longitudinal Physics (Automatic Acceleration, Weather-Adjusted Braking, Nitro)
-        const nitroWanted =
-          keysPressed.has('Space') ||
-          keysPressed.has('KeyW') ||
-          keysPressed.has('ArrowUp') ||
-          controlsRef.current.nitroHeld;
-        const brakeWanted =
-          keysPressed.has('KeyS') ||
-          keysPressed.has('ArrowDown') ||
-          controlsRef.current.brakeHeld;
+          sim.elapsedRaceSec += dt;
 
-        const weatherEffectiveStats = {
-          ...effectiveStats,
-          brakingDecelMs2:
-            effectiveStats.brakingDecelMs2 * sim.weatherState.brakingMultiplier,
-          accelRateMs2:
-            effectiveStats.accelRateMs2 *
-            (0.88 + 0.12 * sim.weatherState.gripMultiplier),
-        };
+          // 1. Evaluate Steering Input
+          let kbSteer = 0;
+          if (keysPressed.has('ArrowLeft') || keysPressed.has('KeyA')) kbSteer -= 1;
+          if (keysPressed.has('ArrowRight') || keysPressed.has('KeyD')) kbSteer += 1;
 
-        const longStep = stepLongitudinalPhysics({
-          currentSpeedMs: sim.speedMs,
-          nitroAmount: sim.nitroAmount,
-          isNitroActive: sim.isNitroActive,
-          nitroWanted,
-          brakeWanted,
-          effectiveStats: weatherEffectiveStats,
-          dt,
-        });
+          let touchButtonSteer = 0;
+          const holdMultiplier = controlsRef.current.steerLongPressActive ? 1.08 : 1.0;
+          if (controlsRef.current.steerLeftHeld) {
+            touchButtonSteer -= holdMultiplier;
+            controlsRef.current.steerTapRemainingSec = 0;
+          }
+          if (controlsRef.current.steerRightHeld) {
+            touchButtonSteer += holdMultiplier;
+            controlsRef.current.steerTapRemainingSec = 0;
+          }
+          if (
+            touchButtonSteer === 0 &&
+            (controlsRef.current.steerTapRemainingSec ?? 0) > 0
+          ) {
+            controlsRef.current.steerTapRemainingSec = Math.max(
+              0,
+              (controlsRef.current.steerTapRemainingSec ?? 0) - dt
+            );
+            touchButtonSteer = controlsRef.current.steerTapImpulse ?? 0;
+          }
 
-        if (longStep.justActivatedNitro) {
-          soundController.playNitroActivate();
-          sim.cameraTrauma = Math.min(1, sim.cameraTrauma + 0.22);
-        }
+          const rawTiltSource = controlsRef.current.hasRealDeviceOrientation
+            ? controlsRef.current.lastRawDeviceTiltDeg
+            : controlsRef.current.simulatedTiltDeg;
 
-        sim.speedMs = longStep.speedMs;
-        sim.nitroAmount = longStep.nitroAmount;
-        sim.isNitroActive = longStep.isNitroActive;
+          sim.filteredTiltSteer = processTiltInput({
+            rawAngleDeg: rawTiltSource,
+            neutralOffsetDeg: currentProps.neutralTiltOffsetDeg,
+            previousFilteredInput: sim.filteredTiltSteer,
+            sensitivity: currentProps.sensitivity,
+            invertTilt: currentProps.invertTilt,
+            smoothingFactor: Math.min(1, dt * 15),
+          });
 
-        const currentSpeedKmh = longStep.speedKmh;
-        if (currentSpeedKmh > sim.topSpeedReachedKmh) {
-          sim.topSpeedReachedKmh = currentSpeedKmh;
-        }
+          let activeSteerInput = kbSteer || touchButtonSteer;
+          if (activeSteerInput === 0) {
+            if (currentProps.steeringMode === 'tilt') {
+              activeSteerInput = sim.filteredTiltSteer;
+            } else if (currentProps.steeringMode === 'drag') {
+              activeSteerInput = controlsRef.current.dragSteerNormalized;
+            }
+          }
 
-        // 3. Track Curvature, Weather Track Grip, Centrifugal Slip & Drift Detection
-        let currentCurvature = 0;
-        if (playMode === 'levels') {
-          const sample = sampleTrackAtDistance(sim.activeCourse, sim.distanceMeters);
-          currentCurvature = sample.curvature;
-          sim.visualCurveFactor = THREE.MathUtils.damp(
-            sim.visualCurveFactor,
-            currentCurvature,
-            4.5,
+          // 2. Longitudinal Physics (Automatic Acceleration, Braking, Nitro)
+          const nitroWanted =
+            keysPressed.has('Space') ||
+            keysPressed.has('KeyW') ||
+            keysPressed.has('ArrowUp') ||
+            controlsRef.current.nitroHeld;
+          const brakeWanted =
+            keysPressed.has('KeyS') ||
+            keysPressed.has('ArrowDown') ||
+            controlsRef.current.brakeHeld;
+
+          const longStep = stepLongitudinalPhysics({
+            currentSpeedMs: sim.speedMs,
+            nitroAmount: sim.nitroAmount,
+            isNitroActive: sim.isNitroActive,
+            nitroWanted,
+            brakeWanted,
+            effectiveStats,
+            dt,
+          });
+
+          if (longStep.justActivatedNitro) {
+            soundController.playNitroActivate();
+            sim.cameraTrauma = Math.min(1, sim.cameraTrauma + 0.22);
+          }
+
+          sim.speedMs = longStep.speedMs;
+          sim.nitroAmount = longStep.nitroAmount;
+          sim.isNitroActive = longStep.isNitroActive;
+
+          const currentSpeedKmh = longStep.speedKmh;
+          if (currentSpeedKmh > sim.topSpeedReachedKmh) {
+            sim.topSpeedReachedKmh = currentSpeedKmh;
+          }
+
+          // 3. Track Curvature, Centrifugal Force & Controlled Drift Mechanics (Levels Mode)
+          let currentCurvature = 0;
+          if (playMode === 'levels') {
+            const sample = sampleTrackAtDistance(sim.activeCourse, sim.distanceMeters);
+            currentCurvature = sample.curvature;
+            sim.visualCurveFactor = THREE.MathUtils.damp(
+              sim.visualCurveFactor,
+              currentCurvature,
+              4.8,
+              dt
+            );
+            if (sample.segment.label !== sim.lastSegmentLabel) {
+              sim.lastSegmentLabel = sample.segment.label;
+              syncLiveHudSnapshot();
+            }
+          } else {
+            sim.visualCurveFactor = THREE.MathUtils.damp(sim.visualCurveFactor, 0, 6, dt);
+          }
+
+          // Outward centrifugal pull in curves requires active steering into the bend
+          const centrifugalPull =
+            playMode === 'levels'
+              ? -currentCurvature * Math.max(0, (sim.speedMs - 18) / 44) * 4.6
+              : 0;
+
+          const targetLatVel = activeSteerInput * effectiveStats.handling + centrifugalPull;
+          sim.lateralVelocity = THREE.MathUtils.damp(
+            sim.lateralVelocity,
+            targetLatVel,
+            13.5,
             dt
           );
-          if (sample.segment.label !== sim.lastSegmentLabel) {
-            sim.lastSegmentLabel = sample.segment.label;
+          sim.playerX = THREE.MathUtils.clamp(
+            sim.playerX + sim.lateralVelocity * dt,
+            -HIGHWAY_CONFIG.playerBoundX,
+            HIGHWAY_CONFIG.playerBoundX
+          );
+
+          playerAnchor.position.x = sim.playerX;
+
+          // PRIORITY 7C & 7D: Genuine Controlled Drift Detection & Scoring
+          // Requires active curved road section, moving speed > 28 m/s, steering into the bend,
+          // no active collision/death state, and staying within track boundaries.
+          const absCurve = Math.abs(currentCurvature);
+          const absSteer = Math.abs(activeSteerInput);
+          const steeringIntoCurve =
+            Math.sign(activeSteerInput) === Math.sign(currentCurvature) ||
+            absCurve >= 0.65;
+          const wasDrifting = sim.isDrifting;
+
+          sim.isDrifting =
+            playMode === 'levels' &&
+            absCurve >= 0.34 &&
+            sim.speedMs > 28 &&
+            absSteer >= 0.32 &&
+            steeringIntoCurve &&
+            sim.invulnerableTimer <= 0 &&
+            Math.abs(sim.playerX) < HIGHWAY_CONFIG.playerBoundX - 0.15;
+
+          if (sim.isDrifting) {
+            const speedScale = Math.min(1.6, sim.speedMs / 55);
+            sim.driftScore += dt * 135 * (0.8 + absCurve) * speedScale;
+            sim.nitroAmount = Math.min(1, sim.nitroAmount + dt * 0.06);
+            sim.driftAudioCooldown -= dt;
+            if (sim.driftAudioCooldown <= 0) {
+              soundController.playDriftPulse();
+              sim.driftAudioCooldown = 0.24;
+            }
+            if (Math.random() < 0.72) {
+              spawnParticleBurst(sim.playerX - 0.7, 0.15, 1.35, 1, 0xf59e0b, 3.2);
+              spawnParticleBurst(sim.playerX + 0.7, 0.15, 1.35, 1, 0x38bdf8, 3.2);
+            }
+          }
+          if (wasDrifting !== sim.isDrifting) {
             syncLiveHudSnapshot();
           }
-        } else {
-          sim.visualCurveFactor = THREE.MathUtils.damp(sim.visualCurveFactor, 0, 6, dt);
-        }
 
-        const centrifugalPull =
-          playMode === 'levels'
-            ? -currentCurvature *
-              Math.max(0, (sim.speedMs - 20) / 45) *
-              4.2 *
-              sim.weatherState.centrifugalMultiplier
+          // Chassis roll, yaw (controlled slip angle when drifting), pitch, brake lights & wheels
+          const normSteer = THREE.MathUtils.clamp(
+            sim.lateralVelocity / Math.max(1, effectiveStats.handling),
+            -1,
+            1
+          );
+          const driftYawBonus = sim.isDrifting
+            ? -Math.sign(activeSteerInput || currentCurvature) * 0.15
             : 0;
+          activeCarRig.bodyGroup.rotation.z = THREE.MathUtils.damp(
+            activeCarRig.bodyGroup.rotation.z,
+            -normSteer * 0.14,
+            16,
+            dt
+          );
+          activeCarRig.bodyGroup.rotation.y = THREE.MathUtils.damp(
+            activeCarRig.bodyGroup.rotation.y,
+            -normSteer * 0.13 + driftYawBonus,
+            16,
+            dt
+          );
+          activeCarRig.bodyGroup.rotation.x = THREE.MathUtils.damp(
+            activeCarRig.bodyGroup.rotation.x,
+            sim.isNitroActive ? -0.038 : brakeWanted ? 0.035 : 0,
+            14,
+            dt
+          );
 
-        // Crosswind and low-grip surface micro-drift at high speed in Rain or Snow
-        const crosswindPush =
-          sim.weatherState.windLateralMs *
-          0.18 *
-          Math.max(0, (sim.speedMs - 22) / 40);
+          activeCarRig.taillightMaterial.emissiveIntensity = brakeWanted ? 4.8 : 2.2;
 
-        const targetLatVel =
-          activeSteerInput *
-            effectiveStats.handling *
-            sim.weatherState.gripMultiplier +
-          centrifugalPull +
-          crosswindPush;
-
-        sim.lateralVelocity = THREE.MathUtils.damp(
-          sim.lateralVelocity,
-          targetLatVel,
-          sim.weatherState.lateralDampRate,
-          dt
-        );
-        sim.playerX = THREE.MathUtils.clamp(
-          sim.playerX + sim.lateralVelocity * dt,
-          -HIGHWAY_CONFIG.playerBoundX,
-          HIGHWAY_CONFIG.playerBoundX
-        );
-
-        playerAnchor.position.x = sim.playerX;
-
-        // Genuine Drift Detection (curves in Levels Mode OR low-grip wet/icy powerslides)
-        const absCurve = Math.abs(currentCurvature);
-        const absSteer = Math.abs(activeSteerInput);
-        const wasDrifting = sim.isDrifting;
-        const curveDrift =
-          playMode === 'levels' &&
-          absCurve >= 0.32 * sim.weatherState.driftThresholdScale &&
-          sim.speedMs > 28 &&
-          absSteer >= 0.32;
-        const slickWeatherPowerslide =
-          sim.weatherState.gripMultiplier <= 0.85 &&
-          sim.speedMs > 34 &&
-          absSteer >= 0.72 &&
-          Math.abs(sim.lateralVelocity) > 4.2;
-
-        sim.isDrifting =
-          (curveDrift || slickWeatherPowerslide) &&
-          Math.abs(sim.playerX) < HIGHWAY_CONFIG.playerBoundX - 0.15;
-
-        if (sim.isDrifting) {
-          sim.driftScore += dt * 125 * (1 + absCurve + (1 - sim.weatherState.gripMultiplier));
-          sim.nitroAmount = Math.min(1, sim.nitroAmount + dt * 0.055);
-          sim.driftAudioCooldown -= dt;
-          if (sim.driftAudioCooldown <= 0) {
-            soundController.playDriftPulse();
-            sim.driftAudioCooldown = 0.24;
+          for (const w of activeCarRig.wheels) {
+            w.rotation.x -= sim.speedMs * dt * 1.85;
           }
-          if (Math.random() < 0.7) {
-            spawnParticleBurst(sim.playerX - 0.7, 0.15, 1.35, 1, 0xf59e0b, 3.2);
-            spawnParticleBurst(sim.playerX + 0.7, 0.15, 1.35, 1, 0x38bdf8, 3.2);
-          }
-        }
-        // Wet / snowy rear tire rooster-tail spray at speed
-        if (
-          sim.speedMs > 24 &&
-          (sim.targetWeatherId === 'rain' || sim.targetWeatherId === 'snow') &&
-          Math.random() < 0.42
-        ) {
-          const sprayColor = sim.targetWeatherId === 'snow' ? 0xe0f2fe : 0x7dd3fc;
-          spawnParticleBurst(sim.playerX - 0.68, 0.12, 1.85, 1, sprayColor, 2.2);
-          spawnParticleBurst(sim.playerX + 0.68, 0.12, 1.85, 1, sprayColor, 2.2);
-        }
-        if (wasDrifting !== sim.isDrifting) {
-          syncLiveHudSnapshot();
-        }
-
-        // Chassis roll, yaw (enhanced slip angle when drifting), pitch, brake lights & wheels
-        const normSteer = THREE.MathUtils.clamp(
-          sim.lateralVelocity / Math.max(1, effectiveStats.handling),
-          -1,
-          1
-        );
-        const driftYawBonus = sim.isDrifting ? -Math.sign(activeSteerInput) * 0.12 : 0;
-        activeCarRig.bodyGroup.rotation.z = THREE.MathUtils.damp(
-          activeCarRig.bodyGroup.rotation.z,
-          -normSteer * 0.14,
-          16,
-          dt
-        );
-        activeCarRig.bodyGroup.rotation.y = THREE.MathUtils.damp(
-          activeCarRig.bodyGroup.rotation.y,
-          -normSteer * 0.13 + driftYawBonus,
-          16,
-          dt
-        );
-        activeCarRig.bodyGroup.rotation.x = THREE.MathUtils.damp(
-          activeCarRig.bodyGroup.rotation.x,
-          sim.isNitroActive ? -0.038 : brakeWanted ? 0.035 : 0,
-          14,
-          dt
-        );
-
-        activeCarRig.taillightMaterial.emissiveIntensity = brakeWanted ? 4.8 : 2.2;
-
-        for (const w of activeCarRig.wheels) {
-          w.rotation.x -= sim.speedMs * dt * 1.85;
-        }
-        for (const flame of activeCarRig.nitroFlames) {
-          flame.visible = sim.isNitroActive;
-          if (sim.isNitroActive) {
-            const flicker = 0.85 + Math.random() * 0.4;
-            flame.scale.set(1, flicker, 1);
-          }
-        }
-
-        if (sim.isNitroActive && Math.random() < 0.65) {
-          spawnParticleBurst(sim.playerX, 0.3, 2.35, 1, 0x38bdf8, 4.0);
-        }
-
-        if (sim.invulnerableTimer > 0) {
-          sim.invulnerableTimer = Math.max(0, sim.invulnerableTimer - dt);
-        }
-        if (sim.shieldFlashTimer > 0) {
-          sim.shieldFlashTimer = Math.max(0, sim.shieldFlashTimer - dt);
-          (activeCarRig.shieldBubble.material as THREE.MeshBasicMaterial).opacity =
-            sim.shieldFlashTimer * 1.4;
-        } else {
-          (activeCarRig.shieldBubble.material as THREE.MeshBasicMaterial).opacity =
-            sim.invulnerableTimer > 0 ? 0.22 : 0;
-        }
-
-        // Deflector Matrix Level 3+ auto-recharges 1 shield charge after 40s of clean driving
-        if ((currentProt.shieldDuration ?? 0) >= 3 && sim.integrity < sim.maxIntegrity) {
-          sim.cleanDriveShieldTimer += dt;
-          if (sim.cleanDriveShieldTimer >= 40) {
-            sim.cleanDriveShieldTimer = 0;
-            sim.integrity = Math.min(sim.maxIntegrity, sim.integrity + 1);
-            sim.shieldFlashTimer = 0.45;
-            syncLiveHudSnapshot({
-              text: 'SHIELD RECHARGED',
-              subtext: '+1 Deflector Matrix Layer Restored',
-              tone: 'cyan',
-            });
-          }
-        } else {
-          sim.cleanDriveShieldTimer = 0;
-        }
-
-        // 4. Advance Distance
-        const stepDist = sim.speedMs * dt;
-        sim.distanceMeters += stepDist;
-        sim.scrollOffsetZ += stepDist;
-
-        const playerBox = {
-          x: sim.playerX,
-          z: 0,
-          halfWidth: 0.94,
-          halfLength: 2.18,
-        };
-
-        // --- MODE-SPECIFIC WORLD & OPPONENTS ---
-        if (playMode === 'solo') {
-          const difficulty01 = Math.min(1, sim.distanceMeters / 3500);
-
-          sim.trafficSpawnTimer -= dt;
-          if (sim.trafficSpawnTimer <= 0) {
-            const chosenLanes = selectFairTrafficLanes(HIGHWAY_CONFIG.laneCount, difficulty01);
-            const spawnZ = -HIGHWAY_CONFIG.minSpawnDistanceAhead - Math.random() * 40;
-
-            for (const laneIdx of chosenLanes) {
-              const laneCenterX = HIGHWAY_CONFIG.laneCenters[laneIdx];
-              const tooClose = trafficPool.some(
-                (t) =>
-                  t.active &&
-                  t.laneIndex === laneIdx &&
-                  Math.abs(t.z - spawnZ) < HIGHWAY_CONFIG.minLongitudinalGap
-              );
-              if (tooClose) continue;
-
-              const inactiveItem = trafficPool.find((t) => !t.active);
-              if (inactiveItem) {
-                inactiveItem.active = true;
-                inactiveItem.laneIndex = laneIdx;
-                inactiveItem.x = laneCenterX;
-                inactiveItem.z = spawnZ - Math.random() * 12;
-                inactiveItem.speedMs = 20 + Math.random() * 14 + difficulty01 * 5;
-                inactiveItem.nearMissScored = false;
-                inactiveItem.mesh.position.set(inactiveItem.x, 0, inactiveItem.z);
-                inactiveItem.mesh.visible = true;
-              }
+          for (const flame of activeCarRig.nitroFlames) {
+            flame.visible = sim.isNitroActive;
+            if (sim.isNitroActive) {
+              const flicker = 0.85 + Math.random() * 0.4;
+              flame.scale.set(1, flicker, 1);
             }
-
-            sim.trafficSpawnTimer = Math.max(
-              0.55,
-              1.35 - difficulty01 * 0.6 + Math.random() * 0.25
-            );
           }
 
-          sim.coinSpawnTimer -= dt;
-          if (sim.coinSpawnTimer <= 0) {
-            const laneIdx = Math.floor(Math.random() * HIGHWAY_CONFIG.laneCount);
-            const laneX = HIGHWAY_CONFIG.laneCenters[laneIdx];
-            const baseZ = -95;
-
-            for (let c = 0; c < 4; c++) {
-              const coinItem = coinPool.find((item) => !item.active);
-              if (coinItem) {
-                coinItem.active = true;
-                coinItem.x = laneX;
-                coinItem.z = baseZ - c * 7.5;
-                coinItem.mesh.position.set(coinItem.x, 0.9, coinItem.z);
-                coinItem.mesh.visible = true;
-              }
-            }
-            sim.coinSpawnTimer = 1.9 + Math.random() * 1.2;
+          if (sim.isNitroActive && Math.random() < 0.65) {
+            spawnParticleBurst(sim.playerX, 0.3, 2.35, 1, 0x38bdf8, 4.0);
           }
 
-          // Move Traffic & Check Collisions / Near-Misses
-          for (const t of trafficPool) {
-            if (!t.active) continue;
-            const relSpeedMs = sim.speedMs - t.speedMs;
-            t.z += relSpeedMs * dt;
-            t.mesh.position.set(t.x, 0, t.z);
+          if (sim.invulnerableTimer > 0) {
+            sim.invulnerableTimer = Math.max(0, sim.invulnerableTimer - dt);
+          }
+          if (sim.shieldFlashTimer > 0) {
+            sim.shieldFlashTimer = Math.max(0, sim.shieldFlashTimer - dt);
+            (activeCarRig.shieldBubble.material as THREE.MeshBasicMaterial).opacity =
+              sim.shieldFlashTimer * 1.4;
+          } else {
+            (activeCarRig.shieldBubble.material as THREE.MeshBasicMaterial).opacity =
+              sim.invulnerableTimer > 0 ? 0.22 : 0;
+          }
 
-            if (t.z > Math.abs(HIGHWAY_CONFIG.despawnDistanceBehind)) {
-              t.active = false;
-              t.mesh.visible = false;
-              continue;
-            }
-
-            const check = evaluateVehicleInteraction(
-              playerBox,
-              {
-                x: t.x,
-                z: t.z,
-                halfWidth: t.halfWidth,
-                halfLength: t.halfLength,
-              },
-              t.nearMissScored
-            );
-
-            if (check.collided && sim.invulnerableTimer <= 0) {
-              sim.collisionsCount += 1;
+          // Deflector Matrix Level 3+ auto-recharges 1 shield charge after 40s of clean driving
+          if ((currentProt.shieldDuration ?? 0) >= 3 && sim.integrity < sim.maxIntegrity) {
+            sim.cleanDriveShieldTimer += dt;
+            if (sim.cleanDriveShieldTimer >= 40) {
               sim.cleanDriveShieldTimer = 0;
-              sim.integrity = Math.max(0, sim.integrity - 1);
-              sim.cameraTrauma = Math.min(1, sim.cameraTrauma + 0.78);
-              sim.shieldFlashTimer = 0.55;
-              spawnParticleBurst(sim.playerX, 0.65, -1.2, 18, 0xf59e0b, 9);
-
-              if (sim.integrity <= 0) {
-                soundController.playCollision(true);
-                sim.hitstopTimer = 0.06;
-                sim.isDying = true;
-                sim.defeatDelayTimer = 0.45;
-                syncLiveHudSnapshot({
-                  text: 'CRITICAL IMPACT',
-                  subtext: 'Hull Shield Depleted',
-                  tone: 'danger',
-                });
-              } else {
-                soundController.playCollision(false);
-                sim.hitstopTimer = 0.04;
-                sim.invulnerableTimer = effectiveStats.shieldInvulnerabilitySec;
-                sim.speedMs = Math.max(
-                  18,
-                  sim.speedMs * effectiveStats.collisionSpeedRetention
-                );
-                t.active = false;
-                t.mesh.visible = false;
-                syncLiveHudSnapshot({
-                  text: 'SHIELD IMPACT ABSORBED',
-                  subtext: `${sim.integrity}/${sim.maxIntegrity} Shield Charges Remaining`,
-                  tone: 'danger',
-                });
-              }
-            } else if (check.nearMiss) {
-              t.nearMissScored = true;
-              sim.nearMissCount += 1;
-              sim.nitroAmount = Math.min(
-                1,
-                sim.nitroAmount + HIGHWAY_CONFIG.nearMissNitroBonus
-              );
-              soundController.playNearMiss();
-              spawnParticleBurst(sim.playerX, 0.5, 0, 8, 0x06b6d4, 5);
+              sim.integrity = Math.min(sim.maxIntegrity, sim.integrity + 1);
+              sim.shieldFlashTimer = 0.45;
               syncLiveHudSnapshot({
-                text: `NEAR MISS +${HIGHWAY_CONFIG.nearMissScoreBonus}`,
-                subtext: `+${HIGHWAY_CONFIG.nearMissCoinBonus} Coins · +Nitro Boost`,
+                text: 'SHIELD RECHARGED',
+                subtext: '+1 Deflector Matrix Layer Restored',
                 tone: 'cyan',
               });
             }
-          }
-
-          // Move Solo Coins
-          for (const c of coinPool) {
-            if (!c.active) continue;
-            c.z += sim.speedMs * dt;
-            c.mesh.position.set(c.x, 0.9, c.z);
-            c.mesh.rotation.y += dt * 3.8;
-
-            if (c.z > 16) {
-              c.active = false;
-              c.mesh.visible = false;
-              continue;
-            }
-
-            if (Math.abs(c.z) < 2.2 && Math.abs(c.x - sim.playerX) < 1.65) {
-              c.active = false;
-              c.mesh.visible = false;
-              sim.coinsCollected += 1;
-              soundController.playCoinPickup();
-              spawnParticleBurst(c.x, 0.9, 0, 7, 0xfacc15, 4.5);
-            }
-          }
-        } else {
-          // --- LEVELS MODE: 5 AI OPPONENTS, PROCEDURAL OBSTACLES, START & FINISH GANTRIES ---
-          const course = sim.activeCourse;
-
-          // Position Start & Finish Line Gantries relative to player distance
-          const startRelZ = sim.distanceMeters - 0; // behind player as distance increases
-          if (startRelZ < 35) {
-            startGantryMesh.visible = true;
-            startGantryMesh.position.set(0, 0, startRelZ);
           } else {
-            startGantryMesh.visible = false;
+            sim.cleanDriveShieldTimer = 0;
           }
 
-          const finishRelZ = -(course.totalLengthMeters - sim.distanceMeters);
-          if (finishRelZ > -220 && finishRelZ < 35) {
-            const curveShiftFinish =
-              sim.visualCurveFactor * Math.pow(Math.max(0, -finishRelZ) / 70, 1.5) * 4.5;
-            finishGantryMesh.visible = true;
-            finishGantryMesh.position.set(curveShiftFinish, 0, finishRelZ);
-          } else {
-            finishGantryMesh.visible = false;
-          }
+          // 4. Advance Distance
+          const stepDist = sim.speedMs * dt;
+          sim.distanceMeters += stepDist;
+          sim.scrollOffsetZ += stepDist;
 
-          // Step & Render the 5 AI Opponents (6 racing cars total)
-          for (let i = 0; i < sim.aiOpponents.length; i++) {
-            const ai = sim.aiOpponents[i];
-            stepAiOpponent({
-              ai,
-              allOpponents: sim.aiOpponents,
-              playerX: sim.playerX,
-              playerDist: sim.distanceMeters,
-              course,
-              elapsedRaceSec: sim.elapsedRaceSec,
-              dt,
-            });
+          const playerBox = {
+            x: sim.playerX,
+            z: 0,
+            halfWidth: 0.94,
+            halfLength: 2.18,
+          };
 
-            const aiRig = aiOpponentRigs[i];
-            const relZ = -(ai.distanceMeters - sim.distanceMeters);
-            if (relZ > -210 && relZ < 32) {
-              const curveShift =
-                sim.visualCurveFactor * Math.pow(Math.max(0, -relZ) / 70, 1.5) * 4.5;
-              aiRig.group.visible = true;
-              aiRig.group.position.set(ai.x + curveShift, 0, relZ);
-              for (const w of aiRig.wheels) {
-                w.rotation.x -= ai.speedMs * dt * 1.8;
+          // --- MODE-SPECIFIC WORLD & OPPONENTS ---
+          if (playMode === 'solo') {
+            updateRoadAndBarrierGeometry(null, sim.distanceMeters);
+            const difficulty01 = Math.min(1, sim.distanceMeters / 3500);
+
+            sim.trafficSpawnTimer -= dt;
+            if (sim.trafficSpawnTimer <= 0) {
+              const chosenLanes = selectFairTrafficLanes(HIGHWAY_CONFIG.laneCount, difficulty01);
+              const spawnZ = -HIGHWAY_CONFIG.minSpawnDistanceAhead - Math.random() * 40;
+
+              for (const laneIdx of chosenLanes) {
+                const laneCenterX = HIGHWAY_CONFIG.laneCenters[laneIdx];
+                const tooClose = trafficPool.some(
+                  (t) =>
+                    t.active &&
+                    t.laneIndex === laneIdx &&
+                    Math.abs(t.z - spawnZ) < HIGHWAY_CONFIG.minLongitudinalGap
+                );
+                if (tooClose) continue;
+
+                const inactiveItem = trafficPool.find((t) => !t.active);
+                if (inactiveItem) {
+                  inactiveItem.active = true;
+                  inactiveItem.laneIndex = laneIdx;
+                  inactiveItem.x = laneCenterX;
+                  inactiveItem.z = spawnZ - Math.random() * 12;
+                  inactiveItem.speedMs = 20 + Math.random() * 14 + difficulty01 * 5;
+                  inactiveItem.nearMissScored = false;
+                  inactiveItem.mesh.position.set(inactiveItem.x, 0, inactiveItem.z);
+                  inactiveItem.mesh.visible = true;
+                }
               }
-              for (const f of aiRig.nitroFlames) {
-                f.visible = ai.isNitroActive;
-              }
-            } else {
-              aiRig.group.visible = false;
+
+              sim.trafficSpawnTimer = Math.max(
+                0.55,
+                1.35 - difficulty01 * 0.6 + Math.random() * 0.25
+              );
             }
 
-            // Player vs AI side-to-side contact check (non-fatal racing rub unless direct rear-end)
-            if (Math.abs(relZ) < 3.6 && Math.abs(ai.x - sim.playerX) < 1.72) {
-              const pushDir = sim.playerX >= ai.x ? 1 : -1;
-              sim.playerX = THREE.MathUtils.clamp(
-                sim.playerX + pushDir * 0.25,
-                -HIGHWAY_CONFIG.playerBoundX,
-                HIGHWAY_CONFIG.playerBoundX
-              );
-              ai.x = THREE.MathUtils.clamp(
-                ai.x - pushDir * 0.25,
-                -HIGHWAY_CONFIG.playerBoundX,
-                HIGHWAY_CONFIG.playerBoundX
-              );
-              if (relZ < -1.2 && sim.speedMs > ai.speedMs + 4) {
-                // Player bumped the rear of AI ahead
-                sim.speedMs = Math.max(ai.speedMs, sim.speedMs * 0.9);
-                spawnParticleBurst(sim.playerX, 0.5, -1.5, 6, 0x38bdf8, 5);
+            sim.coinSpawnTimer -= dt;
+            if (sim.coinSpawnTimer <= 0) {
+              const laneIdx = Math.floor(Math.random() * HIGHWAY_CONFIG.laneCount);
+              const laneX = HIGHWAY_CONFIG.laneCenters[laneIdx];
+              const baseZ = -95;
+
+              for (let c = 0; c < 4; c++) {
+                const coinItem = coinPool.find((item) => !item.active);
+                if (coinItem) {
+                  coinItem.active = true;
+                  coinItem.x = laneX;
+                  coinItem.z = baseZ - c * 7.5;
+                  coinItem.mesh.position.set(coinItem.x, 0.9, coinItem.z);
+                  coinItem.mesh.visible = true;
+                }
               }
+              sim.coinSpawnTimer = 1.9 + Math.random() * 1.2;
             }
-          }
 
-          // Render & Check Visible Course Obstacles (Barriers / Chicanes / Pylons)
-          let poolIdx = 0;
-          for (let i = 0; i < course.obstacles.length; i++) {
-            const obs = course.obstacles[i];
-            const relZ = -(obs.distanceMeters - sim.distanceMeters);
-            if (relZ > -185 && relZ < 18 && poolIdx < levelObstaclePool.length) {
-              const item = levelObstaclePool[poolIdx++];
-              const curveShift =
-                sim.visualCurveFactor * Math.pow(Math.max(0, -relZ) / 70, 1.5) * 4.5;
-              item.mesh.visible = true;
-              item.mesh.position.set(obs.x + curveShift, 0, relZ);
+            // Move Traffic & Check Collisions / Near-Misses
+            for (const t of trafficPool) {
+              if (!t.active) continue;
+              const relSpeedMs = sim.speedMs - t.speedMs;
+              t.z += relSpeedMs * dt;
+              t.mesh.position.set(t.x, 0, t.z);
 
-              // Check collision with Player
-              if (
-                sim.invulnerableTimer <= 0 &&
-                Math.abs(relZ) < obs.halfLength + 1.85 &&
-                Math.abs(obs.x - sim.playerX) < obs.halfWidth + 0.72
-              ) {
+              if (t.z > Math.abs(HIGHWAY_CONFIG.despawnDistanceBehind)) {
+                t.active = false;
+                t.mesh.visible = false;
+                continue;
+              }
+
+              const check = evaluateVehicleInteraction(
+                playerBox,
+                {
+                  x: t.x,
+                  z: t.z,
+                  halfWidth: t.halfWidth,
+                  halfLength: t.halfLength,
+                },
+                t.nearMissScored
+              );
+
+              if (check.collided && sim.invulnerableTimer <= 0) {
                 sim.collisionsCount += 1;
                 sim.cleanDriveShieldTimer = 0;
                 sim.integrity = Math.max(0, sim.integrity - 1);
-                sim.cameraTrauma = Math.min(1, sim.cameraTrauma + 0.75);
+                sim.cameraTrauma = Math.min(1, sim.cameraTrauma + 0.78);
                 sim.shieldFlashTimer = 0.55;
-                spawnParticleBurst(sim.playerX, 0.65, -1.2, 16, 0xf59e0b, 8);
+                spawnParticleBurst(sim.playerX, 0.65, -1.2, 18, 0xf59e0b, 9);
 
                 if (sim.integrity <= 0) {
                   soundController.playCollision(true);
@@ -1702,7 +1606,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
                   sim.isDying = true;
                   sim.defeatDelayTimer = 0.45;
                   syncLiveHudSnapshot({
-                    text: 'CRITICAL BARRIER IMPACT',
+                    text: 'CRITICAL IMPACT',
                     subtext: 'Hull Shield Depleted',
                     tone: 'danger',
                   });
@@ -1711,122 +1615,318 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
                   sim.hitstopTimer = 0.04;
                   sim.invulnerableTimer = effectiveStats.shieldInvulnerabilitySec;
                   sim.speedMs = Math.max(
-                    20,
+                    18,
                     sim.speedMs * effectiveStats.collisionSpeedRetention
                   );
+                  t.active = false;
+                  t.mesh.visible = false;
                   syncLiveHudSnapshot({
-                    text: 'SHIELD DEFLECTED HAZARD',
+                    text: 'SHIELD IMPACT ABSORBED',
                     subtext: `${sim.integrity}/${sim.maxIntegrity} Shield Charges Remaining`,
-                    tone: 'amber',
+                    tone: 'danger',
                   });
+                }
+              } else if (check.nearMiss) {
+                t.nearMissScored = true;
+                sim.nearMissCount += 1;
+                sim.nitroAmount = Math.min(
+                  1,
+                  sim.nitroAmount + HIGHWAY_CONFIG.nearMissNitroBonus
+                );
+                soundController.playNearMiss();
+                spawnParticleBurst(sim.playerX, 0.5, 0, 8, 0x06b6d4, 5);
+                syncLiveHudSnapshot({
+                  text: `NEAR MISS +${HIGHWAY_CONFIG.nearMissScoreBonus}`,
+                  subtext: `+${HIGHWAY_CONFIG.nearMissCoinBonus} Bonus Coins · +Nitro Boost`,
+                  tone: 'cyan',
+                });
+              }
+            }
+
+            // Move Solo Coins
+            for (const c of coinPool) {
+              if (!c.active) continue;
+              c.z += sim.speedMs * dt;
+              c.mesh.position.set(c.x, 0.9, c.z);
+              c.mesh.rotation.y += dt * 3.8;
+
+              if (c.z > 16) {
+                c.active = false;
+                c.mesh.visible = false;
+                continue;
+              }
+
+              if (Math.abs(c.z) < 2.2 && Math.abs(c.x - sim.playerX) < 1.65) {
+                c.active = false;
+                c.mesh.visible = false;
+                sim.coinsCollected += 1;
+                soundController.playCoinPickup();
+                spawnParticleBurst(c.x, 0.9, 0, 7, 0xfacc15, 4.5);
+              }
+            }
+          } else {
+            // --- LEVELS MODE: CURVED 3D ROAD, 5 AI OPPONENTS, OBSTACLES, START & FINISH GANTRIES ---
+            const course = sim.activeCourse;
+            updateRoadAndBarrierGeometry(course, sim.distanceMeters);
+
+            // Position Start & Finish Line Gantries aligned with the curved road centerline
+            const startRelZ = sim.distanceMeters - 0;
+            if (startRelZ < 35) {
+              const startCenter = computeCurvedRoadCenterAtWorldZ(
+                course,
+                sim.distanceMeters,
+                startRelZ
+              );
+              startGantryMesh.visible = true;
+              startGantryMesh.position.set(startCenter.xOffset, 0, startRelZ);
+              startGantryMesh.rotation.y = -startCenter.headingRad * 0.65;
+            } else {
+              startGantryMesh.visible = false;
+            }
+
+            const finishRelZ = -(course.totalLengthMeters - sim.distanceMeters);
+            if (finishRelZ > -230 && finishRelZ < 35) {
+              const finishCenter = computeCurvedRoadCenterAtWorldZ(
+                course,
+                sim.distanceMeters,
+                finishRelZ
+              );
+              finishGantryMesh.visible = true;
+              finishGantryMesh.position.set(finishCenter.xOffset, 0, finishRelZ);
+              finishGantryMesh.rotation.y = -finishCenter.headingRad * 0.65;
+            } else {
+              finishGantryMesh.visible = false;
+            }
+
+            // Step & Render the 5 AI Opponents (6 racing cars total)
+            for (let i = 0; i < sim.aiOpponents.length; i++) {
+              const ai = sim.aiOpponents[i];
+              stepAiOpponent({
+                ai,
+                allOpponents: sim.aiOpponents,
+                playerX: sim.playerX,
+                playerDist: sim.distanceMeters,
+                course,
+                elapsedRaceSec: sim.elapsedRaceSec,
+                dt,
+              });
+
+              const aiRig = aiOpponentRigs[i];
+              const relZ = -(ai.distanceMeters - sim.distanceMeters);
+              if (relZ > -220 && relZ < 32) {
+                const roadCenter = computeCurvedRoadCenterAtWorldZ(
+                  course,
+                  sim.distanceMeters,
+                  relZ
+                );
+                aiRig.group.visible = true;
+                aiRig.group.position.set(ai.x + roadCenter.xOffset, 0, relZ);
+                aiRig.group.rotation.y =
+                  -roadCenter.headingRad * 0.65 -
+                  THREE.MathUtils.clamp(ai.lateralVelocity * 0.015, -0.15, 0.15);
+                for (const w of aiRig.wheels) {
+                  w.rotation.x -= ai.speedMs * dt * 1.8;
+                }
+                for (const f of aiRig.nitroFlames) {
+                  f.visible = ai.isNitroActive;
+                }
+              } else {
+                aiRig.group.visible = false;
+              }
+
+              // Player vs AI side-to-side contact check (non-fatal racing rub unless direct rear-end)
+              if (Math.abs(relZ) < 3.6 && Math.abs(ai.x - sim.playerX) < 1.72) {
+                const pushDir = sim.playerX >= ai.x ? 1 : -1;
+                sim.playerX = THREE.MathUtils.clamp(
+                  sim.playerX + pushDir * 0.25,
+                  -HIGHWAY_CONFIG.playerBoundX,
+                  HIGHWAY_CONFIG.playerBoundX
+                );
+                ai.x = THREE.MathUtils.clamp(
+                  ai.x - pushDir * 0.25,
+                  -HIGHWAY_CONFIG.playerBoundX,
+                  HIGHWAY_CONFIG.playerBoundX
+                );
+                if (relZ < -1.2 && sim.speedMs > ai.speedMs + 4) {
+                  sim.speedMs = Math.max(ai.speedMs, sim.speedMs * 0.9);
+                  spawnParticleBurst(sim.playerX, 0.5, -1.5, 6, 0x38bdf8, 5);
                 }
               }
             }
-          }
-          for (let k = poolIdx; k < levelObstaclePool.length; k++) {
-            levelObstaclePool[k].mesh.visible = false;
-          }
 
-          // Render & Collect Course Coins
-          let coinIdx = 0;
-          for (let i = 0; i < course.coins.length; i++) {
-            const c = course.coins[i];
-            if (c.collected) continue;
-            const relZ = -(c.distanceMeters - sim.distanceMeters);
-            if (relZ > -160 && relZ < 14 && coinIdx < coinPool.length) {
-              const poolCoin = coinPool[coinIdx++];
-              const curveShift =
-                sim.visualCurveFactor * Math.pow(Math.max(0, -relZ) / 70, 1.5) * 4.5;
-              poolCoin.mesh.visible = true;
-              poolCoin.mesh.position.set(c.x + curveShift, 0.9, relZ);
-              poolCoin.mesh.rotation.y += dt * 3.8;
+            // Render & Check Visible Course Obstacles aligned with the curved road
+            let poolIdx = 0;
+            for (let i = 0; i < course.obstacles.length; i++) {
+              const obs = course.obstacles[i];
+              const relZ = -(obs.distanceMeters - sim.distanceMeters);
+              if (relZ > -195 && relZ < 18 && poolIdx < levelObstaclePool.length) {
+                const item = levelObstaclePool[poolIdx++];
+                const roadCenter = computeCurvedRoadCenterAtWorldZ(
+                  course,
+                  sim.distanceMeters,
+                  relZ
+                );
+                item.mesh.visible = true;
+                item.mesh.position.set(obs.x + roadCenter.xOffset, 0, relZ);
+                item.mesh.rotation.y = -roadCenter.headingRad * 0.65;
 
-              if (Math.abs(relZ) < 2.2 && Math.abs(c.x - sim.playerX) < 1.65) {
-                c.collected = true;
-                poolCoin.mesh.visible = false;
-                sim.coinsCollected += 1;
-                soundController.playCoinPickup();
-                spawnParticleBurst(sim.playerX, 0.9, 0, 7, 0xfacc15, 4.5);
+                // Check collision with Player (both obs.x and sim.playerX are in road-local lateral space!)
+                if (
+                  sim.invulnerableTimer <= 0 &&
+                  Math.abs(relZ) < obs.halfLength + 1.85 &&
+                  Math.abs(obs.x - sim.playerX) < obs.halfWidth + 0.72
+                ) {
+                  sim.collisionsCount += 1;
+                  sim.cleanDriveShieldTimer = 0;
+                  sim.isDrifting = false;
+                  sim.integrity = Math.max(0, sim.integrity - 1);
+                  sim.cameraTrauma = Math.min(1, sim.cameraTrauma + 0.75);
+                  sim.shieldFlashTimer = 0.55;
+                  spawnParticleBurst(sim.playerX, 0.65, -1.2, 16, 0xf59e0b, 8);
+
+                  if (sim.integrity <= 0) {
+                    soundController.playCollision(true);
+                    sim.hitstopTimer = 0.06;
+                    sim.isDying = true;
+                    sim.defeatDelayTimer = 0.45;
+                    syncLiveHudSnapshot({
+                      text: 'CRITICAL BARRIER IMPACT',
+                      subtext: 'Hull Shield Depleted',
+                      tone: 'danger',
+                    });
+                  } else {
+                    soundController.playCollision(false);
+                    sim.hitstopTimer = 0.04;
+                    sim.invulnerableTimer = effectiveStats.shieldInvulnerabilitySec;
+                    sim.speedMs = Math.max(
+                      20,
+                      sim.speedMs * effectiveStats.collisionSpeedRetention
+                    );
+                    syncLiveHudSnapshot({
+                      text: 'SHIELD DEFLECTED HAZARD',
+                      subtext: `${sim.integrity}/${sim.maxIntegrity} Shield Charges Remaining`,
+                      tone: 'amber',
+                    });
+                  }
+                }
               }
             }
-          }
-          for (let k = coinIdx; k < coinPool.length; k++) {
-            coinPool[k].mesh.visible = false;
-          }
+            for (let k = poolIdx; k < levelObstaclePool.length; k++) {
+              levelObstaclePool[k].mesh.visible = false;
+            }
 
-          // Update Live 1/6 Standings & Check Finish Line Crossing
-          const standings = computeRaceStandings({
-            playerCarId: selectedCarId,
-            playerDistanceMeters: sim.distanceMeters,
-            playerFinished: sim.distanceMeters >= course.totalLengthMeters,
-            playerFinishTimeSec:
-              sim.distanceMeters >= course.totalLengthMeters
-                ? Number(sim.elapsedRaceSec.toFixed(2))
-                : null,
-            opponents: sim.aiOpponents,
-            totalLengthMeters: course.totalLengthMeters,
-          });
-          const newPos = standings.find((s) => s.isPlayer)?.position ?? 6;
-          if (newPos !== sim.playerPosition) {
-            sim.playerPosition = newPos;
-            syncLiveHudSnapshot();
-          }
+            // Render & Collect Course Coins aligned with the curved road
+            let coinIdx = 0;
+            for (let i = 0; i < course.coins.length; i++) {
+              const c = course.coins[i];
+              if (c.collected) continue;
+              const relZ = -(c.distanceMeters - sim.distanceMeters);
+              if (relZ > -170 && relZ < 14 && coinIdx < coinPool.length) {
+                const poolCoin = coinPool[coinIdx++];
+                const roadCenter = computeCurvedRoadCenterAtWorldZ(
+                  course,
+                  sim.distanceMeters,
+                  relZ
+                );
+                poolCoin.mesh.visible = true;
+                poolCoin.mesh.position.set(c.x + roadCenter.xOffset, 0.9, relZ);
+                poolCoin.mesh.rotation.y += dt * 3.8;
 
-          if (sim.distanceMeters >= course.totalLengthMeters) {
-            // Player crossed the Finish Line!
-            sim.distanceMeters = course.totalLengthMeters;
-            const finishTime = Number(sim.elapsedRaceSec.toFixed(2));
-            const finalStandings = computeRaceStandings({
+                if (Math.abs(relZ) < 2.2 && Math.abs(c.x - sim.playerX) < 1.65) {
+                  c.collected = true;
+                  poolCoin.mesh.visible = false;
+                  sim.coinsCollected += 1;
+                  soundController.playCoinPickup();
+                  spawnParticleBurst(sim.playerX, 0.9, 0, 7, 0xfacc15, 4.5);
+                }
+              }
+            }
+            for (let k = coinIdx; k < coinPool.length; k++) {
+              coinPool[k].mesh.visible = false;
+            }
+
+            // Update Live 1/6 Standings & Check Finish Line Crossing
+            const standings = computeRaceStandings({
               playerCarId: selectedCarId,
-              playerDistanceMeters: course.totalLengthMeters,
-              playerFinished: true,
-              playerFinishTimeSec: finishTime,
+              playerDistanceMeters: sim.distanceMeters,
+              playerFinished: sim.distanceMeters >= course.totalLengthMeters,
+              playerFinishTimeSec:
+                sim.distanceMeters >= course.totalLengthMeters
+                  ? Number(sim.elapsedRaceSec.toFixed(2))
+                  : null,
               opponents: sim.aiOpponents,
               totalLengthMeters: course.totalLengthMeters,
             });
-            const finalRank = finalStandings.find((s) => s.isPlayer)?.position ?? 1;
-            const rewards = calculateLevelRaceRewards({
-              course,
-              position: finalRank,
-              coinsCollected: sim.coinsCollected,
-              driftScore: sim.driftScore,
-              collisionsCount: sim.collisionsCount,
-            });
-            const summary = calculateRunRewards({
-              distanceMeters: course.totalLengthMeters,
-              coinsCollected: sim.coinsCollected,
-              nearMissCount: sim.nearMissCount,
-              bonusScore: rewards.totalScore,
-            });
+            const newPos = standings.find((s) => s.isPlayer)?.position ?? 6;
+            if (newPos !== sim.playerPosition) {
+              sim.playerPosition = newPos;
+              syncLiveHudSnapshot();
+            }
 
-            soundController.playRaceFinish(finalRank <= 3);
-            currentProps.onRunEnded({
-              runId: sim.runId,
-              playMode: 'levels',
-              summary,
-              nearMissCount: sim.nearMissCount,
-              topSpeedKmh: Math.round(sim.topSpeedReachedKmh),
-              reviveAvailable: false,
-              levelResult: {
+            if (sim.distanceMeters >= course.totalLengthMeters && !sim.runEndedFired) {
+              sim.runEndedFired = true;
+              sim.distanceMeters = course.totalLengthMeters;
+              const finishTime = Number(sim.elapsedRaceSec.toFixed(2));
+              const finalStandings = computeRaceStandings({
+                playerCarId: selectedCarId,
+                playerDistanceMeters: course.totalLengthMeters,
+                playerFinished: true,
+                playerFinishTimeSec: finishTime,
+                opponents: sim.aiOpponents,
+                totalLengthMeters: course.totalLengthMeters,
+              });
+              const finalRank = finalStandings.find((s) => s.isPlayer)?.position ?? 1;
+              const rewards = calculateLevelRaceRewards({
                 course,
-                standings: finalStandings,
-                playerPosition: finalRank,
-                playerFinishedCourse: true,
-                finishTimeSec: finishTime,
-                rewards,
-                driftScore: Math.floor(sim.driftScore),
+                position: finalRank,
+                coinsCollected: sim.coinsCollected,
+                driftScore: sim.driftScore,
                 collisionsCount: sim.collisionsCount,
-              },
-            });
-            return;
-          }
-        }
+              });
+              const summary = calculateRunRewards({
+                distanceMeters: course.totalLengthMeters,
+                coinsCollected: sim.coinsCollected,
+                nearMissCount: sim.nearMissCount,
+                bonusScore: rewards.totalScore,
+              });
 
-        soundController.updateEngine(currentSpeedKmh, sim.isNitroActive, false);
+              soundController.playRaceFinish(finalRank <= 3);
+              currentProps.onRunEnded({
+                runId: sim.runId,
+                playMode: 'levels',
+                summary: {
+                  ...summary,
+                  totalScore: rewards.totalScore,
+                  totalCoinsEarned: rewards.totalCoinsEarned,
+                },
+                coinsCollected: sim.coinsCollected,
+                nearMissCount: sim.nearMissCount,
+                driftScore: Math.floor(sim.driftScore),
+                topSpeedKmh: Math.round(sim.topSpeedReachedKmh),
+                reviveAvailable: false,
+                levelResult: {
+                  course,
+                  standings: finalStandings,
+                  playerPosition: finalRank,
+                  playerFinishedCourse: true,
+                  finishTimeSec: finishTime,
+                  rewards,
+                  coinsCollected: sim.coinsCollected,
+                  driftScore: Math.floor(sim.driftScore),
+                  collisionsCount: sim.collisionsCount,
+                },
+              });
+              return;
+            }
+          }
+
+          soundController.updateEngine(currentSpeedKmh, sim.isNitroActive, false);
+        }
       } else if (currentProps.gameState === 'title') {
         const menuSpeedMs = currentProps.isGarageOpen ? 0 : 24;
         sim.scrollOffsetZ += menuSpeedMs * dt;
         sim.visualCurveFactor = THREE.MathUtils.damp(sim.visualCurveFactor, 0, 6, dt);
+        updateRoadAndBarrierGeometry(null, 0);
 
         for (const t of trafficPool) {
           if (t.active) t.mesh.visible = !currentProps.isGarageOpen;
@@ -1843,13 +1943,33 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
         startGantryMesh.visible = false;
         finishGantryMesh.visible = false;
 
-        sim.playerX = THREE.MathUtils.damp(
-          sim.playerX,
-          currentProps.isGarageOpen ? 0 : 1.75,
-          7,
-          dt
-        );
-        playerAnchor.position.x = sim.playerX;
+        if (currentProps.isGarageOpen) {
+          // Center vehicle on showroom pedestal at (0, 0, 0) and rotate around its true vertical center axis
+          sim.playerX = 0;
+          playerAnchor.position.set(0, 0, 0);
+
+          if (sim.garageHoldDir !== 0) {
+            sim.garageTargetYawRad += sim.garageHoldDir * dt * 1.95;
+          } else if (sim.garageManualPauseTimer > 0) {
+            sim.garageManualPauseTimer = Math.max(0, sim.garageManualPauseTimer - dt);
+          } else if (sim.garageAutoRotate && !isDraggingTurntable) {
+            sim.garageTargetYawRad += dt * 0.42;
+          }
+
+          sim.garageYawRad = THREE.MathUtils.damp(
+            sim.garageYawRad,
+            sim.garageTargetYawRad,
+            12,
+            dt
+          );
+          playerAnchor.rotation.set(0, sim.garageYawRad, 0);
+          turntableGroup.rotation.set(0, sim.garageYawRad, 0);
+        } else {
+          sim.playerX = THREE.MathUtils.damp(sim.playerX, 1.75, 7, dt);
+          playerAnchor.position.set(sim.playerX, 0, 0);
+          playerAnchor.rotation.set(0, 0, 0);
+        }
+
         activeCarRig.bodyGroup.rotation.set(0, 0, 0);
         activeCarRig.taillightMaterial.emissiveIntensity = 2.2;
         for (const flame of activeCarRig.nitroFlames) {
@@ -1867,13 +1987,21 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       albedoMap.offset.y = -(sim.scrollOffsetZ * 0.065) % 1;
       roughnessMap.offset.y = -(sim.scrollOffsetZ * 0.065) % 1;
 
+      const activeCourseForVisuals =
+        currentProps.gameState === 'playing' && playMode === 'levels'
+          ? sim.activeCourse
+          : null;
+
       const archSpacing = 12;
       const archWrapSpan = archCount * archSpacing;
       for (let i = 0; i < archCount; i++) {
         const z =
           ((i * archSpacing + sim.scrollOffsetZ) % archWrapSpan) - archWrapSpan + 24;
-        const curveX =
-          sim.visualCurveFactor * Math.pow(Math.max(0, -z) / 70, 1.5) * 4.5;
+        const { xOffset: curveX } = computeCurvedRoadCenterAtWorldZ(
+          activeCourseForVisuals,
+          sim.distanceMeters,
+          z
+        );
 
         _dummy.position.set(-HIGHWAY_CONFIG.roadWidth * 0.5 - 0.6 + curveX, 3.9, z);
         _dummy.rotation.set(0, 0, 0);
@@ -1907,8 +2035,11 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
           _dummy.scale.set(0.001, 0.001, 0.001);
         } else {
           const z = -i * 12 + (sim.scrollOffsetZ % 12);
-          const curveX =
-            sim.visualCurveFactor * Math.pow(Math.max(0, -z) / 70, 1.5) * 4.5;
+          const { xOffset: curveX } = computeCurvedRoadCenterAtWorldZ(
+            activeCourseForVisuals,
+            sim.distanceMeters,
+            z
+          );
           _dummy.position.set(curveX, 7.85, z);
           _dummy.rotation.set(0, 0, 0);
           _dummy.scale.set(1, 1, 1);
@@ -1962,139 +2093,56 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       particleInst.instanceMatrix.needsUpdate = true;
       if (particleInst.instanceColor) particleInst.instanceColor.needsUpdate = true;
 
-      // Update Atmosphere, Road Surface Wetness/Ice & 3D Weather Precipitation
-      const isGaragePreview =
-        currentProps.gameState === 'title' && currentProps.isGarageOpen;
-      const effectiveWeatherId: WeatherConditionId = isGaragePreview
-        ? 'clear'
-        : sim.targetWeatherId;
-      const targetWeatherProfile =
-        WEATHER_PROFILES[effectiveWeatherId] ?? WEATHER_PROFILES.clear;
-
-      const envLerp = Math.min(1, dt * 2.5);
-      if (scene.fog instanceof THREE.FogExp2) {
-        scene.fog.density = isGaragePreview
-          ? THREE.MathUtils.damp(scene.fog.density, 0.0038, 5, dt)
-          : sim.weatherState.fogDensity;
-        _targetFogColor.setHex(targetWeatherProfile.fogColorHex);
-        scene.fog.color.lerp(_targetFogColor, envLerp);
-      }
-
-      _targetSkyColor.setHex(targetWeatherProfile.hemiSkyHex);
-      _targetGroundColor.setHex(targetWeatherProfile.hemiGroundHex);
-      hemiLight.color.lerp(_targetSkyColor, envLerp);
-      hemiLight.groundColor.lerp(_targetGroundColor, envLerp);
-      hemiLight.intensity = isGaragePreview
-        ? 1.45
-        : sim.weatherState.hemiIntensity;
-      sunLight.intensity = isGaragePreview
-        ? 2.6
-        : sim.weatherState.sunIntensity;
-      renderer.toneMappingExposure = isGaragePreview
-        ? 1.2
-        : sim.weatherState.exposure;
-
-      roadMat.roughness = isGaragePreview ? 0.65 : sim.weatherState.roadRoughness;
-      roadMat.metalness = isGaragePreview ? 0.18 : sim.weatherState.roadMetalness;
-      _targetRoadTint.setHex(targetWeatherProfile.roadTintHex);
-      roadMat.color.lerp(_targetRoadTint, envLerp);
-
-      const activePrecipCount =
-        isGaragePreview || showTunnels ? 0 : targetWeatherProfile.particleCount;
-      const precipType = targetWeatherProfile.precipitationType;
-      weatherDropMat.opacity =
-        precipType === 'rain' ? 0.72 : precipType === 'snow' ? 0.86 : 0.22;
-      const forwardRushSpeed =
-        currentProps.gameState === 'playing' ? sim.speedMs * 0.62 : 14;
-
-      for (let i = 0; i < maxWeatherParticles; i++) {
-        if (i >= activePrecipCount || precipType === 'none') {
-          _dummy.position.set(0, -60, 0);
-          _dummy.scale.set(0.001, 0.001, 0.001);
-          _dummy.updateMatrix();
-          weatherPrecipInst.setMatrixAt(i, _dummy.matrix);
-          continue;
-        }
-
-        const wp = weatherParticles[i];
-        if (precipType === 'rain') {
-          wp.x += sim.weatherState.windLateralMs * dt;
-          wp.y -= 28 * wp.speedScale * dt;
-          wp.z += forwardRushSpeed * dt;
-        } else if (precipType === 'snow') {
-          const swirl = Math.sin(now * 0.0028 + wp.phase) * 2.4;
-          wp.x += (sim.weatherState.windLateralMs + swirl) * dt;
-          wp.y -= 5.6 * wp.speedScale * dt;
-          wp.z += forwardRushSpeed * 0.65 * dt;
-        } else {
-          // Dense metro fog drifting mist motes
-          wp.x += Math.cos(now * 0.0014 + wp.phase) * 1.1 * dt;
-          wp.y -= 0.6 * dt;
-          wp.z += forwardRushSpeed * 0.55 * dt;
-        }
-
-        // Wrap particles smoothly inside the active camera volume
-        if (wp.y < 0.05) {
-          wp.y = 13.5 + (Math.random() * 1.5);
-          wp.x = sim.playerX + (Math.random() - 0.5) * 32;
-        }
-        if (wp.z > 9) {
-          wp.z = -64 - Math.random() * 8;
-          wp.x = sim.playerX + (Math.random() - 0.5) * 32;
-        }
-        if (wp.x > sim.playerX + 18) wp.x -= 36;
-        if (wp.x < sim.playerX - 18) wp.x += 36;
-
-        _dummy.position.set(wp.x, wp.y, wp.z);
-        if (precipType === 'rain') {
-          _dummy.rotation.set(0.32, 0, -sim.weatherState.windLateralMs * 0.04);
-          _dummy.scale.set(0.032, 0.96, 0.032);
-          _color.setHex(0xbae6fd);
-        } else if (precipType === 'snow') {
-          _dummy.rotation.set(now * 0.002 + wp.phase, wp.phase, 0);
-          _dummy.scale.set(0.11, 0.11, 0.11);
-          _color.setHex(0xf8fafc);
-        } else {
-          _dummy.rotation.set(0, wp.phase, 0);
-          _dummy.scale.set(0.55, 0.08, 0.55);
-          _color.setHex(0x94a3b8);
-        }
-        _dummy.updateMatrix();
-        weatherPrecipInst.setMatrixAt(i, _dummy.matrix);
-        weatherPrecipInst.setColorAt(i, _color);
-      }
-      weatherPrecipInst.instanceMatrix.needsUpdate = true;
-      if (weatherPrecipInst.instanceColor) {
-        weatherPrecipInst.instanceColor.needsUpdate = true;
-      }
-
-      // --- C. SMOOTH LANDSCAPE CAMERA RIG CHOREOGRAPHY ---
+      // --- C. SMOOTH LANDSCAPE CAMERA RIG & GARAGE BOUNDING-BOX FRAMING ---
       sim.cameraTrauma = Math.max(0, sim.cameraTrauma - dt * 2.2);
       const shakeMag = sim.cameraTrauma * sim.cameraTrauma * 0.35;
       const shakeX = (Math.random() - 0.5) * shakeMag;
       const shakeY = (Math.random() - 0.5) * shakeMag;
 
-      if (currentProps.gameState === 'title' && currentProps.isGarageOpen) {
-        if (!isDraggingTurntable) {
-          sim.garageYawRad += dt * 0.38;
+      const viewW = container.clientWidth || window.innerWidth;
+      const viewH = Math.max(1, container.clientHeight || window.innerHeight);
+
+      if (isGaragePreview) {
+        // PRIORITY 1: Frame the entire vehicle inside the left showroom preview pane
+        // using the vehicle's actual 3D bounding sphere and camera view offset.
+        const bounds = carBounds[selectedCarId] ?? {
+          radius: 2.55,
+          centerY: 0.65,
+          length: 4.5,
+          width: 2.0,
+          height: 1.3,
+        };
+        const targetFovDeg = 40;
+        camera.fov = THREE.MathUtils.damp(camera.fov, targetFovDeg, 10, dt);
+
+        const vFovRad = THREE.MathUtils.degToRad(camera.fov);
+        // Available showroom pane is the left ~44% of landscape screen between top & bottom cards
+        const paneAspect = (viewW >= 640 ? viewW * 0.42 : viewW * 0.9) / (viewH * 0.52);
+        const hFovRad = 2 * Math.atan(Math.tan(vFovRad * 0.5) * Math.max(0.75, paneAspect));
+        const minHalfAngle = Math.min(vFovRad * 0.5, hFovRad * 0.5);
+        const fitDist = Math.max(
+          6.5,
+          (bounds.radius / Math.sin(Math.max(0.22, minHalfAngle))) * 1.44
+        );
+
+        if (viewW >= 640) {
+          // Shift the camera optical center into the left showroom pane
+          camera.setViewOffset(
+            viewW,
+            viewH,
+            Math.round(viewW * 0.275),
+            Math.round(viewH * -0.015),
+            viewW,
+            viewH
+          );
+        } else {
+          camera.clearViewOffset();
         }
-        const radius = 6.15;
-        const sinYaw = Math.sin(sim.garageYawRad);
-        const cosYaw = Math.cos(sim.garageYawRad);
-        _targetCamPos.set(
-          playerAnchor.position.x + sinYaw * radius,
-          1.88,
-          cosYaw * radius
-        );
-        // Frame the 3D showroom car on the left half of the landscape screen
-        const rightShift = window.innerWidth >= 640 ? 1.45 : 0;
-        _desiredCamLook.set(
-          playerAnchor.position.x + cosYaw * rightShift,
-          0.55,
-          -sinYaw * rightShift
-        );
-        camera.fov = THREE.MathUtils.damp(camera.fov, 44, 8, dt);
+
+        _targetCamPos.set(0, bounds.centerY + 1.08, fitDist);
+        _desiredCamLook.set(0, bounds.centerY * 0.85, 0);
       } else if (currentProps.gameState === 'title') {
+        camera.clearViewOffset();
         sim.titleOrbitTime += dt * 0.45;
         _targetCamPos.set(
           -0.6 + Math.sin(sim.titleOrbitTime) * 0.35,
@@ -2104,13 +2152,19 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
         _desiredCamLook.set(0.45, 0.85, -14);
         camera.fov = THREE.MathUtils.damp(camera.fov, 56, 8, dt);
       } else {
-        const chaseX = sim.playerX * 0.72 + shakeX;
-        const chaseY = (sim.isNitroActive ? 2.55 : 2.78) + shakeY;
+        camera.clearViewOffset();
+        const lookAheadCenter = computeCurvedRoadCenterAtWorldZ(
+          activeCourseForVisuals,
+          sim.distanceMeters,
+          -24
+        );
+        const chaseX = sim.playerX * 0.76 + shakeX;
+        const chaseY = (sim.isNitroActive ? 2.58 : 2.82) + shakeY;
         const chaseZ = sim.isNitroActive ? 5.85 : 6.45;
         _targetCamPos.set(chaseX, chaseY, chaseZ);
         _desiredCamLook.set(
-          sim.playerX * 0.88 + sim.visualCurveFactor * 5.2,
-          0.25,
+          sim.playerX * 0.85 + lookAheadCenter.xOffset * 0.68,
+          0.28,
           -24
         );
         const speedAboveLaunch = Math.max(
@@ -2124,44 +2178,63 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       }
 
       camera.updateProjectionMatrix();
-      const camDamp = 1 - Math.exp(-10 * dt);
+      const camDamp = 1 - Math.exp(-11 * dt);
       camera.position.lerp(_targetCamPos, camDamp);
       _currentCamLook.lerp(_desiredCamLook, camDamp);
       camera.lookAt(_currentCamLook);
 
-      // --- D. HIGH-FREQUENCY DOM REF HUD UPDATES (ZERO REACT RE-RENDERS) ---
+      // --- D. HIGH-FREQUENCY AUTHORITATIVE DOM REF HUD UPDATES ---
       hudUpdateAccum += dt;
       if (hudUpdateAccum >= 0.05) {
         hudUpdateAccum = 0;
         const refs = currentProps.hudRefs;
         const speedKmhInt = Math.round(sim.speedMs * 3.6);
-        const distInt = Math.floor(sim.distanceMeters);
-        const liveScore =
-          distInt * 4 +
-          sim.nearMissCount * HIGHWAY_CONFIG.nearMissScoreBonus +
-          sim.coinsCollected * HIGHWAY_CONFIG.coinPickupScore +
-          Math.floor(sim.driftScore);
-        const liveCoinsEarned =
-          sim.coinsCollected * HIGHWAY_CONFIG.coinPickupValue +
-          Math.floor(distInt / 20) +
-          sim.nearMissCount * HIGHWAY_CONFIG.nearMissCoinBonus;
+        const distInt = Math.max(0, Math.floor(sim.distanceMeters));
+
+        // Authoritative live race score starting at 0 at the start line
+        let liveScore = 0;
+        if (playMode === 'levels') {
+          if (distInt > 0 || sim.coinsCollected > 0 || sim.driftScore > 0) {
+            const progressRatio = Math.min(
+              1,
+              distInt / Math.max(1, sim.activeCourse.totalLengthMeters)
+            );
+            liveScore =
+              Math.round((7 - sim.playerPosition) * 1200 * progressRatio) +
+              Math.floor(distInt * 2) +
+              sim.coinsCollected * HIGHWAY_CONFIG.coinPickupScore +
+              Math.floor(sim.driftScore);
+          }
+        } else {
+          const liveSummary = calculateRunRewards({
+            distanceMeters: distInt,
+            coinsCollected: sim.coinsCollected,
+            nearMissCount: sim.nearMissCount,
+            bonusScore: sim.bonusScore + Math.floor(sim.driftScore),
+          });
+          liveScore = liveSummary.totalScore;
+        }
 
         if (refs.speedValueRef.current) {
           refs.speedValueRef.current.textContent = String(speedKmhInt);
         }
         if (refs.distanceValueRef.current) {
           if (playMode === 'levels') {
-            const rem = Math.max(0, Math.ceil(sim.activeCourse.totalLengthMeters - sim.distanceMeters));
+            const rem = Math.max(
+              0,
+              Math.ceil(sim.activeCourse.totalLengthMeters - sim.distanceMeters)
+            );
             refs.distanceValueRef.current.textContent = `${rem}m`;
           } else {
             refs.distanceValueRef.current.textContent = `${distInt}m`;
           }
         }
         if (refs.scoreValueRef.current) {
-          refs.scoreValueRef.current.textContent = String(liveScore);
+          refs.scoreValueRef.current.textContent = liveScore.toLocaleString();
         }
+        // PRIORITY 3B: Display exact coins collected during the current race
         if (refs.coinsValueRef.current) {
-          refs.coinsValueRef.current.textContent = String(liveCoinsEarned);
+          refs.coinsValueRef.current.textContent = String(sim.coinsCollected);
         }
         if (refs.nitroFillRef.current) {
           refs.nitroFillRef.current.style.transform = `scaleX(${sim.nitroAmount.toFixed(3)})`;

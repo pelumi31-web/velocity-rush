@@ -30,19 +30,14 @@ import {
 } from './saveSystem.ts';
 import {
   calculateLevelRaceRewards,
+  computeCurvedRoadCenterAtWorldZ,
   computeRaceStandings,
   createLevelAiOpponents,
   generateLevelCourse,
+  PLAYER_GRID_START_DIST,
   sampleTrackAtDistance,
   stepAiOpponent,
 } from './levelsMode.ts';
-import {
-  createInitialWeatherState,
-  selectNextRandomWeather,
-  stepWeatherInterpolation,
-  WEATHER_ORDER,
-  WEATHER_PROFILES,
-} from './weather.ts';
 
 test('8 distinct vehicles exist with unique body styles and valid customization compatibility', () => {
   assert.equal(CAR_ORDER.length, 8);
@@ -410,42 +405,46 @@ test('economy, Solo Mode runs, challenges, AdMob frequency, and save sanitizatio
   assert.equal(sanitized.selectedCarId, 'starter_apex');
 });
 
-test('Weather system profiles (clear, rain, fog, snow) impact visibility, fog density, and track grip', () => {
-  assert.deepEqual(WEATHER_ORDER, ['clear', 'rain', 'fog', 'snow']);
+test('Fair 6-car starting grid and U-shaped drift / hairpin curves in Levels Mode', () => {
+  for (let lvl = 1; lvl <= 4; lvl++) {
+    const course = generateLevelCourse(lvl);
+    const opponents = createLevelAiOpponents(lvl, 'starter_apex', 72);
+    assert.equal(opponents.length, 5, 'Exactly 5 AI opponents must be spawned');
+    assert.ok(PLAYER_GRID_START_DIST <= 0, 'Player starts behind or on start line');
 
-  const clear = WEATHER_PROFILES.clear;
-  const rain = WEATHER_PROFILES.rain;
-  const fog = WEATHER_PROFILES.fog;
-  const snow = WEATHER_PROFILES.snow;
-
-  // Track grip hierarchy: Clear (1.0) > Fog (0.9) > Rain (0.82) > Snow (0.72)
-  assert.equal(clear.gripMultiplier, 1.0);
-  assert.ok(fog.gripMultiplier < clear.gripMultiplier);
-  assert.ok(rain.gripMultiplier < fog.gripMultiplier);
-  assert.ok(snow.gripMultiplier < rain.gripMultiplier);
-
-  // Visibility & fog density hierarchy: Fog has highest fogDensity & lowest visibilityPct
-  assert.ok(fog.fogDensity > snow.fogDensity);
-  assert.ok(snow.fogDensity > rain.fogDensity);
-  assert.ok(rain.fogDensity > clear.fogDensity);
-  assert.ok(fog.visibilityPct < snow.visibilityPct);
-  assert.ok(rain.visibilityPct < clear.visibilityPct);
-
-  // Random weather selector always chooses a different condition from current
-  for (const current of WEATHER_ORDER) {
-    for (const sampleRand of [0, 0.25, 0.5, 0.75, 0.99]) {
-      const next = selectNextRandomWeather(current, sampleRand);
-      assert.notEqual(next, current);
+    // Verify NO AI car starts ahead of the start line (distanceMeters <= 0)
+    for (const ai of opponents) {
+      assert.ok(
+        ai.distanceMeters <= 0,
+        `AI ${ai.driverName} must start behind or on the start line (got ${ai.distanceMeters}m)`
+      );
+      assert.equal(ai.speedMs, 0, 'AI must be stationary before GO!');
     }
-  }
 
-  // Smooth weather interpolation converges toward target profile
-  let state = createInitialWeatherState('clear');
-  for (let i = 0; i < 60; i++) {
-    state = stepWeatherInterpolation(state, 'snow', 0.1, 0.8);
+    // Verify course includes U-turn, hairpin, sweeping bend, or S-curve elements
+    const curvedSegments = course.segments.filter(
+      (s) =>
+        s.type === 'u_turn_left' ||
+        s.type === 'u_turn_right' ||
+        s.type === 'hairpin_left' ||
+        s.type === 'hairpin_right' ||
+        s.type === 'sweeping_bend_left' ||
+        s.type === 'sweeping_bend_right' ||
+        s.type === 's_curve'
+    );
+    assert.ok(
+      curvedSegments.length >= 2,
+      `Level ${lvl} must contain multiple curved / U-turn / hairpin segments`
+    );
+
+    // Verify road centerline shifts smoothly ahead in U-turn / curved sections
+    const firstCurve = curvedSegments[0];
+    const midDist = (firstCurve.startDist + firstCurve.endDist) * 0.5;
+    const centerAhead = computeCurvedRoadCenterAtWorldZ(course, midDist, -60);
+    assert.ok(
+      Math.abs(centerAhead.xOffset) > 0.5,
+      `Curved road centerline must deflect laterally on ${firstCurve.type}`
+    );
   }
-  assert.equal(state.activeConditionId, 'snow');
-  assert.ok(Math.abs(state.gripMultiplier - snow.gripMultiplier) < 0.01);
-  assert.ok(Math.abs(state.fogDensity - snow.fogDensity) < 0.001);
 });
 
