@@ -3,6 +3,8 @@ import {
   CAR_CONFIGS,
   CAR_ORDER,
   CHALLENGES_CONFIG,
+  DAILY_CHALLENGE_TEMPLATES,
+  DAILY_COMPLETION_BONUS_COINS,
   PAINT_FINISHES,
   PAINT_PRESETS,
   PROTECTION_TRACKS,
@@ -18,6 +20,10 @@ import {
 import type {
   BumperId,
   CarId,
+  ChallengeMetric,
+  DailyChallengeCategory,
+  DailyChallengeDifficulty,
+  DailyChallengeMetric,
   GraphicsQuality,
   PaintFinishType,
   ProtectionUpgradeKey,
@@ -89,10 +95,61 @@ export interface UserSettingsData {
 
 export interface ChallengeProgressData {
   cumulativeDistance: number;
+  soloDistance: number;
   cumulativeCoins: number;
+  totalRaceRewardCoins: number;
   cumulativeNearMisses: number;
+  highSpeedNearMisses: number;
+  cleanRaces: number;
+  driftEvents: number;
+  levelDriftZonesClean: number;
+  successfulJumps: number;
+  tunnelsCompleted: number;
+  levelsWins: number;
+  levelsPodiums: number;
+  levelsCleanFinishes: number;
+  shieldAbsorptions: number;
+  nitroActivations: number;
   cumulativeScore: number;
   claimedChallengeIds: string[];
+}
+
+export interface DailyChallengeItem {
+  id: string;
+  templateId: string;
+  title: string;
+  description: string;
+  difficulty: DailyChallengeDifficulty;
+  category: DailyChallengeCategory;
+  metric: DailyChallengeMetric;
+  targetValue: number;
+  currentValue: number;
+  rewardCoins: number;
+  claimed: boolean;
+}
+
+export interface DailyChallengeHistoryEntry {
+  dateUtc: string; // YYYY-MM-DD
+  completedCount: number;
+  claimedCount: number;
+  bonusClaimed: boolean;
+  totalCoinsEarned: number;
+  challenges: {
+    title: string;
+    difficulty: DailyChallengeDifficulty;
+    completed: boolean;
+    claimed: boolean;
+  }[];
+}
+
+export interface DailyChallengesState {
+  dateUtc: string; // YYYY-MM-DD
+  items: DailyChallengeItem[];
+  bonusClaimed: boolean;
+  currentStreak: number;
+  bestStreak: number;
+  lastStreakDateUtc: string | null;
+  history: DailyChallengeHistoryEntry[];
 }
 
 export interface SaveGameData {
@@ -107,6 +164,7 @@ export interface SaveGameData {
   carCustomizations: Record<CarId, CarCustomizationState>;
   levelsProgression: LevelsProgressionData;
   challenges: ChallengeProgressData;
+  dailyChallenges: DailyChallengesState;
   settings: UserSettingsData;
   completedRacesCount: number;
   processedRunIds: string[];
@@ -154,6 +212,131 @@ export function createDefaultCarCustomization(): CarCustomizationState {
   };
 }
 
+export function getCurrentUtcDateString(now: Date = new Date()): string {
+  return now.toISOString().slice(0, 10);
+}
+
+export function getPreviousUtcDateString(dateUtc: string): string {
+  const parsed = Date.parse(`${dateUtc}T00:00:00Z`);
+  if (!Number.isFinite(parsed)) {
+    return getCurrentUtcDateString(new Date(Date.now() - 86400000));
+  }
+  return new Date(parsed - 86400000).toISOString().slice(0, 10);
+}
+
+export function getTimeUntilNextUtcReset(now: Date = new Date()): {
+  hours: number;
+  minutes: number;
+  seconds: number;
+  totalSeconds: number;
+  formatted: string;
+} {
+  const nextMidnightMs = Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate() + 1,
+    0,
+    0,
+    0,
+    0
+  );
+  const diffSec = Math.max(0, Math.floor((nextMidnightMs - now.getTime()) / 1000));
+  const hours = Math.floor(diffSec / 3600);
+  const minutes = Math.floor((diffSec % 3600) / 60);
+  const seconds = diffSec % 60;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return {
+    hours,
+    minutes,
+    seconds,
+    totalSeconds: diffSec,
+    formatted: `${pad(hours)}h ${pad(minutes)}m ${pad(seconds)}s`,
+  };
+}
+
+function hashStringToUint32(str: string): number {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return h >>> 0;
+}
+
+/**
+ * Deterministically generates 3 varied Daily Challenges (1 Easy, 1 Medium, 1 Hard)
+ * for a given UTC date string (YYYY-MM-DD), ensuring no duplicate categories or metrics
+ * on the same day and scaling targets modestly with player progression tier.
+ */
+export function generateDailyChallengesForDate(
+  dateUtc: string,
+  progressionTier: number = 0
+): DailyChallengeItem[] {
+  const safeTier = Math.max(0, Math.min(6, Math.floor(progressionTier)));
+  const seed = hashStringToUint32(`velocity_rush_daily_${dateUtc}`);
+
+  const easyPool = DAILY_CHALLENGE_TEMPLATES.filter((t) => t.difficulty === 'easy');
+  const medPool = DAILY_CHALLENGE_TEMPLATES.filter((t) => t.difficulty === 'medium');
+  const hardPool = DAILY_CHALLENGE_TEMPLATES.filter((t) => t.difficulty === 'hard');
+
+  const usedCategories = new Set<DailyChallengeCategory>();
+  const usedMetrics = new Set<DailyChallengeMetric>();
+
+  const pickTemplate = (pool: typeof DAILY_CHALLENGE_TEMPLATES, offsetSeed: number) => {
+    for (let attempt = 0; attempt < pool.length; attempt++) {
+      const idx = (offsetSeed + attempt) % pool.length;
+      const candidate = pool[idx];
+      if (!usedCategories.has(candidate.category) && !usedMetrics.has(candidate.metric)) {
+        usedCategories.add(candidate.category);
+        usedMetrics.add(candidate.metric);
+        return candidate;
+      }
+    }
+    const fallback = pool[offsetSeed % pool.length];
+    usedCategories.add(fallback.category);
+    usedMetrics.add(fallback.metric);
+    return fallback;
+  };
+
+  const chosen = [
+    pickTemplate(easyPool, seed),
+    pickTemplate(medPool, (seed >>> 5) + 3),
+    pickTemplate(hardPool, (seed >>> 11) + 7),
+  ];
+
+  return chosen.map((tpl) => {
+    const rawTarget = tpl.baseTarget + safeTier * tpl.scalePerTier;
+    const targetValue = Math.min(tpl.maxTarget, Math.max(tpl.baseTarget, rawTarget));
+    return {
+      id: `${dateUtc}_${tpl.difficulty}_${tpl.templateId}`,
+      templateId: tpl.templateId,
+      title: tpl.title,
+      description: tpl.descriptionTemplate.replace('{target}', targetValue.toLocaleString()),
+      difficulty: tpl.difficulty,
+      category: tpl.category,
+      metric: tpl.metric,
+      targetValue,
+      currentValue: 0,
+      rewardCoins: tpl.rewardCoins,
+      claimed: false,
+    };
+  });
+}
+
+export function createDefaultDailyChallengesState(
+  dateUtc: string = getCurrentUtcDateString()
+): DailyChallengesState {
+  return {
+    dateUtc,
+    items: generateDailyChallengesForDate(dateUtc, 0),
+    bonusClaimed: false,
+    currentStreak: 0,
+    bestStreak: 0,
+    lastStreakDateUtc: null,
+    history: [],
+  };
+}
+
 export function createDefaultSaveData(): SaveGameData {
   const carUpgrades = {} as Record<CarId, CarUpgradesMap>;
   const carProtection = {} as Record<CarId, CarProtectionMap>;
@@ -182,11 +365,25 @@ export function createDefaultSaveData(): SaveGameData {
     },
     challenges: {
       cumulativeDistance: 0,
+      soloDistance: 0,
       cumulativeCoins: 0,
+      totalRaceRewardCoins: 0,
       cumulativeNearMisses: 0,
+      highSpeedNearMisses: 0,
+      cleanRaces: 0,
+      driftEvents: 0,
+      levelDriftZonesClean: 0,
+      successfulJumps: 0,
+      tunnelsCompleted: 0,
+      levelsWins: 0,
+      levelsPodiums: 0,
+      levelsCleanFinishes: 0,
+      shieldAbsorptions: 0,
+      nitroActivations: 0,
       cumulativeScore: 0,
       claimedChallengeIds: [],
     },
+    dailyChallenges: createDefaultDailyChallengesState(),
     settings: {
       musicEnabled: true,
       musicVolume: 0.65,
@@ -463,14 +660,92 @@ export function validateAndSanitizeSave(raw: unknown): SaveGameData {
   if (obj.challenges && typeof obj.challenges === 'object') {
     const ch = obj.challenges as Record<string, unknown>;
     challenges.cumulativeDistance = safeNonNegativeInt(ch.cumulativeDistance);
+    challenges.soloDistance =
+      ch.soloDistance !== undefined
+        ? safeNonNegativeInt(ch.soloDistance)
+        : challenges.cumulativeDistance;
     challenges.cumulativeCoins = safeNonNegativeInt(ch.cumulativeCoins);
+    challenges.totalRaceRewardCoins =
+      ch.totalRaceRewardCoins !== undefined
+        ? safeNonNegativeInt(ch.totalRaceRewardCoins)
+        : challenges.cumulativeCoins * 5;
     challenges.cumulativeNearMisses = safeNonNegativeInt(ch.cumulativeNearMisses);
+    challenges.highSpeedNearMisses = safeNonNegativeInt(ch.highSpeedNearMisses);
+    challenges.cleanRaces = safeNonNegativeInt(ch.cleanRaces);
+    challenges.driftEvents = safeNonNegativeInt(ch.driftEvents);
+    challenges.levelDriftZonesClean = safeNonNegativeInt(ch.levelDriftZonesClean);
+    challenges.successfulJumps = safeNonNegativeInt(ch.successfulJumps);
+    challenges.tunnelsCompleted = safeNonNegativeInt(ch.tunnelsCompleted);
+    challenges.levelsWins = safeNonNegativeInt(ch.levelsWins);
+    challenges.levelsPodiums = safeNonNegativeInt(ch.levelsPodiums);
+    challenges.levelsCleanFinishes = safeNonNegativeInt(ch.levelsCleanFinishes);
+    challenges.shieldAbsorptions = safeNonNegativeInt(ch.shieldAbsorptions);
+    challenges.nitroActivations = safeNonNegativeInt(ch.nitroActivations);
     challenges.cumulativeScore = safeNonNegativeInt(ch.cumulativeScore);
     if (Array.isArray(ch.claimedChallengeIds)) {
       challenges.claimedChallengeIds = Array.from(
         new Set(ch.claimedChallengeIds.filter((x): x is string => typeof x === 'string'))
       );
     }
+  }
+
+  const progTier = Math.min(
+    6,
+    Math.floor((levelsProgression.highestUnlockedLevel - 1) / 3) +
+      Math.floor(unlockedCarIds.length / 3)
+  );
+  let dailyChallenges = createDefaultDailyChallengesState(getCurrentUtcDateString());
+  if (obj.dailyChallenges && typeof obj.dailyChallenges === 'object') {
+    const dc = obj.dailyChallenges as Record<string, unknown>;
+    const dateUtc =
+      typeof dc.dateUtc === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(dc.dateUtc)
+        ? dc.dateUtc
+        : getCurrentUtcDateString();
+    const fallbackItems = generateDailyChallengesForDate(dateUtc, progTier);
+    let items: DailyChallengeItem[] = fallbackItems;
+    if (Array.isArray(dc.items) && dc.items.length === 3) {
+      items = dc.items.map((rawItem, idx) => {
+        const fb = fallbackItems[idx];
+        if (!rawItem || typeof rawItem !== 'object') return fb;
+        const ri = rawItem as Record<string, unknown>;
+        return {
+          id: typeof ri.id === 'string' ? ri.id : fb.id,
+          templateId: typeof ri.templateId === 'string' ? ri.templateId : fb.templateId,
+          title: typeof ri.title === 'string' ? ri.title : fb.title,
+          description: typeof ri.description === 'string' ? ri.description : fb.description,
+          difficulty:
+            ri.difficulty === 'easy' || ri.difficulty === 'medium' || ri.difficulty === 'hard'
+              ? ri.difficulty
+              : fb.difficulty,
+          category: typeof ri.category === 'string' ? (ri.category as DailyChallengeCategory) : fb.category,
+          metric: typeof ri.metric === 'string' ? (ri.metric as DailyChallengeMetric) : fb.metric,
+          targetValue: Math.max(1, safeNonNegativeInt(ri.targetValue) || fb.targetValue),
+          currentValue: safeNonNegativeInt(ri.currentValue),
+          rewardCoins: Math.max(1, safeNonNegativeInt(ri.rewardCoins) || fb.rewardCoins),
+          claimed: Boolean(ri.claimed),
+        };
+      });
+    }
+    const history: DailyChallengeHistoryEntry[] = Array.isArray(dc.history)
+      ? dc.history
+          .filter((h): h is DailyChallengeHistoryEntry => Boolean(h && typeof h === 'object'))
+          .slice(0, 14)
+      : [];
+    dailyChallenges = {
+      dateUtc,
+      items,
+      bonusClaimed: Boolean(dc.bonusClaimed),
+      currentStreak: safeNonNegativeInt(dc.currentStreak),
+      bestStreak: Math.max(
+        safeNonNegativeInt(dc.bestStreak),
+        safeNonNegativeInt(dc.currentStreak)
+      ),
+      lastStreakDateUtc:
+        typeof dc.lastStreakDateUtc === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(dc.lastStreakDateUtc)
+          ? dc.lastStreakDateUtc
+          : null,
+      history,
+    };
   }
 
   const settings = { ...defaults.settings };
@@ -520,7 +795,7 @@ export function validateAndSanitizeSave(raw: unknown): SaveGameData {
     ? obj.processedRunIds.filter((x): x is string => typeof x === 'string').slice(-50)
     : [];
 
-  return {
+  return ensureCurrentDailyChallenges({
     version: SAVE_VERSION,
     coins,
     bestScore,
@@ -532,10 +807,11 @@ export function validateAndSanitizeSave(raw: unknown): SaveGameData {
     carCustomizations,
     levelsProgression,
     challenges,
+    dailyChallenges,
     settings,
     completedRacesCount,
     processedRunIds,
-  };
+  });
 }
 
 function clampLevel(val: unknown, max: number = 5): number {
@@ -857,8 +1133,294 @@ export function tryPurchaseOrEquipCustomization(
   };
 }
 
+export interface LiveGameplayProgressDelta {
+  distanceMeters?: number;
+  soloDistanceMeters?: number;
+  rawCoinsPickedUp?: number;
+  nearMisses?: number;
+  highSpeedNearMisses?: number;
+  driftEvents?: number;
+  levelDriftZonesClean?: number;
+  successfulJumps?: number;
+  tunnelsCompleted?: number;
+  shieldAbsorptions?: number;
+  nitroActivations?: number;
+  score?: number;
+}
+
+export function countPurchasedCustomizations(save: SaveGameData): number {
+  let count = 0;
+  for (const cId of CAR_ORDER) {
+    const cust = save.carCustomizations?.[cId];
+    if (!cust) continue;
+    count += Math.max(0, cust.ownedWheelIds.length - 1);
+    count += Math.max(0, cust.ownedPaintIds.length - 1);
+    count += Math.max(0, cust.ownedFinishes.length - 1);
+    count += Math.max(0, cust.ownedWheelColorIds.length - 1);
+    count += Math.max(0, cust.ownedStripeIds.length - 1);
+    count += Math.max(0, cust.ownedUnderglowIds.length - 1);
+    count += Math.max(0, cust.ownedSpoilerIds.length - 1);
+    count += Math.max(0, cust.ownedBumperIds.length - 1);
+    count += Math.max(0, cust.ownedSkirtIds.length - 1);
+    count += Math.max(0, cust.ownedRoofIds.length - 1);
+  }
+  return count;
+}
+
+export function countPurchasedUpgrades(save: SaveGameData): number {
+  let count = 0;
+  for (const cId of CAR_ORDER) {
+    const upg = save.carUpgrades?.[cId];
+    if (upg) {
+      count +=
+        (upg.topSpeed || 0) +
+        (upg.acceleration || 0) +
+        (upg.handling || 0) +
+        (upg.braking || 0) +
+        (upg.nitro || 0);
+    }
+    const prot = save.carProtection?.[cId];
+    if (prot) {
+      count += (prot.shieldCapacity || 0) + (prot.shieldDuration || 0);
+    }
+  }
+  return count;
+}
+
+/**
+ * Evaluates the current player progress value for any of the 32 Lifetime Challenge metrics.
+ */
+export function getChallengeMetricValue(
+  save: SaveGameData,
+  metric: ChallengeMetric
+): number {
+  const ch = save.challenges;
+  switch (metric) {
+    case 'distance':
+      return ch.cumulativeDistance;
+    case 'soloDistance':
+      return ch.soloDistance;
+    case 'totalRacesCompleted':
+      return save.completedRacesCount;
+    case 'coins':
+      return ch.cumulativeCoins;
+    case 'totalRaceRewardCoins':
+      return ch.totalRaceRewardCoins;
+    case 'nearMisses':
+      return ch.cumulativeNearMisses;
+    case 'highSpeedNearMisses':
+      return ch.highSpeedNearMisses;
+    case 'cleanRaces':
+      return ch.cleanRaces;
+    case 'driftEvents':
+      return ch.driftEvents;
+    case 'levelDriftZonesClean':
+      return ch.levelDriftZonesClean;
+    case 'successfulJumps':
+      return ch.successfulJumps;
+    case 'tunnelsCompleted':
+      return ch.tunnelsCompleted;
+    case 'levelsWins': {
+      const recordedWins = Object.values(save.levelsProgression.completedLevels).reduce(
+        (sum, rec) => sum + (rec.wins || 0),
+        0
+      );
+      return Math.max(ch.levelsWins, recordedWins);
+    }
+    case 'levelsPodiums': {
+      const distinctPodiums = Object.values(save.levelsProgression.completedLevels).filter(
+        (rec) => rec.bestPosition <= 3
+      ).length;
+      return Math.max(ch.levelsPodiums, distinctPodiums);
+    }
+    case 'distinctLevelsCompleted':
+      return Object.keys(save.levelsProgression.completedLevels).length;
+    case 'levelsCleanFinishes':
+      return ch.levelsCleanFinishes;
+    case 'ownedCars':
+      return save.unlockedCarIds.length;
+    case 'purchasedCustomizations':
+      return countPurchasedCustomizations(save);
+    case 'purchasedUpgrades':
+      return countPurchasedUpgrades(save);
+    case 'shieldAbsorptions':
+      return ch.shieldAbsorptions;
+    case 'nitroActivations':
+      return ch.nitroActivations;
+    case 'score':
+      return ch.cumulativeScore;
+    default:
+      return 0;
+  }
+}
+
+/**
+ * Ensures the player's Daily Challenges state matches the current UTC date (YYYY-MM-DD).
+ * If a new UTC day has started:
+ * - Archives the previous day's set into bounded history (up to 14 days).
+ * - Resets currentStreak to 0 if the player missed a full UTC day.
+ * - Generates 3 fresh Daily Challenges for the new UTC day.
+ */
+export function ensureCurrentDailyChallenges(
+  save: SaveGameData,
+  currentUtcDate: string = getCurrentUtcDateString()
+): SaveGameData {
+  const dc = save.dailyChallenges;
+  if (!dc) {
+    return {
+      ...save,
+      dailyChallenges: createDefaultDailyChallengesState(currentUtcDate),
+    };
+  }
+  if (dc.dateUtc === currentUtcDate) {
+    return save;
+  }
+
+  // Archive previous day's record into bounded history (up to 14 days)
+  const completedCount = dc.items.filter((i) => i.currentValue >= i.targetValue).length;
+  const claimedCount = dc.items.filter((i) => i.claimed).length;
+  const coinsFromClaims = dc.items.reduce(
+    (sum, i) => sum + (i.claimed ? i.rewardCoins : 0),
+    0
+  );
+  const archivedEntry: DailyChallengeHistoryEntry = {
+    dateUtc: dc.dateUtc,
+    completedCount,
+    claimedCount,
+    bonusClaimed: dc.bonusClaimed,
+    totalCoinsEarned:
+      coinsFromClaims + (dc.bonusClaimed ? DAILY_COMPLETION_BONUS_COINS : 0),
+    challenges: dc.items.map((i) => ({
+      title: i.title,
+      difficulty: i.difficulty,
+      completed: i.currentValue >= i.targetValue,
+      claimed: i.claimed,
+    })),
+  };
+
+  const nextHistory = [
+    archivedEntry,
+    ...dc.history.filter((h) => h.dateUtc !== dc.dateUtc),
+  ].slice(0, 14);
+
+  const yesterdayUtc = getPreviousUtcDateString(currentUtcDate);
+  const streakStillValid =
+    dc.lastStreakDateUtc === currentUtcDate || dc.lastStreakDateUtc === yesterdayUtc;
+  const nextCurrentStreak = streakStillValid ? dc.currentStreak : 0;
+
+  const progTier = Math.min(
+    6,
+    Math.floor((save.levelsProgression.highestUnlockedLevel - 1) / 3) +
+      Math.floor(save.unlockedCarIds.length / 3)
+  );
+
+  return {
+    ...save,
+    dailyChallenges: {
+      dateUtc: currentUtcDate,
+      items: generateDailyChallengesForDate(currentUtcDate, progTier),
+      bonusClaimed: false,
+      currentStreak: nextCurrentStreak,
+      bestStreak: Math.max(dc.bestStreak, nextCurrentStreak),
+      lastStreakDateUtc: dc.lastStreakDateUtc,
+      history: nextHistory,
+    },
+  };
+}
+
+function applyDailyChallengeMetrics(
+  dc: DailyChallengesState,
+  deltas: Partial<Record<DailyChallengeMetric, number>>
+): DailyChallengesState {
+  let changed = false;
+  const nextItems = dc.items.map((item) => {
+    const inc = Math.max(0, Math.floor(deltas[item.metric] ?? 0));
+    if (inc <= 0) return item;
+    changed = true;
+    return {
+      ...item,
+      currentValue: item.currentValue + inc,
+    };
+  });
+  return changed ? { ...dc, items: nextItems } : dc;
+}
+
+/**
+ * Pure transaction: Records incremental gameplay actions during an active run or at run boundary
+ * so both Lifetime Challenges and Daily Challenges update in real time without duplication.
+ */
+export function recordLiveGameplayProgress(
+  save: SaveGameData,
+  delta: LiveGameplayProgressDelta,
+  currentUtcDate: string = getCurrentUtcDateString()
+): SaveGameData {
+  const synced = ensureCurrentDailyChallenges(save, currentUtcDate);
+  const dist = Math.max(0, Math.floor(delta.distanceMeters ?? 0));
+  const soloDist = Math.max(0, Math.floor(delta.soloDistanceMeters ?? 0));
+  const coins = Math.max(0, Math.floor(delta.rawCoinsPickedUp ?? 0));
+  const nearMisses = Math.max(0, Math.floor(delta.nearMisses ?? 0));
+  const highSpeedNm = Math.max(0, Math.floor(delta.highSpeedNearMisses ?? 0));
+  const drifts = Math.max(0, Math.floor(delta.driftEvents ?? 0));
+  const cleanDriftZones = Math.max(0, Math.floor(delta.levelDriftZonesClean ?? 0));
+  const jumps = Math.max(0, Math.floor(delta.successfulJumps ?? 0));
+  const tunnels = Math.max(0, Math.floor(delta.tunnelsCompleted ?? 0));
+  const shieldBlocks = Math.max(0, Math.floor(delta.shieldAbsorptions ?? 0));
+  const nitroUses = Math.max(0, Math.floor(delta.nitroActivations ?? 0));
+  const score = Math.max(0, Math.floor(delta.score ?? 0));
+
+  if (
+    dist === 0 &&
+    soloDist === 0 &&
+    coins === 0 &&
+    nearMisses === 0 &&
+    highSpeedNm === 0 &&
+    drifts === 0 &&
+    cleanDriftZones === 0 &&
+    jumps === 0 &&
+    tunnels === 0 &&
+    shieldBlocks === 0 &&
+    nitroUses === 0 &&
+    score === 0
+  ) {
+    return synced;
+  }
+
+  return {
+    ...synced,
+    challenges: {
+      ...synced.challenges,
+      cumulativeDistance: synced.challenges.cumulativeDistance + dist,
+      soloDistance: synced.challenges.soloDistance + soloDist,
+      cumulativeCoins: synced.challenges.cumulativeCoins + coins,
+      cumulativeNearMisses: synced.challenges.cumulativeNearMisses + nearMisses,
+      highSpeedNearMisses: synced.challenges.highSpeedNearMisses + highSpeedNm,
+      driftEvents: synced.challenges.driftEvents + drifts,
+      levelDriftZonesClean: synced.challenges.levelDriftZonesClean + cleanDriftZones,
+      successfulJumps: synced.challenges.successfulJumps + jumps,
+      tunnelsCompleted: synced.challenges.tunnelsCompleted + tunnels,
+      shieldAbsorptions: synced.challenges.shieldAbsorptions + shieldBlocks,
+      nitroActivations: synced.challenges.nitroActivations + nitroUses,
+      cumulativeScore: synced.challenges.cumulativeScore + score,
+    },
+    dailyChallenges: applyDailyChallengeMetrics(synced.dailyChallenges, {
+      dailyDistance: dist,
+      dailySoloDistance: soloDist,
+      dailyCoinsPickedUp: coins,
+      dailyNearMisses: nearMisses,
+      dailyHighSpeedNearMisses: highSpeedNm,
+      dailyDriftEvents: drifts,
+      dailyJumps: jumps,
+      dailyTunnels: tunnels,
+      dailyShieldBlocks: shieldBlocks,
+      dailyNitroActivations: nitroUses,
+      dailyScore: score,
+    }),
+  };
+}
+
 /**
  * Pure transaction: Record completed Solo Mode run rewards once per unique runId.
+ * Supports optional `alreadyCommitted` deltas so live mid-run progress is never double-counted.
  */
 export function recordCompletedRun(
   save: SaveGameData,
@@ -869,30 +1431,112 @@ export function recordCompletedRun(
     coinsEarned: number;
     rawCoinsPickedUp: number;
     nearMisses: number;
+    highSpeedNearMisses?: number;
+    driftEvents?: number;
+    successfulJumps?: number;
+    tunnelsCompleted?: number;
+    shieldAbsorptions?: number;
+    nitroActivations?: number;
+    collisionsCount?: number;
+    alreadyCommitted?: LiveGameplayProgressDelta;
   }
 ): { applied: boolean; data: SaveGameData } {
   if (!runId || save.processedRunIds.includes(runId)) {
     return { applied: false, data: save };
   }
 
+  const synced = ensureCurrentDailyChallenges(save);
+  const committed = stats.alreadyCommitted ?? {};
+
+  const remDist = Math.max(
+    0,
+    Math.floor(stats.distanceMeters) - Math.floor(committed.distanceMeters ?? 0)
+  );
+  const remSoloDist = Math.max(
+    0,
+    Math.floor(stats.distanceMeters) - Math.floor(committed.soloDistanceMeters ?? 0)
+  );
+  const remCoins = Math.max(
+    0,
+    Math.floor(stats.rawCoinsPickedUp) - Math.floor(committed.rawCoinsPickedUp ?? 0)
+  );
+  const remNearMisses = Math.max(
+    0,
+    Math.floor(stats.nearMisses) - Math.floor(committed.nearMisses ?? 0)
+  );
+  const remHighSpeedNm = Math.max(
+    0,
+    Math.floor(stats.highSpeedNearMisses ?? 0) -
+      Math.floor(committed.highSpeedNearMisses ?? 0)
+  );
+  const remDrifts = Math.max(
+    0,
+    Math.floor(stats.driftEvents ?? 0) - Math.floor(committed.driftEvents ?? 0)
+  );
+  const remJumps = Math.max(
+    0,
+    Math.floor(stats.successfulJumps ?? 0) - Math.floor(committed.successfulJumps ?? 0)
+  );
+  const remTunnels = Math.max(
+    0,
+    Math.floor(stats.tunnelsCompleted ?? 0) - Math.floor(committed.tunnelsCompleted ?? 0)
+  );
+  const remShields = Math.max(
+    0,
+    Math.floor(stats.shieldAbsorptions ?? 0) - Math.floor(committed.shieldAbsorptions ?? 0)
+  );
+  const remNitros = Math.max(
+    0,
+    Math.floor(stats.nitroActivations ?? 0) - Math.floor(committed.nitroActivations ?? 0)
+  );
+  const remScore = Math.max(
+    0,
+    Math.floor(stats.score) - Math.floor(committed.score ?? 0)
+  );
+
+  const coinsEarnedInt = Math.max(0, Math.floor(stats.coinsEarned));
+  const isCleanRun =
+    stats.collisionsCount !== undefined &&
+    stats.collisionsCount === 0 &&
+    Math.floor(stats.distanceMeters) >= 250;
+
   const updated: SaveGameData = {
-    ...save,
-    coins: save.coins + Math.max(0, Math.floor(stats.coinsEarned)),
-    bestScore: Math.max(save.bestScore, Math.floor(stats.score)),
-    bestDistance: Math.max(save.bestDistance, Math.floor(stats.distanceMeters)),
-    completedRacesCount: save.completedRacesCount + 1,
-    processedRunIds: [...save.processedRunIds.slice(-49), runId],
+    ...synced,
+    coins: synced.coins + coinsEarnedInt,
+    bestScore: Math.max(synced.bestScore, Math.floor(stats.score)),
+    bestDistance: Math.max(synced.bestDistance, Math.floor(stats.distanceMeters)),
+    completedRacesCount: synced.completedRacesCount + 1,
+    processedRunIds: [...synced.processedRunIds.slice(-49), runId],
     challenges: {
-      ...save.challenges,
-      cumulativeDistance:
-        save.challenges.cumulativeDistance + Math.max(0, Math.floor(stats.distanceMeters)),
-      cumulativeCoins:
-        save.challenges.cumulativeCoins + Math.max(0, Math.floor(stats.rawCoinsPickedUp)),
-      cumulativeNearMisses:
-        save.challenges.cumulativeNearMisses + Math.max(0, Math.floor(stats.nearMisses)),
-      cumulativeScore:
-        save.challenges.cumulativeScore + Math.max(0, Math.floor(stats.score)),
+      ...synced.challenges,
+      cumulativeDistance: synced.challenges.cumulativeDistance + remDist,
+      soloDistance: synced.challenges.soloDistance + remSoloDist,
+      cumulativeCoins: synced.challenges.cumulativeCoins + remCoins,
+      totalRaceRewardCoins: synced.challenges.totalRaceRewardCoins + coinsEarnedInt,
+      cumulativeNearMisses: synced.challenges.cumulativeNearMisses + remNearMisses,
+      highSpeedNearMisses: synced.challenges.highSpeedNearMisses + remHighSpeedNm,
+      cleanRaces: synced.challenges.cleanRaces + (isCleanRun ? 1 : 0),
+      driftEvents: synced.challenges.driftEvents + remDrifts,
+      successfulJumps: synced.challenges.successfulJumps + remJumps,
+      tunnelsCompleted: synced.challenges.tunnelsCompleted + remTunnels,
+      shieldAbsorptions: synced.challenges.shieldAbsorptions + remShields,
+      nitroActivations: synced.challenges.nitroActivations + remNitros,
+      cumulativeScore: synced.challenges.cumulativeScore + remScore,
     },
+    dailyChallenges: applyDailyChallengeMetrics(synced.dailyChallenges, {
+      dailyDistance: remDist,
+      dailySoloDistance: remSoloDist,
+      dailyCoinsPickedUp: remCoins,
+      dailyNearMisses: remNearMisses,
+      dailyHighSpeedNearMisses: remHighSpeedNm,
+      dailyDriftEvents: remDrifts,
+      dailyJumps: remJumps,
+      dailyTunnels: remTunnels,
+      dailyCleanRaces: isCleanRun ? 1 : 0,
+      dailyShieldBlocks: remShields,
+      dailyNitroActivations: remNitros,
+      dailyScore: remScore,
+    }),
   };
 
   return { applied: true, data: updated };
@@ -913,54 +1557,155 @@ export function recordCompletedLevelRace(
     distanceMeters: number;
     rawCoinsPickedUp: number;
     score: number;
+    playerFinishedCourse?: boolean;
+    collisionsCount?: number;
+    nearMisses?: number;
+    highSpeedNearMisses?: number;
+    driftEvents?: number;
+    levelDriftZonesClean?: number;
+    successfulJumps?: number;
+    tunnelsCompleted?: number;
+    shieldAbsorptions?: number;
+    nitroActivations?: number;
+    alreadyCommitted?: LiveGameplayProgressDelta;
   }
 ): { applied: boolean; unlockedNextLevel: boolean; data: SaveGameData } {
   if (!runId || save.processedRunIds.includes(runId)) {
     return { applied: false, unlockedNextLevel: false, data: save };
   }
 
+  const synced = ensureCurrentDailyChallenges(save);
+  const committed = result.alreadyCommitted ?? {};
+
   const lvl = Math.max(1, Math.floor(result.levelNumber));
   const pos = Math.max(1, Math.min(6, Math.floor(result.playerPosition)));
-  const qualifiedForNextLevel = pos <= 3;
+  const finishedCourse = result.playerFinishedCourse !== false;
+  const qualifiedForNextLevel = finishedCourse && pos <= 3;
 
-  const prevRecord = save.levelsProgression.completedLevels[lvl];
+  const prevRecord = synced.levelsProgression.completedLevels[lvl];
   const updatedRecord: LevelCompletionRecord = {
     bestPosition: prevRecord ? Math.min(prevRecord.bestPosition, pos) : pos,
     bestTimeSec: prevRecord
       ? Math.min(prevRecord.bestTimeSec, Number(result.finishTimeSec.toFixed(2)))
       : Number(result.finishTimeSec.toFixed(2)),
-    wins: (prevRecord?.wins ?? 0) + (pos === 1 ? 1 : 0),
+    wins: (prevRecord?.wins ?? 0) + (finishedCourse && pos === 1 ? 1 : 0),
   };
 
   const nextHighestUnlocked =
-    qualifiedForNextLevel && lvl >= save.levelsProgression.highestUnlockedLevel
+    qualifiedForNextLevel && lvl >= synced.levelsProgression.highestUnlockedLevel
       ? lvl + 1
-      : save.levelsProgression.highestUnlockedLevel;
+      : synced.levelsProgression.highestUnlockedLevel;
 
-  const unlockedNextLevel = nextHighestUnlocked > save.levelsProgression.highestUnlockedLevel;
+  const unlockedNextLevel =
+    nextHighestUnlocked > synced.levelsProgression.highestUnlockedLevel;
+
+  const remDist = Math.max(
+    0,
+    Math.floor(result.distanceMeters) - Math.floor(committed.distanceMeters ?? 0)
+  );
+  const remCoins = Math.max(
+    0,
+    Math.floor(result.rawCoinsPickedUp) - Math.floor(committed.rawCoinsPickedUp ?? 0)
+  );
+  const remNearMisses = Math.max(
+    0,
+    Math.floor(result.nearMisses ?? 0) - Math.floor(committed.nearMisses ?? 0)
+  );
+  const remHighSpeedNm = Math.max(
+    0,
+    Math.floor(result.highSpeedNearMisses ?? 0) -
+      Math.floor(committed.highSpeedNearMisses ?? 0)
+  );
+  const remDrifts = Math.max(
+    0,
+    Math.floor(result.driftEvents ?? 0) - Math.floor(committed.driftEvents ?? 0)
+  );
+  const remDriftZones = Math.max(
+    0,
+    Math.floor(result.levelDriftZonesClean ?? 0) -
+      Math.floor(committed.levelDriftZonesClean ?? 0)
+  );
+  const remJumps = Math.max(
+    0,
+    Math.floor(result.successfulJumps ?? 0) - Math.floor(committed.successfulJumps ?? 0)
+  );
+  const remTunnels = Math.max(
+    0,
+    Math.floor(result.tunnelsCompleted ?? 0) - Math.floor(committed.tunnelsCompleted ?? 0)
+  );
+  const remShields = Math.max(
+    0,
+    Math.floor(result.shieldAbsorptions ?? 0) -
+      Math.floor(committed.shieldAbsorptions ?? 0)
+  );
+  const remNitros = Math.max(
+    0,
+    Math.floor(result.nitroActivations ?? 0) - Math.floor(committed.nitroActivations ?? 0)
+  );
+  const remScore = Math.max(
+    0,
+    Math.floor(result.score) - Math.floor(committed.score ?? 0)
+  );
+
+  const coinsEarnedInt = Math.max(0, Math.floor(result.totalCoinsEarned));
+  const isWin = finishedCourse && pos === 1;
+  const isPodium = finishedCourse && pos <= 3;
+  const isCleanFinish =
+    finishedCourse &&
+    result.collisionsCount !== undefined &&
+    result.collisionsCount === 0;
 
   const updated: SaveGameData = {
-    ...save,
-    coins: save.coins + Math.max(0, Math.floor(result.totalCoinsEarned)),
-    completedRacesCount: save.completedRacesCount + 1,
-    processedRunIds: [...save.processedRunIds.slice(-49), runId],
+    ...synced,
+    coins: synced.coins + coinsEarnedInt,
+    completedRacesCount: synced.completedRacesCount + 1,
+    processedRunIds: [...synced.processedRunIds.slice(-49), runId],
     levelsProgression: {
       highestUnlockedLevel: nextHighestUnlocked,
       selectedLevel: qualifiedForNextLevel ? lvl + 1 : lvl,
-      completedLevels: {
-        ...save.levelsProgression.completedLevels,
-        [lvl]: updatedRecord,
-      },
+      completedLevels: finishedCourse
+        ? {
+            ...synced.levelsProgression.completedLevels,
+            [lvl]: updatedRecord,
+          }
+        : synced.levelsProgression.completedLevels,
     },
     challenges: {
-      ...save.challenges,
-      cumulativeDistance:
-        save.challenges.cumulativeDistance + Math.max(0, Math.floor(result.distanceMeters)),
-      cumulativeCoins:
-        save.challenges.cumulativeCoins + Math.max(0, Math.floor(result.rawCoinsPickedUp)),
-      cumulativeScore:
-        save.challenges.cumulativeScore + Math.max(0, Math.floor(result.score)),
+      ...synced.challenges,
+      cumulativeDistance: synced.challenges.cumulativeDistance + remDist,
+      cumulativeCoins: synced.challenges.cumulativeCoins + remCoins,
+      totalRaceRewardCoins: synced.challenges.totalRaceRewardCoins + coinsEarnedInt,
+      cumulativeNearMisses: synced.challenges.cumulativeNearMisses + remNearMisses,
+      highSpeedNearMisses: synced.challenges.highSpeedNearMisses + remHighSpeedNm,
+      cleanRaces: synced.challenges.cleanRaces + (isCleanFinish ? 1 : 0),
+      driftEvents: synced.challenges.driftEvents + remDrifts,
+      levelDriftZonesClean: synced.challenges.levelDriftZonesClean + remDriftZones,
+      successfulJumps: synced.challenges.successfulJumps + remJumps,
+      tunnelsCompleted: synced.challenges.tunnelsCompleted + remTunnels,
+      levelsWins: synced.challenges.levelsWins + (isWin ? 1 : 0),
+      levelsPodiums: synced.challenges.levelsPodiums + (isPodium ? 1 : 0),
+      levelsCleanFinishes:
+        synced.challenges.levelsCleanFinishes + (isCleanFinish ? 1 : 0),
+      shieldAbsorptions: synced.challenges.shieldAbsorptions + remShields,
+      nitroActivations: synced.challenges.nitroActivations + remNitros,
+      cumulativeScore: synced.challenges.cumulativeScore + remScore,
     },
+    dailyChallenges: applyDailyChallengeMetrics(synced.dailyChallenges, {
+      dailyDistance: remDist,
+      dailyCoinsPickedUp: remCoins,
+      dailyNearMisses: remNearMisses,
+      dailyHighSpeedNearMisses: remHighSpeedNm,
+      dailyDriftEvents: remDrifts,
+      dailyJumps: remJumps,
+      dailyTunnels: remTunnels,
+      dailyLevelsCompleted: finishedCourse ? 1 : 0,
+      dailyLevelsPodiums: isPodium ? 1 : 0,
+      dailyLevelsWins: isWin ? 1 : 0,
+      dailyCleanRaces: isCleanFinish ? 1 : 0,
+      dailyShieldBlocks: remShields,
+      dailyNitroActivations: remNitros,
+      dailyScore: remScore,
+    }),
   };
 
   return { applied: true, unlockedNextLevel, data: updated };
@@ -984,7 +1729,7 @@ export function trySelectLevel(save: SaveGameData, levelNumber: number): SaveGam
 }
 
 /**
- * Pure transaction: Claim a completed challenge reward once.
+ * Pure transaction: Claim a completed lifetime challenge reward once.
  */
 export function tryClaimChallengeReward(
   save: SaveGameData,
@@ -998,14 +1743,7 @@ export function tryClaimChallengeReward(
     return { success: false, reason: 'Challenge reward already claimed.', reward: 0, data: save };
   }
 
-  const currentVal =
-    challenge.metric === 'distance'
-      ? save.challenges.cumulativeDistance
-      : challenge.metric === 'coins'
-        ? save.challenges.cumulativeCoins
-        : challenge.metric === 'nearMisses'
-          ? save.challenges.cumulativeNearMisses
-          : save.challenges.cumulativeScore;
+  const currentVal = getChallengeMetricValue(save, challenge.metric);
 
   if (currentVal < challenge.targetValue) {
     return {
@@ -1026,6 +1764,156 @@ export function tryClaimChallengeReward(
   };
 
   return { success: true, reward: challenge.rewardCoins, data: updated };
+}
+
+/**
+ * Pure transaction: Claim a completed Daily Challenge reward once for the active UTC day.
+ * Also updates the player's Daily Streak (at most once per UTC day).
+ */
+export function tryClaimDailyChallengeReward(
+  save: SaveGameData,
+  dailyChallengeId: string,
+  currentUtcDate: string = getCurrentUtcDateString()
+): {
+  success: boolean;
+  reason?: string;
+  reward: number;
+  streakIncremented: boolean;
+  data: SaveGameData;
+} {
+  const synced = ensureCurrentDailyChallenges(save, currentUtcDate);
+  const dc = synced.dailyChallenges;
+  const idx = dc.items.findIndex((item) => item.id === dailyChallengeId);
+  if (idx === -1) {
+    return {
+      success: false,
+      reason: 'Daily challenge expired or not found.',
+      reward: 0,
+      streakIncremented: false,
+      data: synced,
+    };
+  }
+
+  const targetItem = dc.items[idx];
+  if (targetItem.claimed) {
+    return {
+      success: false,
+      reason: 'Daily challenge reward already claimed.',
+      reward: 0,
+      streakIncremented: false,
+      data: synced,
+    };
+  }
+
+  if (targetItem.currentValue < targetItem.targetValue) {
+    return {
+      success: false,
+      reason: `Progress incomplete (${targetItem.currentValue}/${targetItem.targetValue}).`,
+      reward: 0,
+      streakIncremented: false,
+      data: synced,
+    };
+  }
+
+  const nextItems = dc.items.map((item, i) =>
+    i === idx ? { ...item, claimed: true } : item
+  );
+
+  // Update Daily Streak at most once per UTC day when at least 1 daily challenge is completed & claimed
+  let nextStreak = dc.currentStreak;
+  let nextBestStreak = dc.bestStreak;
+  let nextLastStreakDate = dc.lastStreakDateUtc;
+  let streakIncremented = false;
+
+  if (dc.lastStreakDateUtc !== dc.dateUtc) {
+    const yesterdayUtc = getPreviousUtcDateString(dc.dateUtc);
+    nextStreak = dc.lastStreakDateUtc === yesterdayUtc ? dc.currentStreak + 1 : 1;
+    nextBestStreak = Math.max(dc.bestStreak, nextStreak);
+    nextLastStreakDate = dc.dateUtc;
+    streakIncremented = true;
+  }
+
+  const updated: SaveGameData = {
+    ...synced,
+    coins: synced.coins + targetItem.rewardCoins,
+    dailyChallenges: {
+      ...dc,
+      items: nextItems,
+      currentStreak: nextStreak,
+      bestStreak: nextBestStreak,
+      lastStreakDateUtc: nextLastStreakDate,
+    },
+  };
+
+  return {
+    success: true,
+    reward: targetItem.rewardCoins,
+    streakIncremented,
+    data: updated,
+  };
+}
+
+/**
+ * Pure transaction: Claim the 250-coin Daily Completion Bonus once all 3 daily challenges
+ * for the active UTC day are completed.
+ */
+export function tryClaimDailyCompletionBonus(
+  save: SaveGameData,
+  currentUtcDate: string = getCurrentUtcDateString()
+): { success: boolean; reason?: string; reward: number; data: SaveGameData } {
+  const synced = ensureCurrentDailyChallenges(save, currentUtcDate);
+  const dc = synced.dailyChallenges;
+
+  if (dc.bonusClaimed) {
+    return {
+      success: false,
+      reason: 'Daily completion bonus already claimed today.',
+      reward: 0,
+      data: synced,
+    };
+  }
+
+  const allCompleted =
+    dc.items.length === 3 &&
+    dc.items.every((item) => item.currentValue >= item.targetValue);
+
+  if (!allCompleted) {
+    return {
+      success: false,
+      reason: 'Complete all 3 daily challenges first to unlock the Daily Bonus.',
+      reward: 0,
+      data: synced,
+    };
+  }
+
+  // Also ensure streak is credited if they claim bonus before individual claim
+  let nextStreak = dc.currentStreak;
+  let nextBestStreak = dc.bestStreak;
+  let nextLastStreakDate = dc.lastStreakDateUtc;
+  if (dc.lastStreakDateUtc !== dc.dateUtc) {
+    const yesterdayUtc = getPreviousUtcDateString(dc.dateUtc);
+    nextStreak = dc.lastStreakDateUtc === yesterdayUtc ? dc.currentStreak + 1 : 1;
+    nextBestStreak = Math.max(dc.bestStreak, nextStreak);
+    nextLastStreakDate = dc.dateUtc;
+  }
+
+  const updated: SaveGameData = {
+    ...synced,
+    coins: synced.coins + DAILY_COMPLETION_BONUS_COINS,
+    dailyChallenges: {
+      ...dc,
+      bonusClaimed: true,
+      currentStreak: nextStreak,
+      bestStreak: nextBestStreak,
+      lastStreakDateUtc: nextLastStreakDate,
+    },
+  };
+
+  return {
+    success: true,
+    reward: DAILY_COMPLETION_BONUS_COINS,
+    data: updated,
+  };
 }
 
 export function loadSaveFromStorage(storage?: Storage): SaveGameData {

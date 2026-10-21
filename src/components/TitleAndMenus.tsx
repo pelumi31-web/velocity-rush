@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   AD_CONFIG,
   BUMPER_OPTIONS,
@@ -6,7 +6,9 @@ import {
   CAR_CONFIGS,
   CAR_ORDER,
   CarId,
+  ChallengeCategory,
   CHALLENGES_CONFIG,
+  DAILY_COMPLETION_BONUS_COINS,
   GamePlayMode,
   GraphicsQuality,
   PAINT_FINISHES,
@@ -43,6 +45,8 @@ import {
   createDefaultProtection,
   createDefaultUpgrades,
   CustomizationSlotType,
+  getChallengeMetricValue,
+  getTimeUntilNextUtcReset,
   SaveGameData,
   UserSettingsData,
 } from '../game/saveSystem';
@@ -63,6 +67,23 @@ export type GarageCategoryTab =
   | 'body'
   | 'performance'
   | 'protection';
+
+const CHALLENGE_CATEGORY_TABS: { id: 'all' | ChallengeCategory; label: string }[] = [
+  { id: 'all', label: 'All Challenges' },
+  { id: 'solo', label: 'Solo Mode' },
+  { id: 'levels', label: 'Levels Mode' },
+  { id: 'skills', label: 'Driving Skills' },
+  { id: 'stunts', label: 'Exploration and Stunts' },
+  { id: 'garage', label: 'Garage and Upgrades' },
+];
+
+const CHALLENGE_CATEGORY_LABELS: Record<ChallengeCategory, string> = {
+  solo: 'Solo Mode',
+  levels: 'Levels Mode',
+  skills: 'Driving Skills',
+  stunts: 'Exploration & Stunts',
+  garage: 'Garage & Upgrades',
+};
 
 interface TitleAndMenusProps {
   saveData: SaveGameData;
@@ -90,6 +111,10 @@ interface TitleAndMenusProps {
   onClaimChallenge: (
     challengeId: string
   ) => { success: boolean; reward: number; reason?: string };
+  onClaimDailyChallenge?: (
+    dailyId: string
+  ) => { success: boolean; reward: number; reason?: string };
+  onClaimDailyBonus?: () => { success: boolean; reward: number; reason?: string };
   onUpdateSettings: (partial: Partial<UserSettingsData>) => void;
   onCalibrateTiltNeutral: () => void;
   onRequestMotionPermission: () => void;
@@ -121,6 +146,8 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
   onCustomizeCar,
   onSelectLevel,
   onClaimChallenge,
+  onClaimDailyChallenge,
+  onClaimDailyBonus,
   onUpdateSettings,
   onCalibrateTiltNeutral,
   onRequestMotionPermission,
@@ -146,6 +173,22 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
     'architecture'
   );
   const [autoSpinActive, setAutoSpinActive] = useState<boolean>(true);
+  const [challengesMainView, setChallengesMainView] = useState<'lifetime' | 'daily'>('lifetime');
+  const [challengeCategoryFilter, setChallengeCategoryFilter] = useState<
+    'all' | ChallengeCategory
+  >('all');
+  const [utcResetCountdown, setUtcResetCountdown] = useState<string>(() =>
+    getTimeUntilNextUtcReset().formatted
+  );
+
+  useEffect(() => {
+    if (activeModal !== 'challenges') return;
+    setUtcResetCountdown(getTimeUntilNextUtcReset().formatted);
+    const timer = window.setInterval(() => {
+      setUtcResetCountdown(getTimeUntilNextUtcReset().formatted);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [activeModal]);
 
   const selectedCar = CAR_CONFIGS[saveData.selectedCarId] ?? CAR_CONFIGS.starter_apex;
   const inspectedCar = CAR_CONFIGS[inspectCarId] ?? CAR_CONFIGS.starter_apex;
@@ -165,18 +208,26 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
   const isInspectedUnlocked = saveData.unlockedCarIds.includes(inspectCarId);
   const isInspectedSelected = saveData.selectedCarId === inspectCarId;
 
-  const unclaimedChallengesCount = CHALLENGES_CONFIG.filter((ch) => {
+  const unclaimedLifetimeCount = CHALLENGES_CONFIG.filter((ch) => {
     if (saveData.challenges.claimedChallengeIds.includes(ch.id)) return false;
-    const val =
-      ch.metric === 'distance'
-        ? saveData.challenges.cumulativeDistance
-        : ch.metric === 'coins'
-          ? saveData.challenges.cumulativeCoins
-          : ch.metric === 'nearMisses'
-            ? saveData.challenges.cumulativeNearMisses
-            : saveData.challenges.cumulativeScore;
+    const val = getChallengeMetricValue(saveData, ch.metric);
     return val >= ch.targetValue;
   }).length;
+
+  const dailyState = saveData.dailyChallenges;
+  const dailyItems = dailyState?.items ?? [];
+  const dailyCompletedCount = dailyItems.filter(
+    (item) => item.currentValue >= item.targetValue
+  ).length;
+  const unclaimedDailyItemsCount = dailyItems.filter(
+    (item) => !item.claimed && item.currentValue >= item.targetValue
+  ).length;
+  const dailyBonusReady =
+    dailyItems.length > 0 &&
+    dailyCompletedCount === dailyItems.length &&
+    !(dailyState?.bonusClaimed ?? false);
+  const unclaimedDailyCount = unclaimedDailyItemsCount + (dailyBonusReady ? 1 : 0);
+  const unclaimedChallengesCount = unclaimedLifetimeCount + unclaimedDailyCount;
 
   const cycleInspectedCar = (dir: -1 | 1) => {
     const currentIdx = CAR_ORDER.indexOf(inspectCarId);
@@ -383,10 +434,13 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
               <button
                 type="button"
                 data-testid="open-challenges-btn"
-                onClick={() => setActiveModal('challenges')}
+                onClick={() => {
+                  setChallengesMainView('lifetime');
+                  setActiveModal('challenges');
+                }}
                 className="relative py-2 px-3 rounded-xl bg-slate-900/90 hover:bg-slate-800 border border-slate-700/80 text-slate-100 font-semibold text-xs sm:text-sm transition-colors cursor-pointer"
               >
-                Challenges
+                Challenges ({CHALLENGES_CONFIG.length})
                 {unclaimedChallengesCount > 0 && (
                   <span className="ml-1.5 inline-flex items-center justify-center px-1.5 py-0.5 text-[10px] font-bold bg-amber-400 text-slate-950 rounded-md">
                     {unclaimedChallengesCount}
@@ -394,6 +448,35 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
                 )}
               </button>
             </div>
+
+            <button
+              type="button"
+              data-testid="open-daily-challenges-btn"
+              onClick={() => {
+                setChallengesMainView('daily');
+                setActiveModal('challenges');
+              }}
+              className="w-full py-2 px-3 rounded-xl bg-slate-900/95 hover:bg-slate-800/95 border border-amber-500/40 text-slate-100 font-semibold text-xs transition-colors cursor-pointer flex items-center justify-between gap-2"
+            >
+              <span className="flex items-center gap-1.5">
+                <span className="px-1.5 py-0.5 rounded bg-amber-400/20 text-amber-300 font-bold text-[10px] uppercase tracking-wider">
+                  Daily
+                </span>
+                <span>
+                  Daily Objectives ({dailyCompletedCount}/{dailyItems.length || 3})
+                </span>
+              </span>
+              <span className="flex items-center gap-2 font-mono text-[11px]">
+                <span className="text-amber-400">
+                  Streak: {dailyState?.currentStreak ?? 0}d
+                </span>
+                {unclaimedDailyCount > 0 && (
+                  <span className="px-1.5 py-0.5 text-[10px] font-bold bg-amber-400 text-slate-950 rounded-md">
+                    Claim {unclaimedDailyCount}
+                  </span>
+                )}
+              </span>
+            </button>
           </div>
 
           <div className="mt-3 pt-2 border-t border-slate-800/80 flex items-center justify-between text-[11px] text-slate-400">
@@ -1538,108 +1621,477 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
         </div>
       )}
 
-      {/* 4. CHALLENGES / MISSIONS MODAL */}
-      {activeModal === 'challenges' && (
-        <div
-          role="dialog"
-          aria-label="Driver Challenges"
-          className="my-auto max-w-2xl w-full mx-auto bg-[#0b0f19]/94 border border-slate-800 rounded-2xl p-4 sm:p-5 shadow-2xl pointer-events-auto max-h-[82vh] overflow-y-auto"
-        >
-          <div className="flex items-center justify-between pb-3 mb-3 border-b border-slate-800">
-            <div>
-              <h2 className="text-lg font-extrabold uppercase tracking-tight text-slate-100">
-                Highway Milestones & Challenges
-              </h2>
-              <p className="text-xs text-slate-400">
-                Complete cumulative objectives across Solo and Levels Mode to earn bonus coins.
-              </p>
-            </div>
-            <button
-              type="button"
-              onClick={() => setActiveModal('none')}
-              className="px-3 py-1.5 text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg cursor-pointer"
-            >
-              Close
-            </button>
-          </div>
+      {/* 4. CHALLENGES & DAILY OBJECTIVES MODAL */}
+      {activeModal === 'challenges' && (() => {
+        const totalCompletedCount = CHALLENGES_CONFIG.filter(
+          (ch) => getChallengeMetricValue(saveData, ch.metric) >= ch.targetValue
+        ).length;
+        const totalClaimedCount = saveData.challenges.claimedChallengeIds.length;
+        const filteredChallenges =
+          challengeCategoryFilter === 'all'
+            ? CHALLENGES_CONFIG
+            : CHALLENGES_CONFIG.filter((ch) => ch.category === challengeCategoryFilter);
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-            {CHALLENGES_CONFIG.map((ch) => {
-              const claimed = saveData.challenges.claimedChallengeIds.includes(ch.id);
-              const currentVal =
-                ch.metric === 'distance'
-                  ? saveData.challenges.cumulativeDistance
-                  : ch.metric === 'coins'
-                    ? saveData.challenges.cumulativeCoins
-                    : ch.metric === 'nearMisses'
-                      ? saveData.challenges.cumulativeNearMisses
-                      : saveData.challenges.cumulativeScore;
-              const pct = Math.min(100, Math.round((currentVal / ch.targetValue) * 100));
-              const readyToClaim = !claimed && currentVal >= ch.targetValue;
+        return (
+          <div
+            role="dialog"
+            aria-label="Driver Challenges"
+            className="my-auto max-w-4xl w-full mx-auto bg-[#0b0f19]/95 border border-slate-800 rounded-2xl p-3 sm:p-4 shadow-2xl pointer-events-auto max-h-[84vh] flex flex-col overflow-hidden"
+          >
+            {/* Header & Primary Mode Switcher */}
+            <div className="flex flex-wrap items-center justify-between gap-2 pb-2.5 mb-2.5 border-b border-slate-800 shrink-0">
+              <div>
+                <h2 className="text-base sm:text-lg font-extrabold uppercase tracking-tight text-slate-100">
+                  Highway Milestones & Daily Objectives
+                </h2>
+                <p className="text-[11px] text-slate-400">
+                  Complete 32 lifetime progression milestones and 3 daily objectives across Solo, Levels, Stunts, and Garage.
+                </p>
+              </div>
 
-              return (
-                <div
-                  key={ch.id}
-                  className="bg-slate-900/90 border border-slate-800 rounded-xl p-3 flex flex-col justify-between gap-2"
-                >
-                  <div>
-                    <div className="flex items-center justify-between gap-2">
-                      <h3 className="text-xs sm:text-sm font-bold text-slate-100">
-                        {ch.title}
-                      </h3>
-                      <span className="text-xs font-mono font-bold text-amber-400">
-                        +{ch.rewardCoins} Coins
+              <div className="flex items-center gap-2">
+                <div className="flex items-center bg-slate-900 border border-slate-800 rounded-xl p-0.5">
+                  <button
+                    type="button"
+                    data-testid="challenges-mode-lifetime"
+                    onClick={() => setChallengesMainView('lifetime')}
+                    className={`px-3 py-1 rounded-lg text-xs font-bold transition cursor-pointer flex items-center gap-1.5 ${
+                      challengesMainView === 'lifetime'
+                        ? 'bg-cyan-400 text-slate-950'
+                        : 'text-slate-300 hover:text-white'
+                    }`}
+                  >
+                    <span>Lifetime ({CHALLENGES_CONFIG.length})</span>
+                    {unclaimedLifetimeCount > 0 && (
+                      <span className="px-1.5 py-0.2 text-[10px] font-extrabold rounded bg-amber-400 text-slate-950">
+                        {unclaimedLifetimeCount}
                       </span>
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="challenges-mode-daily"
+                    onClick={() => setChallengesMainView('daily')}
+                    className={`px-3 py-1 rounded-lg text-xs font-bold transition cursor-pointer flex items-center gap-1.5 ${
+                      challengesMainView === 'daily'
+                        ? 'bg-amber-400 text-slate-950'
+                        : 'text-slate-300 hover:text-white'
+                    }`}
+                  >
+                    <span>Daily Objectives (3)</span>
+                    {unclaimedDailyCount > 0 && (
+                      <span className="px-1.5 py-0.2 text-[10px] font-extrabold rounded bg-cyan-400 text-slate-950">
+                        {unclaimedDailyCount}
+                      </span>
+                    )}
+                  </button>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => setActiveModal('none')}
+                  className="px-3 py-1.5 text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg cursor-pointer"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+
+            {/* VIEW A: 32 LIFETIME MILESTONES & CHALLENGES */}
+            {challengesMainView === 'lifetime' && (
+              <>
+                {/* Summary Bar */}
+                <div className="grid grid-cols-3 gap-2 mb-2.5 shrink-0">
+                  <div className="bg-slate-900/90 border border-slate-800 rounded-xl px-3 py-1.5 flex items-center justify-between">
+                    <span className="text-[11px] text-slate-400 uppercase font-semibold">
+                      Completed
+                    </span>
+                    <span
+                      data-testid="challenges-completed-summary"
+                      className="text-xs sm:text-sm font-mono font-bold text-cyan-400"
+                    >
+                      {totalCompletedCount} / {CHALLENGES_CONFIG.length}
+                    </span>
+                  </div>
+                  <div className="bg-slate-900/90 border border-slate-800 rounded-xl px-3 py-1.5 flex items-center justify-between">
+                    <span className="text-[11px] text-slate-400 uppercase font-semibold">
+                      Rewards Claimed
+                    </span>
+                    <span
+                      data-testid="challenges-claimed-summary"
+                      className="text-xs sm:text-sm font-mono font-bold text-emerald-400"
+                    >
+                      {totalClaimedCount} / {CHALLENGES_CONFIG.length}
+                    </span>
+                  </div>
+                  <div className="bg-slate-900/90 border border-slate-800 rounded-xl px-3 py-1.5 flex items-center justify-between">
+                    <span className="text-[11px] text-slate-400 uppercase font-semibold">
+                      Ready to Claim
+                    </span>
+                    <span
+                      data-testid="challenges-ready-summary"
+                      className="text-xs sm:text-sm font-mono font-bold text-amber-400"
+                    >
+                      {unclaimedLifetimeCount}
+                    </span>
+                  </div>
+                </div>
+
+                {/* 6 Category Filter Tabs */}
+                <div className="flex flex-wrap gap-1.5 mb-2.5 shrink-0">
+                  {CHALLENGE_CATEGORY_TABS.map((tab) => {
+                    const active = challengeCategoryFilter === tab.id;
+                    const countInTab =
+                      tab.id === 'all'
+                        ? CHALLENGES_CONFIG.length
+                        : CHALLENGES_CONFIG.filter((c) => c.category === tab.id).length;
+                    return (
+                      <button
+                        key={tab.id}
+                        type="button"
+                        data-testid={`challenge-tab-${tab.id}`}
+                        onClick={() => setChallengeCategoryFilter(tab.id)}
+                        className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition cursor-pointer ${
+                          active
+                            ? 'bg-cyan-400 text-slate-950'
+                            : 'bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800'
+                        }`}
+                      >
+                        {tab.label} ({countInTab})
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Scrollable 2-Column Landscape Challenge Grid */}
+                <div className="flex-1 overflow-y-auto pr-1 grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  {filteredChallenges.map((ch) => {
+                    const claimed = saveData.challenges.claimedChallengeIds.includes(ch.id);
+                    const currentVal = getChallengeMetricValue(saveData, ch.metric);
+                    const pct = Math.min(
+                      100,
+                      Math.round((currentVal / Math.max(1, ch.targetValue)) * 100)
+                    );
+                    const isCompleted = currentVal >= ch.targetValue;
+                    const readyToClaim = !claimed && isCompleted;
+
+                    return (
+                      <div
+                        key={ch.id}
+                        data-testid={`challenge-card-${ch.id}`}
+                        className={`rounded-xl p-3 flex flex-col justify-between gap-2 border ${
+                          readyToClaim
+                            ? 'bg-slate-900/95 border-amber-400/60'
+                            : claimed
+                              ? 'bg-slate-900/70 border-emerald-800/50'
+                              : 'bg-slate-900/90 border-slate-800'
+                        }`}
+                      >
+                        <div>
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="flex items-center gap-1.5 min-w-0">
+                              <h3 className="text-xs sm:text-sm font-bold text-slate-100 truncate">
+                                {ch.title}
+                              </h3>
+                              <span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 text-[9px] font-semibold uppercase shrink-0">
+                                {CHALLENGE_CATEGORY_LABELS[ch.category]}
+                              </span>
+                            </div>
+                            <span className="text-xs font-mono font-bold text-amber-400 shrink-0">
+                              +{ch.rewardCoins} Coins
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-slate-400 mt-0.5 leading-snug">
+                            {ch.description}
+                          </p>
+                        </div>
+
+                        <div>
+                          <div className="flex items-center justify-between text-[11px] font-mono text-slate-300 mb-1">
+                            <span>
+                              {Math.min(currentVal, ch.targetValue).toLocaleString()} /{' '}
+                              {ch.targetValue.toLocaleString()}
+                            </span>
+                            <span>{pct}%</span>
+                          </div>
+                          <div className="w-full h-1.5 bg-slate-950 rounded-full overflow-hidden border border-slate-800 mb-2">
+                            <div
+                              className={`h-full transition-all ${
+                                claimed
+                                  ? 'bg-emerald-400'
+                                  : readyToClaim
+                                    ? 'bg-amber-400'
+                                    : 'bg-cyan-400'
+                              }`}
+                              style={{ width: `${pct}%` }}
+                            />
+                          </div>
+
+                          <button
+                            type="button"
+                            data-testid={`claim-challenge-${ch.id}`}
+                            disabled={!readyToClaim}
+                            onClick={() => {
+                              const res = onClaimChallenge(ch.id);
+                              if (res.success) {
+                                onTriggerFeedbackNotice(
+                                  `Claimed "${ch.title}": +${res.reward} Coins!`
+                                );
+                              } else if (res.reason) {
+                                onTriggerFeedbackNotice(res.reason);
+                              }
+                            }}
+                            className={`w-full py-1.5 px-3 rounded-lg text-xs font-bold uppercase tracking-wider transition-colors cursor-pointer ${
+                              claimed
+                                ? 'bg-emerald-950/50 text-emerald-400 border border-emerald-800/50 cursor-default'
+                                : readyToClaim
+                                  ? 'bg-amber-400 hover:bg-amber-300 text-slate-950'
+                                  : 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                            }`}
+                          >
+                            {claimed
+                              ? 'Claimed'
+                              : readyToClaim
+                                ? `Claim +${ch.rewardCoins} Coins`
+                                : 'In Progress'}
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+
+            {/* VIEW B: DAILY CHALLENGES, STREAK, 250-COIN DAILY BONUS & HISTORY */}
+            {challengesMainView === 'daily' && (
+              <div className="flex-1 overflow-y-auto pr-1 flex flex-col gap-3">
+                {/* Daily Status, Streak & UTC Countdown Bar */}
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 shrink-0">
+                  <div className="bg-slate-900/90 border border-slate-800 rounded-xl px-3 py-2 flex items-center justify-between">
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wider text-slate-400">
+                        Active UTC Day ({dailyState?.dateUtc ?? 'Today'})
+                      </div>
+                      <div
+                        data-testid="daily-reset-countdown"
+                        className="text-xs sm:text-sm font-mono font-bold text-cyan-400"
+                      >
+                        Resets in {utcResetCountdown}
+                      </div>
                     </div>
-                    <p className="text-[11px] text-slate-400 mt-0.5">{ch.description}</p>
+                    <span className="px-2 py-0.5 rounded bg-cyan-500/15 text-cyan-300 text-[10px] font-mono">
+                      UTC
+                    </span>
                   </div>
 
-                  <div>
-                    <div className="flex items-center justify-between text-[11px] font-mono text-slate-300 mb-1">
-                      <span>
-                        {Math.min(currentVal, ch.targetValue)} / {ch.targetValue}
-                      </span>
-                      <span>{pct}%</span>
-                    </div>
-                    <div className="w-full h-1.5 bg-slate-950 rounded-full overflow-hidden border border-slate-800 mb-2">
+                  <div className="bg-slate-900/90 border border-slate-800 rounded-xl px-3 py-2 flex items-center justify-between">
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wider text-slate-400">
+                        Daily Streak
+                      </div>
                       <div
-                        className="h-full bg-cyan-400 transition-all"
-                        style={{ width: `${pct}%` }}
-                      />
+                        data-testid="daily-current-streak"
+                        className="text-xs sm:text-sm font-mono font-bold text-amber-400"
+                      >
+                        {dailyState?.currentStreak ?? 0} Day
+                        {(dailyState?.currentStreak ?? 0) === 1 ? '' : 's'}
+                      </div>
                     </div>
+                    <div className="text-right">
+                      <div className="text-[10px] uppercase tracking-wider text-slate-400">
+                        Best Streak
+                      </div>
+                      <div
+                        data-testid="daily-best-streak"
+                        className="text-xs font-mono font-bold text-emerald-400"
+                      >
+                        {dailyState?.bestStreak ?? 0}d
+                      </div>
+                    </div>
+                  </div>
 
+                  {/* Daily Completion Bonus (+250 Coins) */}
+                  <div className="bg-slate-900/95 border border-amber-500/40 rounded-xl px-3 py-2 flex items-center justify-between gap-2">
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wider text-amber-300 font-bold">
+                        All-3 Daily Bonus (+{DAILY_COMPLETION_BONUS_COINS})
+                      </div>
+                      <div className="text-xs font-mono text-slate-300">
+                        Completed: {dailyCompletedCount} / {dailyItems.length || 3}
+                      </div>
+                    </div>
                     <button
                       type="button"
-                      disabled={!readyToClaim}
+                      data-testid="claim-daily-bonus-btn"
+                      disabled={!dailyBonusReady}
                       onClick={() => {
-                        const res = onClaimChallenge(ch.id);
+                        if (!onClaimDailyBonus) return;
+                        const res = onClaimDailyBonus();
                         if (res.success) {
-                          onTriggerFeedbackNotice(`Claimed +${res.reward} Coins!`);
+                          onTriggerFeedbackNotice(
+                            `Daily Sweep Bonus Claimed: +${res.reward} Coins!`
+                          );
                         } else if (res.reason) {
                           onTriggerFeedbackNotice(res.reason);
                         }
                       }}
-                      className={`w-full py-1.5 px-3 rounded-lg text-xs font-bold uppercase tracking-wider transition-colors cursor-pointer ${
-                        claimed
-                          ? 'bg-emerald-950/50 text-emerald-400 border border-emerald-800/50 cursor-default'
-                          : readyToClaim
+                      className={`px-2.5 py-1.5 rounded-lg text-[11px] font-bold uppercase tracking-wider cursor-pointer shrink-0 ${
+                        dailyState?.bonusClaimed
+                          ? 'bg-emerald-950/60 text-emerald-400 border border-emerald-800/50 cursor-default'
+                          : dailyBonusReady
                             ? 'bg-amber-400 hover:bg-amber-300 text-slate-950'
                             : 'bg-slate-800 text-slate-500 cursor-not-allowed'
                       }`}
                     >
-                      {claimed
-                        ? 'Reward Claimed'
-                        : readyToClaim
-                          ? `Claim +${ch.rewardCoins} Coins`
-                          : 'In Progress'}
+                      {dailyState?.bonusClaimed
+                        ? 'Bonus Claimed'
+                        : dailyBonusReady
+                          ? `Claim +${DAILY_COMPLETION_BONUS_COINS}`
+                          : `${dailyCompletedCount}/3 Done`}
                     </button>
                   </div>
                 </div>
-              );
-            })}
+
+                {/* 3 Daily Challenge Cards (Easy / Medium / Hard) */}
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                  {dailyItems.map((item) => {
+                    const pct = Math.min(
+                      100,
+                      Math.round((item.currentValue / Math.max(1, item.targetValue)) * 100)
+                    );
+                    const completed = item.currentValue >= item.targetValue;
+                    const readyToClaim = !item.claimed && completed;
+                    const diffBadgeClass =
+                      item.difficulty === 'easy'
+                        ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                        : item.difficulty === 'medium'
+                          ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40'
+                          : 'bg-amber-500/20 text-amber-300 border-amber-500/40';
+
+                    return (
+                      <div
+                        key={item.id}
+                        data-testid={`daily-card-${item.difficulty}`}
+                        className={`rounded-xl p-3 flex flex-col justify-between gap-2.5 border ${
+                          readyToClaim
+                            ? 'bg-slate-900/95 border-amber-400/60'
+                            : item.claimed
+                              ? 'bg-slate-900/75 border-emerald-800/50'
+                              : 'bg-slate-900/90 border-slate-800'
+                        }`}
+                      >
+                        <div>
+                          <div className="flex items-center justify-between gap-1.5 mb-1">
+                            <span
+                              className={`px-2 py-0.5 rounded border text-[10px] font-extrabold uppercase tracking-wider ${diffBadgeClass}`}
+                            >
+                              {item.difficulty}
+                            </span>
+                            <span className="text-xs font-mono font-bold text-amber-400">
+                              +{item.rewardCoins} Coins
+                            </span>
+                          </div>
+                          <h3 className="text-xs sm:text-sm font-bold text-slate-100">
+                            {item.title}
+                          </h3>
+                          <p className="text-[11px] text-slate-400 mt-0.5 leading-snug">
+                            {item.description}
+                          </p>
+                        </div>
+
+                        <div>
+                          <div className="flex items-center justify-between text-[11px] font-mono text-slate-300 mb-1">
+                            <span>
+                              {Math.min(item.currentValue, item.targetValue).toLocaleString()} /{' '}
+                              {item.targetValue.toLocaleString()}
+                            </span>
+                            <span>{pct}%</span>
+                          </div>
+                          <div className="w-full h-1.5 bg-slate-950 rounded-full overflow-hidden border border-slate-800 mb-2">
+                            <div
+                              className={`h-full transition-all ${
+                                item.claimed
+                                  ? 'bg-emerald-400'
+                                  : readyToClaim
+                                    ? 'bg-amber-400'
+                                    : 'bg-cyan-400'
+                              }`}
+                              style={{ width: `${pct}%` }}
+                            />
+                          </div>
+
+                          <button
+                            type="button"
+                            data-testid={`claim-daily-${item.difficulty}`}
+                            disabled={!readyToClaim}
+                            onClick={() => {
+                              if (!onClaimDailyChallenge) return;
+                              const res = onClaimDailyChallenge(item.id);
+                              if (res.success) {
+                                onTriggerFeedbackNotice(
+                                  `Claimed Daily "${item.title}": +${res.reward} Coins!`
+                                );
+                              } else if (res.reason) {
+                                onTriggerFeedbackNotice(res.reason);
+                              }
+                            }}
+                            className={`w-full py-1.5 px-3 rounded-lg text-xs font-bold uppercase tracking-wider transition-colors cursor-pointer ${
+                              item.claimed
+                                ? 'bg-emerald-950/50 text-emerald-400 border border-emerald-800/50 cursor-default'
+                                : readyToClaim
+                                  ? 'bg-amber-400 hover:bg-amber-300 text-slate-950'
+                                  : 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                            }`}
+                          >
+                            {item.claimed
+                              ? 'Claimed'
+                              : readyToClaim
+                                ? `Claim +${item.rewardCoins} Coins`
+                                : 'In Progress'}
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Recent Daily Challenge History */}
+                <div className="bg-slate-900/75 border border-slate-800 rounded-xl p-3">
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className="text-xs font-bold uppercase tracking-wider text-slate-200">
+                      Recent Daily Challenge History
+                    </span>
+                    <span className="text-[11px] text-slate-400">
+                      Complete & claim at least 1 daily objective each UTC day to build your streak
+                    </span>
+                  </div>
+                  {(dailyState?.history?.length ?? 0) === 0 ? (
+                    <div className="text-[11px] text-slate-400 font-mono py-1">
+                      No previous daily cycles archived yet — today&apos;s UTC log will archive at 00:00 UTC.
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                      {dailyState.history.slice(0, 8).map((h) => (
+                        <div
+                          key={h.dateUtc}
+                          className="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-[11px] flex items-center justify-between"
+                        >
+                          <span className="font-mono text-slate-300">{h.dateUtc}</span>
+                          <span className="font-mono font-bold text-cyan-400">
+                            {h.completedCount}/3
+                            {h.bonusClaimed ? ' ★' : ''}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* 5. SETTINGS MODAL */}
       {activeModal === 'settings' && (

@@ -13,11 +13,16 @@ import {
 import {
   createDefaultSaveData,
   CustomizationSlotType,
+  ensureCurrentDailyChallenges,
+  LiveGameplayProgressDelta,
   loadSaveFromStorage,
   recordCompletedLevelRace,
   recordCompletedRun,
+  recordLiveGameplayProgress,
   SaveGameData,
   tryClaimChallengeReward,
+  tryClaimDailyChallengeReward,
+  tryClaimDailyCompletionBonus,
   tryPurchaseOrEquipCustomization,
   tryPurchaseProtectionUpgrade,
   tryPurchaseUpgrade,
@@ -440,6 +445,18 @@ export default function App() {
     handleCycleMusicTrack,
   ]);
 
+  const handleIncrementalProgress = useCallback((delta: LiveGameplayProgressDelta) => {
+    setSaveData((prev) => recordLiveGameplayProgress(prev, delta));
+  }, []);
+
+  // Periodic UTC day check so Daily Challenges roll over seamlessly if midnight UTC passes while playing
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      setSaveData((prev) => ensureCurrentDailyChallenges(prev));
+    }, 30000);
+    return () => window.clearInterval(id);
+  }, []);
+
   const handleRunEnded = useCallback((payload: CompletedRunPayload) => {
     setLastRunPayload(payload);
     setRewardedBonusClaimed(false);
@@ -461,6 +478,16 @@ export default function App() {
           ),
           distanceMeters: lr.course.totalLengthMeters,
           score: lr.rewards.totalScore,
+          nearMisses: payload.nearMissCount,
+          highSpeedNearMisses: payload.highSpeedNearMissCount,
+          driftEvents: payload.driftEventsCount,
+          levelDriftZonesClean: payload.levelDriftZonesCleanCount,
+          successfulJumps: payload.successfulJumpsCount,
+          tunnelsCompleted: payload.tunnelsCompletedCount,
+          shieldAbsorptions: payload.shieldAbsorptionsCount,
+          nitroActivations: payload.nitroActivationsCount,
+          collisionsCount: payload.collisionsCount,
+          alreadyCommitted: payload.alreadyCommitted,
         });
         updatedData = res.data;
       } else {
@@ -472,6 +499,13 @@ export default function App() {
             payload.summary.coinsFromPickups / HIGHWAY_CONFIG.coinPickupValue
           ),
           nearMisses: payload.nearMissCount,
+          highSpeedNearMisses: payload.highSpeedNearMissCount,
+          driftEvents: payload.driftEventsCount,
+          successfulJumps: payload.successfulJumpsCount,
+          tunnelsCompleted: payload.tunnelsCompletedCount,
+          shieldAbsorptions: payload.shieldAbsorptionsCount,
+          nitroActivations: payload.nitroActivationsCount,
+          alreadyCommitted: payload.alreadyCommitted,
         });
         updatedData = res.data;
       }
@@ -623,6 +657,34 @@ export default function App() {
     return outcome;
   }, []);
 
+  const handleClaimDailyChallenge = useCallback((dailyId: string) => {
+    soundController.playButtonClick();
+    let outcome: { success: boolean; reason?: string; reward: number } = {
+      success: false,
+      reward: 0,
+    };
+    setSaveData((prev) => {
+      const res = tryClaimDailyChallengeReward(prev, dailyId);
+      outcome = { success: res.success, reason: res.reason, reward: res.reward };
+      return res.data;
+    });
+    return outcome;
+  }, []);
+
+  const handleClaimDailyBonus = useCallback(() => {
+    soundController.playButtonClick();
+    let outcome: { success: boolean; reason?: string; reward: number } = {
+      success: false,
+      reward: 0,
+    };
+    setSaveData((prev) => {
+      const res = tryClaimDailyCompletionBonus(prev);
+      outcome = { success: res.success, reason: res.reason, reward: res.reward };
+      return res.data;
+    });
+    return outcome;
+  }, []);
+
   const handleUpdateSettings = useCallback(
     (partial: Partial<SaveGameData['settings']>) => {
       soundController.playButtonClick();
@@ -682,6 +744,7 @@ export default function App() {
         controlsRef={controlsRef}
         onLiveStateChange={setLiveSnapshot}
         onRunEnded={handleRunEnded}
+        onIncrementalProgress={handleIncrementalProgress}
         onRequestPauseToggle={handlePauseToggle}
         onSensorFallbackNotice={showToastNotice}
       />
@@ -756,6 +819,8 @@ export default function App() {
           onCustomizeCar={handleCustomizeCar}
           onSelectLevel={handleSelectLevel}
           onClaimChallenge={handleClaimChallenge}
+          onClaimDailyChallenge={handleClaimDailyChallenge}
+          onClaimDailyBonus={handleClaimDailyBonus}
           onUpdateSettings={handleUpdateSettings}
           onCalibrateTiltNeutral={handleCalibrateTilt}
           onRequestMotionPermission={handleRequestMotionPermission}

@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import {
   CAR_CONFIGS,
   CAR_ORDER,
+  CHALLENGES_CONFIG,
+  DAILY_COMPLETION_BONUS_COINS,
   HIGHWAY_CONFIG,
   WHEEL_ORDER,
 } from './config.ts';
@@ -19,9 +21,15 @@ import {
 } from './rules.ts';
 import {
   createDefaultSaveData,
+  ensureCurrentDailyChallenges,
+  generateDailyChallengesForDate,
+  getChallengeMetricValue,
   recordCompletedLevelRace,
   recordCompletedRun,
+  recordLiveGameplayProgress,
   tryClaimChallengeReward,
+  tryClaimDailyChallengeReward,
+  tryClaimDailyCompletionBonus,
   tryPurchaseOrEquipCustomization,
   tryPurchaseProtectionUpgrade,
   tryPurchaseUpgrade,
@@ -29,18 +37,21 @@ import {
   validateAndSanitizeSave,
 } from './saveSystem.ts';
 import {
+  ARCADE_JUMP_GRAVITY,
   calculateLevelRaceRewards,
   computeCurvedRoadCenterAtWorldZ,
   computeExpectedJumpRangeMeters,
   computeRaceStandings,
   createLevelAiOpponents,
   generateLevelCourse,
+  isDistanceInTunnelProtectedZone,
   PLAYER_GRID_START_DIST,
   sampleRoadSurfaceAtDistance,
   sampleTrackAtDistance,
   stepAiOpponent,
   stepVehicleJumpPhysics,
   validateBridgeJumpSpec,
+  validateJumpAgainstTunnels,
 } from './levelsMode.ts';
 
 test('8 distinct vehicles exist with unique body styles and valid customization compatibility', () => {
@@ -452,7 +463,9 @@ test('Fair 6-car starting grid and U-shaped drift / hairpin curves in Levels Mod
   }
 });
 
-test('Feature 1 & 2: Illuminated Tunnels and Broken-Bridge Jumps geometry, physics, and 5-AI navigation', () => {
+test('Feature 1 & 2: Illuminated Tunnels, Controlled Short Broken-Bridge Jumps, and Tunnel-Priority Routing', () => {
+  assert.ok(ARCADE_JUMP_GRAVITY >= 34, 'Jump gravity must be brisk so cars do not float in air');
+
   for (const lvl of [1, 2, 4, 8]) {
     const course = generateLevelCourse(lvl);
     assert.ok(course.tunnels.length >= 2, `Level ${lvl} must include illuminated tunnels`);
@@ -479,17 +492,36 @@ test('Feature 1 & 2: Illuminated Tunnels and Broken-Bridge Jumps geometry, physi
     assert.equal(midTun.isInsideTunnel, true);
     assert.equal(midTun.tunnelProximity01, 1.0);
 
-    // 2. Verify Broken-Bridge Jump has inclined ramp, open gap, clear obstacles, and valid range
+    // 2. Verify Broken-Bridge Jump has controlled ramp height, compact gap, clear obstacles, and zero tunnel overlap
     for (const jump of course.bridgeJumps) {
       const validated = validateBridgeJumpSpec(jump);
-      assert.ok(validated.rampPeakHeight >= 2.1, 'Ramp must have real upward elevation');
-      assert.ok(validated.rampAngleRad > 0.08, 'Ramp must have real upward incline angle');
-      assert.ok(validated.gapLength >= 16, 'Bridge gap must be a real span');
+      assert.ok(
+        validated.rampPeakHeight >= 1.3 && validated.rampPeakHeight <= 2.0,
+        'Ramp must have controlled, realistic upward elevation (1.3m–2.0m)'
+      );
+      assert.ok(validated.rampAngleRad > 0.05, 'Ramp must have real upward incline angle');
+      assert.ok(
+        validated.gapLength >= 13 && validated.gapLength <= 22,
+        'Bridge gap must be a compact, crossable span (13m–22m)'
+      );
+
+      // Verify jump does NOT overlap any tunnel or protected tunnel buffer zone
+      const clearanceOk = validateJumpAgainstTunnels(validated, course.tunnels);
+      assert.equal(
+        clearanceOk,
+        true,
+        `Bridge jump ${jump.id} in Level ${lvl} must never conflict with a tunnel`
+      );
+      assert.equal(
+        isDistanceInTunnelProtectedZone(jump.rampEndDist, course.tunnels),
+        false,
+        'Takeoff lip must never be inside a protected tunnel approach/exit zone'
+      );
 
       // Starter car top speed (~60.5 m/s) must easily exceed the gap length
       const starterRange = computeExpectedJumpRangeMeters(validated, 54);
       assert.ok(
-        starterRange > validated.gapLength + 6,
+        starterRange > validated.gapLength + 2.5,
         `Starter car range (${starterRange.toFixed(1)}m) must clear gap (${validated.gapLength}m)`
       );
 
@@ -500,8 +532,8 @@ test('Feature 1 & 2: Illuminated Tunnels and Broken-Bridge Jumps geometry, physi
         course.tunnels
       );
       assert.equal(midRamp.isOnTakeoffRamp, true);
-      assert.ok(midRamp.groundY > 0.8 && midRamp.groundY < jump.rampPeakHeight);
-      assert.ok(midRamp.slopePitchRad > 0.08);
+      assert.ok(midRamp.groundY > 0.45 && midRamp.groundY < jump.rampPeakHeight);
+      assert.ok(midRamp.slopePitchRad > 0.05);
 
       // Verify physically open gap across (gapStartDist, gapEndDist)
       const midGap = sampleRoadSurfaceAtDistance(
@@ -526,7 +558,7 @@ test('Feature 1 & 2: Illuminated Tunnels and Broken-Bridge Jumps geometry, physi
     }
   }
 
-  // 3. Test Vehicle Takeoff -> Airborne Flight -> Safe Landing at Valid Speed
+  // 3. Test Vehicle Takeoff -> Short, Controlled Airborne Flight -> Safe Landing at Valid Speed
   const course1 = generateLevelCourse(1);
   const jump1 = course1.bridgeJumps[0];
   let dist = jump1.rampStartDist - 5;
@@ -535,13 +567,15 @@ test('Feature 1 & 2: Illuminated Tunnels and Broken-Bridge Jumps geometry, physi
   let pitchRad = 0;
   let isAirborne = false;
   let activeJumpId: number | null = null;
-  const validSpeedMs = 52; // ~187 km/h (achievable by starter car)
-  const dt = 0.025;
+  const validSpeedMs = 52; // ~187 km/h
+  const dt = 0.02;
 
   let sawTakeoff = false;
   let sawAirborneOverGap = false;
   let sawLanding = false;
   let sawFailedJump = false;
+  let totalAirborneTimeSec = 0;
+  let maxAirborneHeightMeters = 0;
 
   while (dist < jump1.landingEndDist) {
     const nextDist = dist + validSpeedMs * dt;
@@ -566,9 +600,13 @@ test('Feature 1 & 2: Illuminated Tunnels and Broken-Bridge Jumps geometry, physi
     activeJumpId = step.activeJumpId;
 
     if (step.justTookOff) sawTakeoff = true;
+    if (isAirborne) {
+      totalAirborneTimeSec += dt;
+      maxAirborneHeightMeters = Math.max(maxAirborneHeightMeters, y);
+    }
     if (isAirborne && dist > jump1.gapStartDist + 2 && dist < jump1.gapEndDist - 2) {
       sawAirborneOverGap = true;
-      assert.ok(y > 1.5, 'Vehicle must be airborne well above road datum over the open gap');
+      assert.ok(y > 0.75, 'Vehicle must be airborne above road datum over the open gap');
     }
     if (step.justLanded) sawLanding = true;
     if (step.justFailedJump) sawFailedJump = true;
@@ -579,15 +617,46 @@ test('Feature 1 & 2: Illuminated Tunnels and Broken-Bridge Jumps geometry, physi
   assert.equal(sawLanding, true, 'Vehicle must land safely on receiving platform');
   assert.equal(sawFailedJump, false, 'Valid approach speed must not fail jump');
   assert.equal(isAirborne, false, 'Vehicle must return to grounded state after landing');
+  assert.ok(
+    totalAirborneTimeSec > 0.25 && totalAirborneTimeSec <= 0.65,
+    `Jump airtime must be brief and controlled (got ${totalAirborneTimeSec.toFixed(2)}s)`
+  );
+  assert.ok(
+    maxAirborneHeightMeters <= 2.4,
+    `Jump apex height must stay below tunnel roof height (got ${maxAirborneHeightMeters.toFixed(2)}m)`
+  );
 
-  // 4. Test Deliberate Failed Jump when Speed is Too Slow
+  // 4. Test Tunnel Routing Priority: any vehicle entering a tunnel while airborne is immediately grounded onto the tunnel road
+  const tun1 = course1.tunnels[0];
+  const insideTunStep = stepVehicleJumpPhysics({
+    prevDistanceMeters: tun1.startDist - 1,
+    nextDistanceMeters: tun1.startDist + 2,
+    speedMs: 55,
+    y: 4.5,
+    vy: 3.0,
+    pitchRad: 0.12,
+    isAirborne: true,
+    activeJumpId: 99,
+    bridgeJumps: course1.bridgeJumps,
+    tunnels: course1.tunnels,
+    dt: 0.02,
+  });
+  assert.equal(
+    insideTunStep.isAirborne,
+    false,
+    'Vehicle entering a tunnel must never remain airborne or clip through the tunnel roof'
+  );
+  assert.equal(insideTunStep.y, 0, 'Vehicle inside tunnel must be grounded at road level y=0');
+  assert.equal(insideTunStep.jumpState, 'grounded');
+
+  // 5. Test Deliberate Failed Jump when Speed is Too Slow
   dist = jump1.rampStartDist - 2;
   y = 0;
   vy = 0;
   pitchRad = 0;
   isAirborne = false;
   activeJumpId = null;
-  const slowSpeedMs = 17; // ~61 km/h (heavy braking, well below minRequiredSpeedMs)
+  const slowSpeedMs = 15; // well below minRequiredSpeedMs
   let failedDetected = false;
 
   while (dist < jump1.landingEndDist && !failedDetected) {
@@ -617,7 +686,7 @@ test('Feature 1 & 2: Illuminated Tunnels and Broken-Bridge Jumps geometry, physi
   }
   assert.equal(failedDetected, true, 'Insufficient speed must trigger failed-jump detection');
 
-  // 5. Verify all 5 AI Opponents successfully jump the broken bridge and continue racing
+  // 6. Verify all 5 AI Opponents successfully jump the broken bridge and continue racing
   const aiRacers = createLevelAiOpponents(1, 62);
   for (const ai of aiRacers) {
     ai.distanceMeters = jump1.approachStartDist;
@@ -625,7 +694,7 @@ test('Feature 1 & 2: Illuminated Tunnels and Broken-Bridge Jumps geometry, physi
   }
   const aibecameAirborne = new Set<string>();
   let elapsed = 0;
-  for (let s = 0; s < 220; s++) {
+  for (let s = 0; s < 260; s++) {
     elapsed += dt;
     for (const ai of aiRacers) {
       stepAiOpponent({
@@ -637,7 +706,7 @@ test('Feature 1 & 2: Illuminated Tunnels and Broken-Bridge Jumps geometry, physi
         elapsedRaceSec: elapsed,
         dt,
       });
-      if (ai.isAirborne && ai.y > 1.5) {
+      if (ai.isAirborne && ai.y > 0.75) {
         aibecameAirborne.add(ai.id);
       }
     }
@@ -655,5 +724,175 @@ test('Feature 1 & 2: Illuminated Tunnels and Broken-Bridge Jumps geometry, physi
     assert.equal(ai.isAirborne, false, `AI ${ai.driverName} must be grounded after landing`);
   }
 });
+
+test('32 Lifetime Challenges & Daily Challenges, Streaks, Bonus, and Live Progress Persistence', () => {
+  // 1. Verify 32 total challenges and preservation of the 4 original IDs
+  assert.equal(CHALLENGES_CONFIG.length, 32, 'Must configure 32 total lifetime challenges');
+  const originalIds = ['dist_1000', 'coins_75', 'nearmiss_12', 'score_10000'];
+  for (const origId of originalIds) {
+    assert.ok(
+      CHALLENGES_CONFIG.some((c) => c.id === origId),
+      `Original challenge ID ${origId} must be preserved`
+    );
+  }
+
+  // Verify all 6 categories have challenges
+  for (const cat of ['solo', 'levels', 'skills', 'stunts', 'garage'] as const) {
+    assert.ok(
+      CHALLENGES_CONFIG.filter((c) => c.category === cat).length >= 3,
+      `Category ${cat} must contain multiple challenges`
+    );
+  }
+
+  // 2. Verify live gameplay progress updates both lifetime and daily metrics without double-counting at run end
+  let save = createDefaultSaveData();
+  save = recordLiveGameplayProgress(save, {
+    distanceMeters: 600,
+    soloDistanceMeters: 600,
+    rawCoinsPickedUp: 10,
+    nearMisses: 4,
+    highSpeedNearMisses: 2,
+    driftEvents: 2,
+    successfulJumps: 10,
+    tunnelsCompleted: 2,
+    shieldAbsorptions: 1,
+    nitroActivations: 4,
+  });
+
+  assert.equal(getChallengeMetricValue(save, 'successfulJumps'), 10);
+  assert.equal(getChallengeMetricValue(save, 'tunnelsCompleted'), 2);
+  assert.equal(getChallengeMetricValue(save, 'highSpeedNearMisses'), 2);
+
+  // Claim "Airborne Rookie" (10 successful bridge jumps, +300 coins)
+  const coinsBefore = save.coins;
+  const claimJump = tryClaimChallengeReward(save, 'jumps_10');
+  assert.equal(claimJump.success, true);
+  assert.equal(claimJump.reward, 300);
+  save = claimJump.data;
+  assert.equal(save.coins, coinsBefore + 300);
+
+  // Re-claiming the same challenge must be rejected
+  const duplicateClaim = tryClaimChallengeReward(save, 'jumps_10');
+  assert.equal(duplicateClaim.success, false);
+
+  // Finish the Solo run passing alreadyCommitted so the 600m and 10 jumps are not double-counted
+  const endRes = recordCompletedRun(save, 'solo_run_test_1', {
+    score: 4500,
+    distanceMeters: 1000,
+    coinsEarned: 150,
+    rawCoinsPickedUp: 15,
+    nearMisses: 6,
+    highSpeedNearMisses: 3,
+    driftEvents: 3,
+    successfulJumps: 12,
+    tunnelsCompleted: 3,
+    shieldAbsorptions: 1,
+    nitroActivations: 5,
+    alreadyCommitted: {
+      distanceMeters: 600,
+      soloDistanceMeters: 600,
+      rawCoinsPickedUp: 10,
+      nearMisses: 4,
+      highSpeedNearMisses: 2,
+      driftEvents: 2,
+      successfulJumps: 10,
+      tunnelsCompleted: 2,
+      shieldAbsorptions: 1,
+      nitroActivations: 4,
+    },
+  });
+  save = endRes.data;
+  assert.equal(
+    getChallengeMetricValue(save, 'soloDistance'),
+    1000,
+    'Solo distance must equal total 1000m (600m live + 400m remainder)'
+  );
+  assert.equal(
+    getChallengeMetricValue(save, 'successfulJumps'),
+    12,
+    'Total jumps must equal 12 (10 live + 2 remainder)'
+  );
+
+  // 3. Verify Daily Challenges generation, uniqueness, streak increment, and 250-coin daily bonus
+  const day1 = '2026-10-20';
+  const day2 = '2026-10-21';
+  const day4 = '2026-10-23'; // skipped 2026-10-22
+
+  const generated = generateDailyChallengesForDate(day1, 0);
+  assert.equal(generated.length, 3, 'Must generate 3 daily challenges per UTC day');
+  assert.equal(generated[0].difficulty, 'easy');
+  assert.equal(generated[1].difficulty, 'medium');
+  assert.equal(generated[2].difficulty, 'hard');
+  const dailyMetrics = new Set(generated.map((d) => d.metric));
+  assert.equal(dailyMetrics.size, 3, '3 daily challenges must have 3 distinct metrics');
+
+  // Force day1 active state and complete all 3 daily challenges
+  save = {
+    ...save,
+    dailyChallenges: {
+      dateUtc: day1,
+      items: generated.map((c) => ({ ...c, currentValue: c.targetValue })),
+      bonusClaimed: false,
+      currentStreak: 0,
+      bestStreak: 0,
+      lastStreakDateUtc: null,
+      history: [],
+    },
+  };
+
+  // Claim first daily challenge -> streak becomes 1
+  const dClaim1 = tryClaimDailyChallengeReward(save, generated[0].id, day1);
+  assert.equal(dClaim1.success, true);
+  save = dClaim1.data;
+  assert.equal(save.dailyChallenges.currentStreak, 1);
+  assert.equal(save.dailyChallenges.bestStreak, 1);
+
+  // Claim second daily challenge on same UTC day -> streak stays 1
+  const dClaim2 = tryClaimDailyChallengeReward(save, generated[1].id, day1);
+  assert.equal(dClaim2.success, true);
+  save = dClaim2.data;
+  assert.equal(save.dailyChallenges.currentStreak, 1);
+
+  // Claim Daily Completion Bonus (+250 coins) since all 3 are completed
+  const bonusClaim = tryClaimDailyCompletionBonus(save, day1);
+  assert.equal(bonusClaim.success, true);
+  assert.equal(bonusClaim.reward, DAILY_COMPLETION_BONUS_COINS);
+  save = bonusClaim.data;
+  assert.equal(save.dailyChallenges.bonusClaimed, true);
+
+  // Roll over to next consecutive UTC day (day2) -> archives day1 into history and preserves streak
+  save = ensureCurrentDailyChallenges(save, day2);
+  assert.equal(save.dailyChallenges.dateUtc, day2);
+  assert.equal(save.dailyChallenges.history.length, 1);
+  assert.equal(save.dailyChallenges.history[0].dateUtc, day1);
+  assert.equal(save.dailyChallenges.history[0].completedCount, 3);
+  assert.equal(save.dailyChallenges.currentStreak, 1);
+
+  // Complete and claim a challenge on day2 -> streak increments to 2!
+  save = {
+    ...save,
+    dailyChallenges: {
+      ...save.dailyChallenges,
+      items: save.dailyChallenges.items.map((c, idx) =>
+        idx === 0 ? { ...c, currentValue: c.targetValue } : c
+      ),
+    },
+  };
+  const day2Claim = tryClaimDailyChallengeReward(
+    save,
+    save.dailyChallenges.items[0].id,
+    day2
+  );
+  assert.equal(day2Claim.success, true);
+  save = day2Claim.data;
+  assert.equal(save.dailyChallenges.currentStreak, 2);
+  assert.equal(save.dailyChallenges.bestStreak, 2);
+
+  // Skip day3 and roll over to day4 -> currentStreak resets to 0 while bestStreak remains 2
+  save = ensureCurrentDailyChallenges(save, day4);
+  assert.equal(save.dailyChallenges.currentStreak, 0);
+  assert.equal(save.dailyChallenges.bestStreak, 2);
+});
+
 
 

@@ -693,7 +693,8 @@ class SoundController {
 
   public playRaceFinish(isVictory: boolean): void {
     const ctx = this.ensureContext();
-    if (!ctx || !this.sfxGain) return;
+    const sfxGain = this.sfxGain;
+    if (!ctx || !sfxGain) return;
     const now = ctx.currentTime;
     const notes = isVictory ? [523.25, 659.25, 783.99, 1046.5] : [440, 392, 349.23];
     notes.forEach((freq, idx) => {
@@ -704,7 +705,7 @@ class SoundController {
       g.gain.setValueAtTime(0.18, now + idx * 0.09);
       g.gain.exponentialRampToValueAtTime(0.001, now + idx * 0.09 + 0.26);
       osc.connect(g);
-      g.connect(this.sfxGain);
+      g.connect(sfxGain);
       osc.start(now + idx * 0.09);
       osc.stop(now + idx * 0.09 + 0.28);
     });

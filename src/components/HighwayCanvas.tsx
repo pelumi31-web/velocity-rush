@@ -45,8 +45,13 @@ import {
   stepVehicleJumpPhysics,
   TunnelSectionSpec,
   validateBridgeJumpSpec,
+  validateJumpAgainstTunnels,
 } from '../game/levelsMode';
-import { CarCustomizationState, createDefaultCarCustomization } from '../game/saveSystem';
+import {
+  CarCustomizationState,
+  createDefaultCarCustomization,
+  LiveGameplayProgressDelta,
+} from '../game/saveSystem';
 import { soundController } from '../game/audio';
 import {
   applyCarCustomizationToRig,
@@ -109,7 +114,16 @@ export interface CompletedRunPayload {
   summary: RunRewardsSummary;
   coinsCollected: number;
   nearMissCount: number;
+  highSpeedNearMissCount?: number;
   driftScore: number;
+  driftEventsCount?: number;
+  levelDriftZonesCleanCount?: number;
+  successfulJumpsCount?: number;
+  tunnelsCompletedCount?: number;
+  shieldAbsorptionsCount?: number;
+  nitroActivationsCount?: number;
+  collisionsCount?: number;
+  alreadyCommitted?: LiveGameplayProgressDelta;
   topSpeedKmh: number;
   reviveAvailable: boolean;
   levelResult?: {
@@ -165,6 +179,7 @@ interface HighwayCanvasProps {
   controlsRef: React.MutableRefObject<TouchInputControlsRef>;
   onLiveStateChange: (snapshot: LiveRaceSnapshot) => void;
   onRunEnded: (payload: CompletedRunPayload) => void;
+  onIncrementalProgress?: (delta: LiveGameplayProgressDelta) => void;
   onRequestPauseToggle: () => void;
   onSensorFallbackNotice: (msg: string) => void;
 }
@@ -697,17 +712,26 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       distanceMeters: 0,
       coinsCollected: 0,
       nearMissCount: 0,
+      highSpeedNearMissCount: 0,
       bonusScore: 0,
       driftScore: 0,
       isDrifting: false,
+      currentDriftDurationSec: 0,
+      currentDriftCounted: false,
+      driftEventsCount: 0,
+      activeDriftSegmentIndex: null as number | null,
+      activeDriftSegmentHadCollision: false,
+      completedCleanDriftSegmentIndices: new Set<number>(),
       driftAudioCooldown: 0,
       collisionsCount: 0,
+      shieldAbsorptionsCount: 0,
+      nitroActivationsCount: 0,
       integrity: HIGHWAY_CONFIG.maxHullIntegrity,
       maxIntegrity: HIGHWAY_CONFIG.maxHullIntegrity,
       cleanDriveShieldTimer: 0,
       nitroAmount: 1.0,
       isNitroActive: false,
-      playerX: PLAYER_GRID_START_X,
+      playerX: PLAYER_GRID_START_X as number,
       playerY: 0,
       playerVy: 0,
       playerPitchRad: 0,
@@ -715,6 +739,8 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       activeJumpId: null as number | null,
       landingBounceTimer: 0,
       completedJumpIds: new Set<number>(),
+      enteredTunnelIds: new Set<number>(),
+      completedTunnelIds: new Set<number>(),
       isInsideTunnel: false,
       tunnelProximity01: 0,
       lateralVelocity: 0,
@@ -754,7 +780,91 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       soloBridgeJumps: [] as BrokenBridgeJumpSpec[],
       soloNextFeatureDist: 160,
       soloFeatureIdCounter: 1,
+      committedProgress: {
+        distanceMeters: 0,
+        soloDistanceMeters: 0,
+        rawCoinsPickedUp: 0,
+        nearMisses: 0,
+        highSpeedNearMisses: 0,
+        driftEvents: 0,
+        levelDriftZonesClean: 0,
+        successfulJumps: 0,
+        tunnelsCompleted: 0,
+        shieldAbsorptions: 0,
+        nitroActivations: 0,
+        score: 0,
+      } as Required<LiveGameplayProgressDelta>,
+      progressFlushTimer: 1.8,
     };
+
+    function flushIncrementalProgress() {
+      const cb = propsRef.current.onIncrementalProgress;
+      if (!cb) return;
+      const mode = propsRef.current.playMode ?? 'solo';
+      const distInt = Math.max(0, Math.floor(sim.distanceMeters));
+      const soloDistInt = mode === 'solo' ? distInt : 0;
+      const currentLiveScore =
+        Math.floor(sim.distanceMeters * 2) +
+        sim.coinsCollected * HIGHWAY_CONFIG.coinPickupScore +
+        sim.nearMissCount * HIGHWAY_CONFIG.nearMissScoreBonus +
+        sim.bonusScore +
+        Math.floor(sim.driftScore);
+
+      const delta: LiveGameplayProgressDelta = {
+        distanceMeters: Math.max(0, distInt - sim.committedProgress.distanceMeters),
+        soloDistanceMeters: Math.max(0, soloDistInt - sim.committedProgress.soloDistanceMeters),
+        rawCoinsPickedUp: Math.max(
+          0,
+          sim.coinsCollected - sim.committedProgress.rawCoinsPickedUp
+        ),
+        nearMisses: Math.max(0, sim.nearMissCount - sim.committedProgress.nearMisses),
+        highSpeedNearMisses: Math.max(
+          0,
+          sim.highSpeedNearMissCount - sim.committedProgress.highSpeedNearMisses
+        ),
+        driftEvents: Math.max(0, sim.driftEventsCount - sim.committedProgress.driftEvents),
+        levelDriftZonesClean: Math.max(
+          0,
+          sim.completedCleanDriftSegmentIndices.size -
+            sim.committedProgress.levelDriftZonesClean
+        ),
+        successfulJumps: Math.max(
+          0,
+          sim.completedJumpIds.size - sim.committedProgress.successfulJumps
+        ),
+        tunnelsCompleted: Math.max(
+          0,
+          sim.completedTunnelIds.size - sim.committedProgress.tunnelsCompleted
+        ),
+        shieldAbsorptions: Math.max(
+          0,
+          sim.shieldAbsorptionsCount - sim.committedProgress.shieldAbsorptions
+        ),
+        nitroActivations: Math.max(
+          0,
+          sim.nitroActivationsCount - sim.committedProgress.nitroActivations
+        ),
+        score: Math.max(0, currentLiveScore - sim.committedProgress.score),
+      };
+
+      const hasAny = Object.values(delta).some((v) => (v ?? 0) > 0);
+      if (!hasAny) return;
+
+      sim.committedProgress.distanceMeters += delta.distanceMeters ?? 0;
+      sim.committedProgress.soloDistanceMeters += delta.soloDistanceMeters ?? 0;
+      sim.committedProgress.rawCoinsPickedUp += delta.rawCoinsPickedUp ?? 0;
+      sim.committedProgress.nearMisses += delta.nearMisses ?? 0;
+      sim.committedProgress.highSpeedNearMisses += delta.highSpeedNearMisses ?? 0;
+      sim.committedProgress.driftEvents += delta.driftEvents ?? 0;
+      sim.committedProgress.levelDriftZonesClean += delta.levelDriftZonesClean ?? 0;
+      sim.committedProgress.successfulJumps += delta.successfulJumps ?? 0;
+      sim.committedProgress.tunnelsCompleted += delta.tunnelsCompleted ?? 0;
+      sim.committedProgress.shieldAbsorptions += delta.shieldAbsorptions ?? 0;
+      sim.committedProgress.nitroActivations += delta.nitroActivations ?? 0;
+      sim.committedProgress.score += delta.score ?? 0;
+
+      cb(delta);
+    }
 
     function spawnSoloJumpCoinArc(jump: BrokenBridgeJumpSpec, currentPlayerDist: number) {
       const steps = 5;
@@ -764,7 +874,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
         const frac = s / (steps - 1);
         const worldDist = jump.rampEndDist - 2 + frac * (jump.gapLength + 6);
         const relZ = -(worldDist - currentPlayerDist);
-        const arcY = jump.rampPeakHeight + Math.sin(frac * Math.PI) * 1.9 + 0.65;
+        const arcY = jump.rampPeakHeight + Math.sin(frac * Math.PI) * 0.95 + 0.55;
         coinItem.active = true;
         coinItem.x = HIGHWAY_CONFIG.laneCenters[s % 2 === 0 ? 1 : 2];
         coinItem.y = arcY;
@@ -782,15 +892,20 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       while (sim.soloNextFeatureDist < currentDist + 750) {
         const idx = sim.soloFeatureIdCounter++;
         if (idx % 2 === 1) {
-          // Spawn a validated Solo Mode Broken-Bridge Jump
-          const rampStartDist = sim.soloNextFeatureDist + 45;
-          const rampLength = 22;
-          const gapLength = Math.min(25, 18 + Math.floor(idx / 3) * 1.5);
-          const rampPeakHeight = 2.45;
+          // Spawn a validated Solo Mode Broken-Bridge Jump with strict separation from tunnels
+          const lastTunnelEnd =
+            sim.soloTunnels.length > 0
+              ? sim.soloTunnels[sim.soloTunnels.length - 1].endDist
+              : -999;
+          const safeApproachStart = Math.max(sim.soloNextFeatureDist, lastTunnelEnd + 170);
+          const rampStartDist = safeApproachStart + 45;
+          const rampLength = 18;
+          const gapLength = Math.min(19, 15 + Math.floor(idx / 3) * 1.0);
+          const rampPeakHeight = 1.55;
           const spec = validateBridgeJumpSpec({
             id: idx,
             label: 'Viaduct Broken-Bridge Jump',
-            approachStartDist: sim.soloNextFeatureDist,
+            approachStartDist: safeApproachStart,
             rampStartDist,
             rampEndDist: rampStartDist + rampLength,
             rampLength,
@@ -802,14 +917,20 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
             landingStartDist: rampStartDist + rampLength + gapLength,
             landingEndDist: rampStartDist + rampLength + gapLength + 44,
             landingLength: 44,
-            landingHeightOffset: 0.2,
-            minRequiredSpeedMs: 28.5,
+            landingHeightOffset: 0.15,
+            minRequiredSpeedMs: 28.0,
           });
-          sim.soloBridgeJumps.push(spec);
-          sim.soloNextFeatureDist = spec.landingEndDist + 150;
+          if (validateJumpAgainstTunnels(spec, sim.soloTunnels)) {
+            sim.soloBridgeJumps.push(spec);
+          }
+          sim.soloNextFeatureDist = spec.landingEndDist + 190;
         } else {
-          // Spawn an Illuminated Solo Mode Highway Tunnel
-          const startDist = sim.soloNextFeatureDist + 20;
+          // Spawn an Illuminated Solo Mode Highway Tunnel with guaranteed grounded approach buffer
+          const lastJumpEnd =
+            sim.soloBridgeJumps.length > 0
+              ? sim.soloBridgeJumps[sim.soloBridgeJumps.length - 1].landingEndDist
+              : -999;
+          const startDist = Math.max(sim.soloNextFeatureDist + 30, lastJumpEnd + 190);
           const length = 165;
           sim.soloTunnels.push({
             id: idx,
@@ -818,7 +939,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
             length,
             label: 'Metro Illuminated Tunnel',
           });
-          sim.soloNextFeatureDist = startDist + length + 160;
+          sim.soloNextFeatureDist = startDist + length + 180;
         }
       }
     }
@@ -1110,6 +1231,11 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
         }
       }
 
+      // Flush any valid driving progress from the previous run before resetting
+      if (sim.distanceMeters > 5 && !sim.runEndedFired) {
+        flushIncrementalProgress();
+      }
+
       sim.runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
       sim.runEndedFired = false;
       sim.speedMs = skipCountdown ? effStats.topSpeedMs * 0.85 : 0;
@@ -1117,10 +1243,19 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       sim.distanceMeters = initialDist;
       sim.coinsCollected = 0;
       sim.nearMissCount = 0;
+      sim.highSpeedNearMissCount = 0;
       sim.bonusScore = 0;
       sim.driftScore = 0;
       sim.isDrifting = false;
+      sim.currentDriftDurationSec = 0;
+      sim.currentDriftCounted = false;
+      sim.driftEventsCount = 0;
+      sim.activeDriftSegmentIndex = null;
+      sim.activeDriftSegmentHadCollision = false;
+      sim.completedCleanDriftSegmentIndices.clear();
       sim.collisionsCount = 0;
+      sim.shieldAbsorptionsCount = 0;
+      sim.nitroActivationsCount = 0;
       sim.maxIntegrity = effStats.maxShieldCharges;
       sim.integrity = effStats.maxShieldCharges;
       sim.cleanDriveShieldTimer = 0;
@@ -1134,8 +1269,25 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       sim.activeJumpId = null;
       sim.landingBounceTimer = 0;
       sim.completedJumpIds.clear();
+      sim.enteredTunnelIds.clear();
+      sim.completedTunnelIds.clear();
       sim.isInsideTunnel = false;
       sim.tunnelProximity01 = 0;
+      sim.committedProgress = {
+        distanceMeters: 0,
+        soloDistanceMeters: 0,
+        rawCoinsPickedUp: 0,
+        nearMisses: 0,
+        highSpeedNearMisses: 0,
+        driftEvents: 0,
+        levelDriftZonesClean: 0,
+        successfulJumps: 0,
+        tunnelsCompleted: 0,
+        shieldAbsorptions: 0,
+        nitroActivations: 0,
+        score: 0,
+      };
+      sim.progressFlushTimer = 1.8;
       sim.lateralVelocity = 0;
       sim.filteredTiltSteer = 0;
       sim.invulnerableTimer = 0;
@@ -1551,7 +1703,16 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
                 summary,
                 coinsCollected: sim.coinsCollected,
                 nearMissCount: sim.nearMissCount,
+                highSpeedNearMissCount: sim.highSpeedNearMissCount,
                 driftScore: Math.floor(sim.driftScore),
+                driftEventsCount: sim.driftEventsCount,
+                levelDriftZonesCleanCount: sim.completedCleanDriftSegmentIndices.size,
+                successfulJumpsCount: sim.completedJumpIds.size,
+                tunnelsCompletedCount: sim.completedTunnelIds.size,
+                shieldAbsorptionsCount: sim.shieldAbsorptionsCount,
+                nitroActivationsCount: sim.nitroActivationsCount,
+                collisionsCount: sim.collisionsCount,
+                alreadyCommitted: { ...sim.committedProgress },
                 topSpeedKmh: Math.round(sim.topSpeedReachedKmh),
                 reviveAvailable: !sim.reviveUsed,
                 levelResult: {
@@ -1573,7 +1734,15 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
                 summary,
                 coinsCollected: sim.coinsCollected,
                 nearMissCount: sim.nearMissCount,
+                highSpeedNearMissCount: sim.highSpeedNearMissCount,
                 driftScore: Math.floor(sim.driftScore),
+                driftEventsCount: sim.driftEventsCount,
+                successfulJumpsCount: sim.completedJumpIds.size,
+                tunnelsCompletedCount: sim.completedTunnelIds.size,
+                shieldAbsorptionsCount: sim.shieldAbsorptionsCount,
+                nitroActivationsCount: sim.nitroActivationsCount,
+                collisionsCount: sim.collisionsCount,
+                alreadyCommitted: { ...sim.committedProgress },
                 topSpeedKmh: Math.round(sim.topSpeedReachedKmh),
                 reviveAvailable: !sim.reviveUsed,
               });
@@ -1715,6 +1884,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
           });
 
           if (longStep.justActivatedNitro) {
+            sim.nitroActivationsCount += 1;
             soundController.playNitroActivate();
             sim.cameraTrauma = Math.min(1, sim.cameraTrauma + 0.22);
           }
@@ -1742,6 +1912,26 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
             if (sample.segment.label !== sim.lastSegmentLabel) {
               sim.lastSegmentLabel = sample.segment.label;
               syncLiveHudSnapshot();
+            }
+
+            // Track clean completion of designated drift/curve segments in Levels Mode
+            if (sample.segment.isDriftZone) {
+              if (sim.activeDriftSegmentIndex !== sample.segment.index) {
+                if (
+                  sim.activeDriftSegmentIndex !== null &&
+                  !sim.activeDriftSegmentHadCollision
+                ) {
+                  sim.completedCleanDriftSegmentIndices.add(sim.activeDriftSegmentIndex);
+                }
+                sim.activeDriftSegmentIndex = sample.segment.index;
+                sim.activeDriftSegmentHadCollision = false;
+              }
+            } else if (sim.activeDriftSegmentIndex !== null) {
+              if (!sim.activeDriftSegmentHadCollision) {
+                sim.completedCleanDriftSegmentIndices.add(sim.activeDriftSegmentIndex);
+              }
+              sim.activeDriftSegmentIndex = null;
+              sim.activeDriftSegmentHadCollision = false;
             }
           } else {
             sim.visualCurveFactor = THREE.MathUtils.damp(sim.visualCurveFactor, 0, 6, dt);
@@ -1815,24 +2005,41 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
           sim.isInsideTunnel = jumpStep.surface.isInsideTunnel;
           sim.tunnelProximity01 = jumpStep.surface.tunnelProximity01;
 
+          // Track valid tunnel entrance -> interior -> exit completions
+          for (let i = 0; i < activeTunnels.length; i++) {
+            const tun = activeTunnels[i];
+            if (
+              !sim.isAirborne &&
+              sim.distanceMeters >= tun.startDist &&
+              sim.distanceMeters <= tun.startDist + 55
+            ) {
+              sim.enteredTunnelIds.add(tun.id);
+            }
+            if (
+              sim.enteredTunnelIds.has(tun.id) &&
+              !sim.completedTunnelIds.has(tun.id) &&
+              sim.distanceMeters >= tun.endDist
+            ) {
+              sim.completedTunnelIds.add(tun.id);
+              flushIncrementalProgress();
+            }
+          }
+
           if (sim.landingBounceTimer > 0) {
             sim.landingBounceTimer = Math.max(0, sim.landingBounceTimer - dt);
           }
 
+          // No jump-related popup notifications on takeoff, airborne state, or landing!
           if (jumpStep.justTookOff) {
             soundController.playJumpTakeoff();
-            spawnParticleBurst(sim.playerX, sim.playerY + 0.18, 1.5, 12, 0x38bdf8, 6.2);
-            syncLiveHudSnapshot({
-              text: 'AIRBORNE LAUNCH!',
-              subtext: 'Clearing Broken-Bridge Gap',
-              tone: 'cyan',
-            });
+            spawnParticleBurst(sim.playerX, sim.playerY + 0.18, 1.5, 10, 0x38bdf8, 5.5);
+            syncLiveHudSnapshot();
           } else if (jumpStep.justLanded && jumpStep.landedJump) {
             soundController.playJumpLanding();
-            sim.landingBounceTimer = 0.28;
-            sim.cameraTrauma = Math.min(1, sim.cameraTrauma + 0.26);
-            spawnParticleBurst(sim.playerX - 0.7, 0.18, 0.2, 8, 0x10b981, 6.5);
-            spawnParticleBurst(sim.playerX + 0.7, 0.18, 0.2, 8, 0x38bdf8, 6.5);
+            sim.landingBounceTimer = 0.22;
+            sim.cameraTrauma = Math.min(1, sim.cameraTrauma + 0.18);
+            spawnParticleBurst(sim.playerX - 0.7, 0.18, 0.2, 6, 0x10b981, 5.5);
+            spawnParticleBurst(sim.playerX + 0.7, 0.18, 0.2, 6, 0x38bdf8, 5.5);
 
             const jId = jumpStep.landedJump.id;
             if (!sim.completedJumpIds.has(jId)) {
@@ -1840,17 +2047,17 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
               sim.bonusScore += BRIDGE_JUMP_SCORE_BONUS;
               sim.coinsCollected += BRIDGE_JUMP_COIN_BONUS;
               sim.nitroAmount = Math.min(1, sim.nitroAmount + 0.22);
-              syncLiveHudSnapshot({
-                text: `BRIDGE JUMP +${BRIDGE_JUMP_SCORE_BONUS}`,
-                subtext: `+${BRIDGE_JUMP_COIN_BONUS} Bonus Coins · +22% Nitro Boost`,
-                tone: 'cyan',
-              });
+              flushIncrementalProgress();
             }
+            syncLiveHudSnapshot();
           } else if (jumpStep.justFailedJump && jumpStep.failedJump) {
             // Deliberate failed-jump handling using the game's shield & crash recovery rules
             sim.collisionsCount += 1;
+            sim.activeDriftSegmentHadCollision = true;
             sim.cleanDriveShieldTimer = 0;
             sim.isDrifting = false;
+            sim.currentDriftDurationSec = 0;
+            sim.currentDriftCounted = false;
             sim.integrity = Math.max(0, sim.integrity - 1);
             sim.cameraTrauma = Math.min(1, sim.cameraTrauma + 0.85);
             sim.shieldFlashTimer = 0.65;
@@ -1864,19 +2071,21 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
               sim.distanceMeters = jumpStep.failedJump.gapEndDist + 2.0;
               sim.playerY = jumpStep.failedJump.landingHeightOffset;
               syncLiveHudSnapshot({
-                text: 'BRIDGE JUMP FAILED',
-                subtext: 'Fell Short of Landing Platform · Hull Depleted',
+                text: 'CRITICAL IMPACT',
+                subtext: 'Hull Shield Depleted',
                 tone: 'danger',
               });
             } else {
+              sim.shieldAbsorptionsCount += 1;
               soundController.playCollision(false);
               sim.hitstopTimer = 0.05;
               sim.invulnerableTimer = Math.max(2.2, effectiveStats.shieldInvulnerabilitySec);
               sim.distanceMeters = jumpStep.failedJump.gapEndDist + 4.0;
               sim.playerY = jumpStep.failedJump.landingHeightOffset;
               sim.speedMs = Math.max(24, sim.speedMs * 0.72);
+              flushIncrementalProgress();
               syncLiveHudSnapshot({
-                text: 'JUMP FAILED · SHIELD RECOVERY',
+                text: 'SHIELD IMPACT ABSORBED',
                 subtext: `${sim.integrity}/${sim.maxIntegrity} Shield Charges Remaining`,
                 tone: 'amber',
               });
@@ -1906,6 +2115,12 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
             Math.abs(sim.playerX) < HIGHWAY_CONFIG.playerBoundX - 0.15;
 
           if (sim.isDrifting) {
+            sim.currentDriftDurationSec += dt;
+            if (sim.currentDriftDurationSec >= 0.35 && !sim.currentDriftCounted) {
+              sim.currentDriftCounted = true;
+              sim.driftEventsCount += 1;
+              flushIncrementalProgress();
+            }
             const speedScale = Math.min(1.6, sim.speedMs / 55);
             sim.driftScore += dt * 135 * (0.8 + absCurve) * speedScale;
             sim.nitroAmount = Math.min(1, sim.nitroAmount + dt * 0.06);
@@ -1918,9 +2133,18 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
               spawnParticleBurst(sim.playerX - 0.7, sim.playerY + 0.15, 1.35, 1, 0xf59e0b, 3.2);
               spawnParticleBurst(sim.playerX + 0.7, sim.playerY + 0.15, 1.35, 1, 0x38bdf8, 3.2);
             }
+          } else {
+            sim.currentDriftDurationSec = 0;
+            sim.currentDriftCounted = false;
           }
           if (wasDrifting !== sim.isDrifting) {
             syncLiveHudSnapshot();
+          }
+
+          sim.progressFlushTimer -= dt;
+          if (sim.progressFlushTimer <= 0) {
+            sim.progressFlushTimer = 2.0;
+            flushIncrementalProgress();
           }
 
           // Chassis roll, yaw, ramp/airborne pitch, landing suspension bounce, brake lights & wheels
@@ -2168,6 +2392,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
                       tone: 'danger',
                     });
                   } else {
+                    sim.shieldAbsorptionsCount += 1;
                     soundController.playCollision(false);
                     sim.hitstopTimer = 0.04;
                     sim.invulnerableTimer = effectiveStats.shieldInvulnerabilitySec;
@@ -2177,6 +2402,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
                     );
                     t.active = false;
                     t.mesh.visible = false;
+                    flushIncrementalProgress();
                     syncLiveHudSnapshot({
                       text: 'SHIELD IMPACT ABSORBED',
                       subtext: `${sim.integrity}/${sim.maxIntegrity} Shield Charges Remaining`,
@@ -2186,6 +2412,9 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
                 } else if (check.nearMiss) {
                   t.nearMissScored = true;
                   sim.nearMissCount += 1;
+                  if (currentSpeedKmh >= 180) {
+                    sim.highSpeedNearMissCount += 1;
+                  }
                   sim.nitroAmount = Math.min(
                     1,
                     sim.nitroAmount + HIGHWAY_CONFIG.nearMissNitroBonus
@@ -2365,8 +2594,11 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
                   Math.abs(obs.x - sim.playerX) < obs.halfWidth + 0.72
                 ) {
                   sim.collisionsCount += 1;
+                  sim.activeDriftSegmentHadCollision = true;
                   sim.cleanDriveShieldTimer = 0;
                   sim.isDrifting = false;
+                  sim.currentDriftDurationSec = 0;
+                  sim.currentDriftCounted = false;
                   sim.integrity = Math.max(0, sim.integrity - 1);
                   sim.cameraTrauma = Math.min(1, sim.cameraTrauma + 0.75);
                   sim.shieldFlashTimer = 0.55;
@@ -2383,6 +2615,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
                       tone: 'danger',
                     });
                   } else {
+                    sim.shieldAbsorptionsCount += 1;
                     soundController.playCollision(false);
                     sim.hitstopTimer = 0.04;
                     sim.invulnerableTimer = effectiveStats.shieldInvulnerabilitySec;
@@ -2390,6 +2623,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
                       20,
                       sim.speedMs * effectiveStats.collisionSpeedRetention
                     );
+                    flushIncrementalProgress();
                     syncLiveHudSnapshot({
                       text: 'SHIELD DEFLECTED HAZARD',
                       subtext: `${sim.integrity}/${sim.maxIntegrity} Shield Charges Remaining`,
@@ -2495,7 +2729,16 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
                 },
                 coinsCollected: sim.coinsCollected,
                 nearMissCount: sim.nearMissCount,
+                highSpeedNearMissCount: sim.highSpeedNearMissCount,
                 driftScore: Math.floor(sim.driftScore),
+                driftEventsCount: sim.driftEventsCount,
+                levelDriftZonesCleanCount: sim.completedCleanDriftSegmentIndices.size,
+                successfulJumpsCount: sim.completedJumpIds.size,
+                tunnelsCompletedCount: sim.completedTunnelIds.size,
+                shieldAbsorptionsCount: sim.shieldAbsorptionsCount,
+                nitroActivationsCount: sim.nitroActivationsCount,
+                collisionsCount: sim.collisionsCount,
+                alreadyCommitted: { ...sim.committedProgress },
                 topSpeedKmh: Math.round(sim.topSpeedReachedKmh),
                 reviveAvailable: false,
                 levelResult: {

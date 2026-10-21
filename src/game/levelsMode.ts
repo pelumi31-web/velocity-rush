@@ -145,6 +145,15 @@ export interface LevelRaceRewardsBreakdown {
   qualifiedForNextLevel: boolean;
 }
 
+export type JumpLifecycleState =
+  | 'grounded'
+  | 'approaching_ramp'
+  | 'taking_off'
+  | 'airborne'
+  | 'landing'
+  | 'grounded_after_landing'
+  | 'failed_jump';
+
 /**
  * Player starting grid position on the 6-car starting grid (Front Row, Lane 1 at 0.0m).
  */
@@ -153,8 +162,16 @@ export const PLAYER_GRID_START_DIST = 0;
 
 /**
  * Gravity constant for arcade vehicle jumps (m/s^2).
+ * Calibrated for crisp, responsive downward pull so jumps are short, controlled, and never floaty.
  */
-export const ARCADE_JUMP_GRAVITY = 22.0;
+export const ARCADE_JUMP_GRAVITY = 36.0;
+
+/**
+ * Protected no-jump buffer zones around every tunnel entrance and exit so vehicles
+ * never launch over a tunnel or descend through a tunnel roof.
+ */
+export const TUNNEL_PRE_BUFFER_METERS = 85;
+export const TUNNEL_POST_BUFFER_METERS = 65;
 
 /**
  * Bonus score and coins awarded once per successfully cleared broken-bridge jump.
@@ -176,28 +193,73 @@ export function createSeededRandom(seed: number): () => number {
 }
 
 /**
+ * Checks whether a longitudinal distance falls inside a tunnel or its protected approach/exit buffer.
+ */
+export function isDistanceInTunnelProtectedZone(
+  distanceMeters: number,
+  tunnels: TunnelSectionSpec[],
+  preBuffer: number = TUNNEL_PRE_BUFFER_METERS,
+  postBuffer: number = TUNNEL_POST_BUFFER_METERS
+): boolean {
+  for (let i = 0; i < tunnels.length; i++) {
+    const t = tunnels[i];
+    if (distanceMeters >= t.startDist - preBuffer && distanceMeters <= t.endDist + postBuffer) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Validates that a BrokenBridgeJumpSpec's approach, ramp, airborne trajectory, and landing zone
+ * do not overlap any tunnel or its protected approach/exit buffer.
+ */
+export function validateJumpAgainstTunnels(
+  jump: BrokenBridgeJumpSpec,
+  tunnels: TunnelSectionSpec[],
+  maxVehicleSpeedMs: number = 90
+): boolean {
+  const maxAirborneRange = computeExpectedJumpRangeMeters(jump, maxVehicleSpeedMs);
+  const jumpFootprintStart = jump.approachStartDist - 20;
+  const jumpFootprintEnd = Math.max(
+    jump.landingEndDist + 35,
+    jump.rampEndDist + maxAirborneRange + 35
+  );
+
+  for (let i = 0; i < tunnels.length; i++) {
+    const t = tunnels[i];
+    const tunnelProtectedStart = t.startDist - TUNNEL_PRE_BUFFER_METERS;
+    const tunnelProtectedEnd = t.endDist + TUNNEL_POST_BUFFER_METERS;
+    if (jumpFootprintStart <= tunnelProtectedEnd && jumpFootprintEnd >= tunnelProtectedStart) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Validates and sanitizes a BrokenBridgeJumpSpec so every generated jump is guaranteed
- * to be reachable by the standard starter car (~60.5 m/s top speed) with clear approach
- * and receiving platform geometry.
+ * to be reachable by the standard starter car (~60.5 m/s top speed) with a controlled,
+ * believable jump height and short airtime (~0.38s-0.52s).
  */
 export function validateBridgeJumpSpec(
   spec: BrokenBridgeJumpSpec,
   starterTopSpeedMs = 60.5
 ): BrokenBridgeJumpSpec {
   const approachLen = Math.max(45, spec.rampStartDist - spec.approachStartDist);
-  const rampLength = Math.max(18, Math.min(28, spec.rampLength));
-  const rampPeakHeight = Math.max(2.1, Math.min(3.2, spec.rampPeakHeight));
+  const rampLength = Math.max(16, Math.min(22, spec.rampLength));
+  const rampPeakHeight = Math.max(1.4, Math.min(1.9, spec.rampPeakHeight));
   const rampAngleRad = Math.atan2(rampPeakHeight, rampLength);
 
-  // Starter car normal cruise speed (~48-60 m/s) must easily clear the gap
-  const maxSafeGap = Math.min(30, Math.max(16, spec.gapLength));
-  const landingLength = Math.max(38, spec.landingLength);
-  const landingHeightOffset = Math.max(0, Math.min(0.75, spec.landingHeightOffset));
+  // Calibrated gap length (14m..21m) so vehicles cross quickly and land crisply on the receiving deck
+  const maxSafeGap = Math.min(21, Math.max(14, spec.gapLength));
+  const landingLength = Math.max(42, spec.landingLength);
+  const landingHeightOffset = Math.max(0, Math.min(0.45, spec.landingHeightOffset));
 
-  // Minimum speed required to clear the gap (kept between 28 m/s and 36 m/s so normal driving clears it,
+  // Minimum speed required to clear the gap (kept between 27 m/s and 34 m/s so normal driving clears it,
   // while heavy braking before the ramp causes a realistic failed jump)
   const safeMinSpeedMs = Math.min(
-    starterTopSpeedMs * 0.62,
+    starterTopSpeedMs * 0.58,
     Math.max(27, spec.minRequiredSpeedMs)
   );
 
@@ -245,6 +307,7 @@ export function computeExpectedJumpRangeMeters(
 
 /**
  * Computes the vertical launch velocity (m/s) when leaving the takeoff ramp lip.
+ * Capped so vehicles follow a low, believable highway jump arc and never float in the air.
  */
 export function computeJumpLaunchVerticalVelocity(
   jump: BrokenBridgeJumpSpec,
@@ -253,10 +316,10 @@ export function computeJumpLaunchVerticalVelocity(
   const speedRatio = takeoffSpeedMs / Math.max(1, jump.minRequiredSpeedMs);
   if (speedRatio < 0.92) {
     // Insufficient speed: weak vertical lift so the vehicle drops short into the gap
-    return Math.max(0.4, takeoffSpeedMs * Math.tan(jump.rampAngleRad) * 0.42);
+    return Math.min(2.1, Math.max(0.35, takeoffSpeedMs * Math.tan(jump.rampAngleRad) * 0.35));
   }
-  // Sufficient speed: coherent upward trajectory proportional to ramp angle & speed
-  return takeoffSpeedMs * Math.tan(jump.rampAngleRad) * 1.16 + 2.35;
+  // Sufficient speed: controlled upward trajectory capped at 5.35 m/s so airtime stays ~0.38s-0.52s
+  return Math.min(5.35, Math.max(3.6, takeoffSpeedMs * Math.tan(jump.rampAngleRad) * 0.72 + 1.15));
 }
 
 export interface RoadSurfaceSample {
@@ -287,35 +350,6 @@ export function sampleRoadSurfaceAtDistance(
   let isOnLandingDeck = false;
   let activeJump: BrokenBridgeJumpSpec | null = null;
 
-  for (let i = 0; i < bridgeJumps.length; i++) {
-    const jump = bridgeJumps[i];
-    if (distanceMeters >= jump.approachStartDist && distanceMeters <= jump.landingEndDist + 10) {
-      activeJump = jump;
-      if (distanceMeters >= jump.rampStartDist && distanceMeters <= jump.rampEndDist) {
-        isOnTakeoffRamp = true;
-        const t = (distanceMeters - jump.rampStartDist) / Math.max(1, jump.rampLength);
-        // Smoothly curved-upward ramp profile (slight ease-in for clean transition, steady incline to lip)
-        const shapedT = 0.15 * t * t + 0.85 * t;
-        groundY = jump.rampPeakHeight * shapedT;
-        slopePitchRad = jump.rampAngleRad;
-      } else if (distanceMeters > jump.gapStartDist && distanceMeters < jump.gapEndDist) {
-        isOverOpenGap = true;
-        groundY = -14.0; // Physically open bridge chasm!
-        slopePitchRad = 0;
-      } else if (distanceMeters >= jump.landingStartDist && distanceMeters <= jump.landingEndDist) {
-        isOnLandingDeck = true;
-        const landProgress =
-          (distanceMeters - jump.landingStartDist) / Math.max(1, jump.landingLength);
-        groundY = jump.landingHeightOffset * Math.max(0, 1 - landProgress);
-        slopePitchRad =
-          jump.landingHeightOffset > 0.05
-            ? -Math.atan2(jump.landingHeightOffset, jump.landingLength)
-            : 0;
-      }
-      break;
-    }
-  }
-
   let isInsideTunnel = false;
   let tunnelProximity01 = 0;
   let activeTunnel: TunnelSectionSpec | null = null;
@@ -345,6 +379,42 @@ export function sampleRoadSurfaceAtDistance(
       if (p > tunnelProximity01) {
         tunnelProximity01 = p;
         activeTunnel = tun;
+      }
+    }
+  }
+
+  // Tunnel routing priority: inside a tunnel or its immediate portal zone, road is strictly flat & continuous
+  const inImmediateTunnelPortalZone = tunnels.some(
+    (t) => distanceMeters >= t.startDist - 40 && distanceMeters <= t.endDist + 25
+  );
+
+  if (!inImmediateTunnelPortalZone) {
+    for (let i = 0; i < bridgeJumps.length; i++) {
+      const jump = bridgeJumps[i];
+      if (distanceMeters >= jump.approachStartDist && distanceMeters <= jump.landingEndDist + 10) {
+        activeJump = jump;
+        if (distanceMeters >= jump.rampStartDist && distanceMeters <= jump.rampEndDist) {
+          isOnTakeoffRamp = true;
+          const t = (distanceMeters - jump.rampStartDist) / Math.max(1, jump.rampLength);
+          // Smoothly curved-upward ramp profile
+          const shapedT = 0.15 * t * t + 0.85 * t;
+          groundY = jump.rampPeakHeight * shapedT;
+          slopePitchRad = jump.rampAngleRad;
+        } else if (distanceMeters > jump.gapStartDist && distanceMeters < jump.gapEndDist) {
+          isOverOpenGap = true;
+          groundY = -14.0; // Physically open bridge chasm!
+          slopePitchRad = 0;
+        } else if (distanceMeters >= jump.landingStartDist && distanceMeters <= jump.landingEndDist) {
+          isOnLandingDeck = true;
+          const landProgress =
+            (distanceMeters - jump.landingStartDist) / Math.max(1, jump.landingLength);
+          groundY = jump.landingHeightOffset * Math.max(0, 1 - landProgress);
+          slopePitchRad =
+            jump.landingHeightOffset > 0.05
+              ? -Math.atan2(jump.landingHeightOffset, jump.landingLength)
+              : 0;
+        }
+        break;
       }
     }
   }
@@ -382,6 +452,7 @@ export interface VehicleJumpStepOutput {
   pitchRad: number;
   isAirborne: boolean;
   activeJumpId: number | null;
+  jumpState: JumpLifecycleState;
   justTookOff: boolean;
   takeoffJump: BrokenBridgeJumpSpec | null;
   justLanded: boolean;
@@ -393,24 +464,24 @@ export interface VehicleJumpStepOutput {
 
 /**
  * Authoritative vehicle vertical & bridge-jump physics step shared by the Player and all 5 AI cars.
- * Handles:
- *  - Driving up the inclined takeoff ramp (y and nose-up pitch follow the 3D ramp surface)
- *  - Transitioning from grounded to airborne at the ramp lip without duplicate triggers
- *  - Coherent parabolic flight across the open gap
- *  - Smooth landing detection on the receiving bridge platform
- *  - Deliberate failed-jump detection if the vehicle drops into the open chasm short of the landing deck
+ * Enforces:
+ *  - Tunnel routing priority: vehicles approaching or inside a tunnel are strictly grounded at y=0
+ *    and can never jump over a tunnel or enter through a tunnel roof.
+ *  - Controlled, short jump arcs across broken-bridge gaps.
+ *  - Explicit JumpLifecycleState transitions without duplicate triggers.
  */
 export function stepVehicleJumpPhysics(input: VehicleJumpStepInput): VehicleJumpStepOutput {
   const {
     prevDistanceMeters,
     nextDistanceMeters,
     speedMs,
-     bridgeJumps,
+    bridgeJumps,
     tunnels,
     dt,
   } = input;
 
   let { y, vy, pitchRad, isAirborne, activeJumpId } = input;
+  let jumpState: JumpLifecycleState = isAirborne ? 'airborne' : 'grounded';
   let justTookOff = false;
   let takeoffJump: BrokenBridgeJumpSpec | null = null;
   let justLanded = false;
@@ -420,21 +491,61 @@ export function stepVehicleJumpPhysics(input: VehicleJumpStepInput): VehicleJump
 
   const surface = sampleRoadSurfaceAtDistance(nextDistanceMeters, bridgeJumps, tunnels);
 
+  // Strict Tunnel Routing Priority Guard:
+  // If the vehicle is inside a tunnel or within 35m of a tunnel entrance portal,
+  // guarantee it is grounded on the road surface so it enters cleanly through the front entrance.
+  const inTunnelOrApproach = tunnels.some(
+    (t) => nextDistanceMeters >= t.startDist - 35 && nextDistanceMeters <= t.endDist + 10
+  );
+  if (inTunnelOrApproach) {
+    if (isAirborne) {
+      isAirborne = false;
+      justLanded = true;
+      landedJump = bridgeJumps.find((j) => j.id === activeJumpId) ?? null;
+    }
+    y = 0;
+    vy = 0;
+    pitchRad += (0 - pitchRad) * Math.min(1, dt * 18);
+    activeJumpId = null;
+    jumpState = 'grounded';
+    return {
+      y,
+      vy,
+      pitchRad,
+      isAirborne,
+      activeJumpId,
+      jumpState,
+      justTookOff,
+      takeoffJump,
+      justLanded,
+      landedJump,
+      justFailedJump,
+      failedJump,
+      surface,
+    };
+  }
+
+  const inProtectedTunnelBuffer = isDistanceInTunnelProtectedZone(nextDistanceMeters, tunnels);
+
   if (!isAirborne) {
-    // Check if the vehicle just reached or crossed a ramp takeoff lip
+    // Check if the vehicle just reached or crossed a ramp takeoff lip (only if outside tunnel buffer)
     let triggeredJump: BrokenBridgeJumpSpec | null = null;
-    for (let i = 0; i < bridgeJumps.length; i++) {
-      const jump = bridgeJumps[i];
-      if (activeJumpId === jump.id) continue;
-      const crossedLip =
-        prevDistanceMeters <= jump.rampEndDist &&
-        nextDistanceMeters >= jump.rampEndDist - 0.65;
-      const enteredOpenGap =
-        nextDistanceMeters > jump.gapStartDist &&
-        nextDistanceMeters < jump.gapEndDist;
-      if (crossedLip || enteredOpenGap) {
-        triggeredJump = jump;
-        break;
+    if (!inProtectedTunnelBuffer) {
+      for (let i = 0; i < bridgeJumps.length; i++) {
+        const jump = bridgeJumps[i];
+        if (activeJumpId === jump.id) continue;
+        if (!validateJumpAgainstTunnels(jump, tunnels)) continue;
+
+        const crossedLip =
+          prevDistanceMeters <= jump.rampEndDist &&
+          nextDistanceMeters >= jump.rampEndDist - 0.65;
+        const enteredOpenGap =
+          nextDistanceMeters > jump.gapStartDist &&
+          nextDistanceMeters < jump.gapEndDist;
+        if (crossedLip || enteredOpenGap) {
+          triggeredJump = jump;
+          break;
+        }
       }
     }
 
@@ -443,9 +554,10 @@ export function stepVehicleJumpPhysics(input: VehicleJumpStepInput): VehicleJump
       activeJumpId = triggeredJump.id;
       y = triggeredJump.rampPeakHeight;
       vy = computeJumpLaunchVerticalVelocity(triggeredJump, speedMs);
-      pitchRad = Math.min(0.26, triggeredJump.rampAngleRad * 1.25);
+      pitchRad = Math.min(0.18, triggeredJump.rampAngleRad * 1.15);
       justTookOff = true;
       takeoffJump = triggeredJump;
+      jumpState = 'taking_off';
 
       // If the vehicle crossed the lip mid-step, advance airborne y for the post-lip fraction of the step
       const overLipMeters = Math.max(0, nextDistanceMeters - triggeredJump.rampEndDist);
@@ -454,17 +566,23 @@ export function stepVehicleJumpPhysics(input: VehicleJumpStepInput): VehicleJump
         y += vy * subDt;
         vy -= ARCADE_JUMP_GRAVITY * subDt;
       }
-    } else if (surface.isOnTakeoffRamp && surface.activeJump) {
+    } else if (surface.isOnTakeoffRamp && surface.activeJump && !inProtectedTunnelBuffer) {
       // Climbing the inclined takeoff ramp
       y = surface.groundY;
       vy = speedMs * Math.sin(surface.slopePitchRad);
       pitchRad += (surface.slopePitchRad - pitchRad) * Math.min(1, dt * 16);
+      jumpState = 'approaching_ramp';
     } else {
       // Normal road or receiving landing deck
       y = Math.max(0, surface.groundY);
       vy = 0;
       pitchRad += (surface.slopePitchRad - pitchRad) * Math.min(1, dt * 14);
-      // Clear activeJumpId once well past the landing deck
+      if (surface.isOnLandingDeck) {
+        jumpState = 'grounded_after_landing';
+      } else {
+        jumpState = 'grounded';
+      }
+      // Clear activeJumpId once past the landing deck
       if (activeJumpId !== null) {
         const prevJump = bridgeJumps.find((j) => j.id === activeJumpId);
         if (!prevJump || nextDistanceMeters > prevJump.landingEndDist) {
@@ -476,12 +594,13 @@ export function stepVehicleJumpPhysics(input: VehicleJumpStepInput): VehicleJump
     // Vehicle is currently AIRBORNE across the broken bridge gap
     y += vy * dt;
     vy -= ARCADE_JUMP_GRAVITY * dt;
+    jumpState = 'airborne';
 
     const desiredAirPitch = Math.max(
-      -0.2,
-      Math.min(0.26, (vy / Math.max(22, speedMs)) * 0.95)
+      -0.16,
+      Math.min(0.18, (vy / Math.max(25, speedMs)) * 0.85)
     );
-    pitchRad += (desiredAirPitch - pitchRad) * Math.min(1, dt * 10);
+    pitchRad += (desiredAirPitch - pitchRad) * Math.min(1, dt * 12);
 
     const currentJump =
       bridgeJumps.find((j) => j.id === activeJumpId) ?? surface.activeJump;
@@ -498,14 +617,19 @@ export function stepVehicleJumpPhysics(input: VehicleJumpStepInput): VehicleJump
           pitchRad = 0;
           justFailedJump = true;
           failedJump = currentJump;
-        } else if (y <= landingDeckY + 0.22 && vy <= 0) {
+          jumpState = 'failed_jump';
+        } else if (
+          (y <= landingDeckY + 0.28 && vy <= 0) ||
+          nextDistanceMeters >= currentJump.landingEndDist - 2
+        ) {
           // Clean touchdown on the receiving bridge deck!
           isAirborne = false;
           y = landingDeckY;
           vy = 0;
-          pitchRad = -0.04; // brief nose suspension compression on touchdown
+          pitchRad = -0.035; // brief nose suspension compression on touchdown
           justLanded = true;
           landedJump = currentJump;
+          jumpState = 'landing';
         }
       } else if (
         nextDistanceMeters > currentJump.gapStartDist + 1.5 &&
@@ -519,6 +643,7 @@ export function stepVehicleJumpPhysics(input: VehicleJumpStepInput): VehicleJump
           pitchRad = 0;
           justFailedJump = true;
           failedJump = currentJump;
+          jumpState = 'failed_jump';
         }
       }
     } else if (y <= 0) {
@@ -526,6 +651,7 @@ export function stepVehicleJumpPhysics(input: VehicleJumpStepInput): VehicleJump
       y = 0;
       vy = 0;
       pitchRad = 0;
+      jumpState = 'grounded';
     }
   }
 
@@ -535,6 +661,7 @@ export function stepVehicleJumpPhysics(input: VehicleJumpStepInput): VehicleJump
     pitchRad,
     isAirborne,
     activeJumpId,
+    jumpState,
     justTookOff,
     takeoffJump,
     justLanded,
@@ -600,16 +727,17 @@ export function generateLevelCourse(levelNumber: number): GeneratedLevelCourse {
   });
   cursorDist = 90;
 
-  // Curated sequence for Level 1 so players immediately experience an Illuminated Tunnel,
-  // a Broken-Bridge Jump, a U-Turn Drift Bend, an S-Curve, and a second Tunnel & Jump:
+  // Curated sequence for Level 1 so players experience an Illuminated Tunnel,
+  // a U-Turn Drift Bend separating it from a Broken-Bridge Jump, an S-Curve, and a second Tunnel & Jump
+  // with guaranteed grounded road separation between every tunnel and jump:
   const level1Sequence: TrackSegmentType[] = [
     'tunnel_passage',
-    'bridge_jump',
     'u_turn_right',
+    'bridge_jump',
     'drift_s_bend',
     'tunnel_passage',
-    'bridge_jump',
     'sweeping_bend_left',
+    'bridge_jump',
   ];
 
   const level2PlusPool: TrackSegmentType[] = [
@@ -635,22 +763,28 @@ export function generateLevelCourse(levelNumber: number): GeneratedLevelCourse {
     } else if (i === 0) {
       segType = 'tunnel_passage';
     } else if (i === 1) {
-      segType = 'bridge_jump';
+      segType = i % 2 === 0 ? 'u_turn_left' : 'sweeping_bend_right';
     } else if (i === 2) {
-      segType = i % 2 === 0 ? 'u_turn_left' : 'hairpin_right';
-    } else if (i === 4) {
       segType = 'bridge_jump';
-    } else if (i === 5) {
+    } else if (i === 3) {
+      segType = 'drift_s_bend';
+    } else if (i === 4) {
       segType = 'tunnel_passage';
+    } else if (i === 5) {
+      segType = 'hairpin_right';
+    } else if (i === 6) {
+      segType = 'bridge_jump';
     } else {
       segType = level2PlusPool[Math.floor(rng() * level2PlusPool.length)];
-      const prevSeg = segments[segments.length - 1];
-      if (segType === 'tunnel_passage' && prevSeg?.isTunnel) {
-        segType = 'sweeping_bend_right';
-      }
-      if (segType === 'bridge_jump' && prevSeg?.isBridgeJump) {
-        segType = 'drift_s_bend';
-      }
+    }
+
+    // Strict separation rule: never place a tunnel immediately after/before a bridge jump or another tunnel
+    const prevSeg = segments[segments.length - 1];
+    if (
+      (segType === 'tunnel_passage' || segType === 'bridge_jump') &&
+      (prevSeg?.isTunnel || prevSeg?.isBridgeJump)
+    ) {
+      segType = i % 2 === 0 ? 'sweeping_bend_right' : 'drift_s_bend';
     }
 
     let segLength = 170 + Math.floor(rng() * 45);
@@ -661,9 +795,9 @@ export function generateLevelCourse(levelNumber: number): GeneratedLevelCourse {
     } else if (segType === 'drift_s_bend') {
       segLength = 220 + Math.floor(rng() * 40);
     } else if (segType === 'tunnel_passage') {
-      segLength = 175 + Math.floor(rng() * 35);
+      segLength = 180 + Math.floor(rng() * 35);
     } else if (segType === 'bridge_jump') {
-      segLength = 185 + Math.floor(rng() * 30);
+      segLength = 195 + Math.floor(rng() * 30);
     }
 
     const baseCurveScale =
@@ -726,8 +860,8 @@ export function generateLevelCourse(levelNumber: number): GeneratedLevelCourse {
             ? 'Harbor Illuminated Tunnel'
             : 'Midtown Express Tunnel';
         isTunnel = true;
-        const tunStart = cursorDist + 12;
-        const tunEnd = cursorDist + segLength - 12;
+        const tunStart = cursorDist + 15;
+        const tunEnd = cursorDist + segLength - 15;
         tunnels.push({
           id: tunnelIdCounter++,
           startDist: tunStart,
@@ -739,7 +873,6 @@ export function generateLevelCourse(levelNumber: number): GeneratedLevelCourse {
       }
       case 'bridge_jump': {
         // Keep bridge jump alignment straight during approach, takeoff, and landing
-        // (later levels can have subtle post-landing curvature)
         curvature = 0;
         label =
           jumpIdCounter % 2 === 1
@@ -747,28 +880,28 @@ export function generateLevelCourse(levelNumber: number): GeneratedLevelCourse {
             : 'Viaduct Span Jump';
         isBridgeJump = true;
 
-        // Progressive jump scaling across levels, validated by validateBridgeJumpSpec
+        // Progressive jump scaling across levels with controlled height & short gap
         const rawGapLen =
           safeLevel === 1
-            ? 18
-            : Math.min(28, 19 + Math.floor((safeLevel - 1) * 1.4 + rng() * 3));
-        const rawRampLen = safeLevel === 1 ? 22 : 21 + Math.floor(rng() * 4);
+            ? 15
+            : Math.min(20, 15 + Math.floor((safeLevel - 1) * 0.8 + rng() * 2));
+        const rawRampLen = safeLevel === 1 ? 18 : 18 + Math.floor(rng() * 3);
         const rawPeakHeight =
           safeLevel === 1
-            ? 2.45
-            : Math.min(3.1, 2.5 + difficulty01 * 0.55);
+            ? 1.55
+            : Math.min(1.85, 1.55 + difficulty01 * 0.28);
         const rawLandingHeight =
-          safeLevel <= 2 ? 0.15 : Math.min(0.65, 0.2 + difficulty01 * 0.45);
+          safeLevel <= 2 ? 0.12 : Math.min(0.35, 0.15 + difficulty01 * 0.2);
         const rawMinSpeedMs =
           safeLevel === 1
-            ? 29.0 // ~104 km/h
-            : Math.min(35.5, 30.0 + difficulty01 * 5.5);
+            ? 28.0 // ~101 km/h
+            : Math.min(33.5, 28.5 + difficulty01 * 4.5);
 
-        const rampStartDist = cursorDist + 58;
+        const rampStartDist = cursorDist + 52;
         const rawSpec: BrokenBridgeJumpSpec = {
           id: jumpIdCounter++,
           label,
-          approachStartDist: cursorDist + 10,
+          approachStartDist: cursorDist + 6,
           rampStartDist,
           rampEndDist: rampStartDist + rawRampLen,
           rampLength: rawRampLen,
@@ -784,7 +917,13 @@ export function generateLevelCourse(levelNumber: number): GeneratedLevelCourse {
           minRequiredSpeedMs: rawMinSpeedMs,
         };
 
-        bridgeJumps.push(validateBridgeJumpSpec(rawSpec));
+        const validatedJump = validateBridgeJumpSpec(rawSpec);
+        if (validateJumpAgainstTunnels(validatedJump, tunnels)) {
+          bridgeJumps.push(validatedJump);
+        } else {
+          isBridgeJump = false;
+          label = 'Expressway Straight';
+        }
         break;
       }
       case 'chicane_barriers':
@@ -812,6 +951,13 @@ export function generateLevelCourse(levelNumber: number): GeneratedLevelCourse {
     cursorDist += segLength;
   }
 
+  // Final post-validation pass: ensure no earlier jump overlaps a later tunnel's protected buffer
+  for (let j = bridgeJumps.length - 1; j >= 0; j--) {
+    if (!validateJumpAgainstTunnels(bridgeJumps[j], tunnels)) {
+      bridgeJumps.splice(j, 1);
+    }
+  }
+
   // Final Finish Straight (120m)
   segments.push({
     index: segments.length,
@@ -836,7 +982,7 @@ export function generateLevelCourse(levelNumber: number): GeneratedLevelCourse {
   let obstacleIdCounter = 1;
   let coinIdCounter = 1;
 
-  // Place airborne coin arcs over every Broken-Bridge Jump so players are guided and rewarded
+  // Place airborne coin arcs over every Broken-Bridge Jump matching the controlled jump height
   for (const jump of bridgeJumps) {
     const coinLaneX = HIGHWAY_CONFIG.laneCenters[1]; // Center-left racing line (-1.8m)
     const coinLaneX2 = HIGHWAY_CONFIG.laneCenters[2]; // Center-right racing line (+1.8m)
@@ -845,7 +991,7 @@ export function generateLevelCourse(levelNumber: number): GeneratedLevelCourse {
       const frac = s / (steps - 1); // 0..1 across ramp lip to landing zone
       const d = jump.rampEndDist - 2 + frac * (jump.gapLength + 6);
       const arcHeight =
-        jump.rampPeakHeight + Math.sin(frac * Math.PI) * 1.9 + 0.65;
+        jump.rampPeakHeight + Math.sin(frac * Math.PI) * 0.95 + 0.55;
       coins.push({
         id: coinIdCounter++,
         distanceMeters: Number(d.toFixed(1)),

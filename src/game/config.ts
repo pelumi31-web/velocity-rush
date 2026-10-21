@@ -178,12 +178,88 @@ export interface ProtectionTrackConfig {
   costMultiplier: number;
 }
 
+export type ChallengeCategory =
+  | 'solo'
+  | 'levels'
+  | 'skills'
+  | 'stunts'
+  | 'garage';
+
+export type ChallengeMetric =
+  | 'distance'
+  | 'soloDistance'
+  | 'totalRacesCompleted'
+  | 'coins'
+  | 'totalRaceRewardCoins'
+  | 'nearMisses'
+  | 'highSpeedNearMisses'
+  | 'cleanRaces'
+  | 'driftEvents'
+  | 'levelDriftZonesClean'
+  | 'successfulJumps'
+  | 'tunnelsCompleted'
+  | 'levelsWins'
+  | 'levelsPodiums'
+  | 'distinctLevelsCompleted'
+  | 'levelsCleanFinishes'
+  | 'ownedCars'
+  | 'purchasedCustomizations'
+  | 'purchasedUpgrades'
+  | 'shieldAbsorptions'
+  | 'nitroActivations'
+  | 'score';
+
 export interface ChallengeConfig {
   id: string;
   title: string;
   description: string;
-  metric: 'distance' | 'coins' | 'nearMisses' | 'score';
+  category: ChallengeCategory;
+  metric: ChallengeMetric;
   targetValue: number;
+  rewardCoins: number;
+  unitLabel?: string;
+}
+
+export type DailyChallengeDifficulty = 'easy' | 'medium' | 'hard';
+
+export type DailyChallengeCategory =
+  | 'distance'
+  | 'coins'
+  | 'near_miss'
+  | 'drift'
+  | 'stunts_jumps'
+  | 'stunts_tunnels'
+  | 'levels_race'
+  | 'nitro_shield'
+  | 'score';
+
+export type DailyChallengeMetric =
+  | 'dailyDistance'
+  | 'dailySoloDistance'
+  | 'dailyCoinsPickedUp'
+  | 'dailyNearMisses'
+  | 'dailyHighSpeedNearMisses'
+  | 'dailyDriftEvents'
+  | 'dailyJumps'
+  | 'dailyTunnels'
+  | 'dailyLevelsCompleted'
+  | 'dailyLevelsPodiums'
+  | 'dailyLevelsWins'
+  | 'dailyCleanRaces'
+  | 'dailyNitroActivations'
+  | 'dailyShieldBlocks'
+  | 'dailyScore';
+
+export interface DailyChallengeTemplate {
+  templateId: string;
+  title: string;
+  descriptionTemplate: string; // uses {target} placeholder
+  difficulty: DailyChallengeDifficulty;
+  category: DailyChallengeCategory;
+  metric: DailyChallengeMetric;
+  baseTarget: number;
+  scalePerTier: number;
+  maxTarget: number;
   rewardCoins: number;
 }
 
@@ -775,39 +851,533 @@ export const PROTECTION_TRACKS: Record<ProtectionUpgradeKey, ProtectionTrackConf
 };
 
 export const CHALLENGES_CONFIG: ChallengeConfig[] = [
+  // --- ORIGINAL 4 CHALLENGES (preserved IDs, progress, and claimed state) ---
   {
     id: 'dist_1000',
     title: 'Highway Cruiser',
     description: 'Drive a cumulative distance of 1,000 meters across races.',
+    category: 'solo',
     metric: 'distance',
     targetValue: 1000,
     rewardCoins: 250,
+    unitLabel: 'm',
   },
   {
     id: 'coins_75',
     title: 'Bullion Collector',
     description: 'Collect 75 highway coins from active traffic lanes.',
+    category: 'solo',
     metric: 'coins',
     targetValue: 75,
     rewardCoins: 300,
+    unitLabel: 'coins',
   },
   {
     id: 'nearmiss_12',
     title: 'Thread the Needle',
     description: 'Execute 12 high-speed traffic near-misses without crashing.',
+    category: 'skills',
     metric: 'nearMisses',
     targetValue: 12,
     rewardCoins: 350,
+    unitLabel: 'near-misses',
   },
   {
     id: 'score_10000',
     title: 'Velocity Legend',
     description: 'Reach a cumulative score of 10,000 points across runs.',
+    category: 'solo',
     metric: 'score',
     targetValue: 10000,
     rewardCoins: 500,
+    unitLabel: 'pts',
+  },
+
+  // --- DISTANCE AND ENDURANCE (5-8) ---
+  {
+    id: 'solo_dist_5000',
+    title: 'City Explorer',
+    description: 'Drive a cumulative distance of 5,000 metres across Solo Mode runs.',
+    category: 'solo',
+    metric: 'soloDistance',
+    targetValue: 5000,
+    rewardCoins: 250,
+    unitLabel: 'm',
+  },
+  {
+    id: 'solo_dist_25000',
+    title: 'Road Veteran',
+    description: 'Drive a cumulative distance of 25,000 metres across Solo Mode runs.',
+    category: 'solo',
+    metric: 'soloDistance',
+    targetValue: 25000,
+    rewardCoins: 600,
+    unitLabel: 'm',
+  },
+  {
+    id: 'races_25',
+    title: 'Endurance Racer',
+    description: 'Complete 25 races across Solo Mode and Levels Mode combined.',
+    category: 'solo',
+    metric: 'totalRacesCompleted',
+    targetValue: 25,
+    rewardCoins: 500,
+    unitLabel: 'races',
+  },
+  {
+    id: 'solo_dist_60000',
+    title: 'Marathon Driver',
+    description: 'Accumulate 60,000 metres of valid driving distance across Solo Mode runs.',
+    category: 'solo',
+    metric: 'soloDistance',
+    targetValue: 60000,
+    rewardCoins: 1000,
+    unitLabel: 'm',
+  },
+
+  // --- COINS AND REWARDS (9-11) ---
+  {
+    id: 'coins_250',
+    title: 'Coin Hunter',
+    description: 'Collect 250 coins from road pickups across any game mode.',
+    category: 'solo',
+    metric: 'coins',
+    targetValue: 250,
+    rewardCoins: 300,
+    unitLabel: 'coins',
+  },
+  {
+    id: 'coins_1000',
+    title: 'Treasure Runner',
+    description: 'Collect 1,000 coins from road pickups across any game mode.',
+    category: 'solo',
+    metric: 'coins',
+    targetValue: 1000,
+    rewardCoins: 800,
+    unitLabel: 'coins',
+  },
+  {
+    id: 'race_reward_coins_5000',
+    title: 'Consistent Earner',
+    description: 'Earn 5,000 total coins from race rewards and road pickups.',
+    category: 'solo',
+    metric: 'totalRaceRewardCoins',
+    targetValue: 5000,
+    rewardCoins: 900,
+    unitLabel: 'coins',
+  },
+
+  // --- NEAR MISSES AND DRIVING PRECISION (12-14) ---
+  {
+    id: 'nearmiss_30',
+    title: 'Close Call Apprentice',
+    description: 'Perform 30 traffic near-misses without crashing.',
+    category: 'skills',
+    metric: 'nearMisses',
+    targetValue: 30,
+    rewardCoins: 350,
+    unitLabel: 'near-misses',
+  },
+  {
+    id: 'highspeed_nearmiss_50',
+    title: 'High-Speed Threader',
+    description: 'Perform 50 near-misses while driving at high speed (180+ km/h).',
+    category: 'skills',
+    metric: 'highSpeedNearMisses',
+    targetValue: 50,
+    rewardCoins: 650,
+    unitLabel: 'near-misses',
+  },
+  {
+    id: 'clean_races_10',
+    title: 'Precision Driver',
+    description: 'Finish 10 races or runs with zero barrier or vehicle collisions.',
+    category: 'skills',
+    metric: 'cleanRaces',
+    targetValue: 10,
+    rewardCoins: 700,
+    unitLabel: 'clean runs',
+  },
+
+  // --- DRIFTING AND CORNERING (15-17) ---
+  {
+    id: 'drift_events_20',
+    title: 'Drift Initiate',
+    description: 'Complete 20 controlled corner drifts across curved road sections.',
+    category: 'skills',
+    metric: 'driftEvents',
+    targetValue: 20,
+    rewardCoins: 300,
+    unitLabel: 'drifts',
+  },
+  {
+    id: 'drift_events_75',
+    title: 'Drift Specialist',
+    description: 'Complete 75 controlled corner drifts across curved road sections.',
+    category: 'skills',
+    metric: 'driftEvents',
+    targetValue: 75,
+    rewardCoins: 650,
+    unitLabel: 'drifts',
+  },
+  {
+    id: 'level_drift_zones_30',
+    title: 'Corner Master',
+    description: 'Successfully navigate 30 curved road or drift sections in Levels Mode without hitting barriers.',
+    category: 'skills',
+    metric: 'levelDriftZonesClean',
+    targetValue: 30,
+    rewardCoins: 750,
+    unitLabel: 'sectors',
+  },
+
+  // --- JUMPS AND TUNNELS / EXPLORATION AND STUNTS (18-21) ---
+  {
+    id: 'jumps_10',
+    title: 'Airborne Rookie',
+    description: 'Successfully land 10 broken-bridge jumps on the receiving road deck.',
+    category: 'stunts',
+    metric: 'successfulJumps',
+    targetValue: 10,
+    rewardCoins: 300,
+    unitLabel: 'jumps',
+  },
+  {
+    id: 'jumps_40',
+    title: 'Long Jumper',
+    description: 'Successfully land 40 broken-bridge jumps across Solo Mode and Levels Mode.',
+    category: 'stunts',
+    metric: 'successfulJumps',
+    targetValue: 40,
+    rewardCoins: 700,
+    unitLabel: 'jumps',
+  },
+  {
+    id: 'tunnels_15',
+    title: 'Tunnel Runner',
+    description: 'Drive cleanly through 15 illuminated road tunnels from entrance to exit.',
+    category: 'stunts',
+    metric: 'tunnelsCompleted',
+    targetValue: 15,
+    rewardCoins: 300,
+    unitLabel: 'tunnels',
+  },
+  {
+    id: 'tunnels_50',
+    title: 'Tunnel Veteran',
+    description: 'Drive cleanly through 50 illuminated road tunnels from entrance to exit.',
+    category: 'stunts',
+    metric: 'tunnelsCompleted',
+    targetValue: 50,
+    rewardCoins: 650,
+    unitLabel: 'tunnels',
+  },
+
+  // --- LEVELS MODE AND AI RACING (22-27) ---
+  {
+    id: 'levels_win_1',
+    title: 'First Victory',
+    description: 'Win 1 race in 1st place in Levels Mode against AI opponents.',
+    category: 'levels',
+    metric: 'levelsWins',
+    targetValue: 1,
+    rewardCoins: 300,
+    unitLabel: 'wins',
+  },
+  {
+    id: 'levels_podium_10',
+    title: 'Podium Finisher',
+    description: 'Finish in the Top 3 in 10 Levels Mode races.',
+    category: 'levels',
+    metric: 'levelsPodiums',
+    targetValue: 10,
+    rewardCoins: 500,
+    unitLabel: 'podiums',
+  },
+  {
+    id: 'levels_complete_10',
+    title: 'Level Climber',
+    description: 'Complete 10 distinct levels in Levels Mode.',
+    category: 'levels',
+    metric: 'distinctLevelsCompleted',
+    targetValue: 10,
+    rewardCoins: 600,
+    unitLabel: 'levels',
+  },
+  {
+    id: 'levels_complete_25',
+    title: 'Skyway Champion',
+    description: 'Complete 25 distinct levels in Levels Mode.',
+    category: 'levels',
+    metric: 'distinctLevelsCompleted',
+    targetValue: 25,
+    rewardCoins: 1200,
+    unitLabel: 'levels',
+  },
+  {
+    id: 'levels_win_15',
+    title: 'Rival Beater',
+    description: 'Finish 1st ahead of all 5 AI opponents in 15 Levels Mode races.',
+    category: 'levels',
+    metric: 'levelsWins',
+    targetValue: 15,
+    rewardCoins: 900,
+    unitLabel: 'wins',
+  },
+  {
+    id: 'levels_clean_5',
+    title: 'Clean Finish',
+    description: 'Complete 5 Levels Mode races from start to finish without any collisions.',
+    category: 'levels',
+    metric: 'levelsCleanFinishes',
+    targetValue: 5,
+    rewardCoins: 650,
+    unitLabel: 'clean finishes',
+  },
+
+  // --- GARAGE, CARS, AND UPGRADES (28-32) ---
+  {
+    id: 'garage_cars_3',
+    title: 'Garage Collector',
+    description: 'Unlock and own 3 vehicles in the Showroom Garage.',
+    category: 'garage',
+    metric: 'ownedCars',
+    targetValue: 3,
+    rewardCoins: 500,
+    unitLabel: 'cars',
+  },
+  {
+    id: 'garage_custom_5',
+    title: 'Custom Builder',
+    description: 'Purchase or unlock 5 vehicle customizations (wheels, paints, finishes, or body parts).',
+    category: 'garage',
+    metric: 'purchasedCustomizations',
+    targetValue: 5,
+    rewardCoins: 450,
+    unitLabel: 'items',
+  },
+  {
+    id: 'garage_upgrades_10',
+    title: 'Performance Engineer',
+    description: 'Purchase 10 vehicle performance or shield upgrades in the Garage.',
+    category: 'garage',
+    metric: 'purchasedUpgrades',
+    targetValue: 10,
+    rewardCoins: 600,
+    unitLabel: 'upgrades',
+  },
+  {
+    id: 'shield_blocks_15',
+    title: 'Shield Guardian',
+    description: 'Use vehicle shields to absorb or survive 15 traffic or barrier impacts.',
+    category: 'garage',
+    metric: 'shieldAbsorptions',
+    targetValue: 15,
+    rewardCoins: 450,
+    unitLabel: 'impacts',
+  },
+  {
+    id: 'nitro_uses_40',
+    title: 'Nitro Enthusiast',
+    description: 'Activate nitro boost 40 times during valid races.',
+    category: 'skills',
+    metric: 'nitroActivations',
+    targetValue: 40,
+    rewardCoins: 400,
+    unitLabel: 'boosts',
   },
 ];
+
+export const DAILY_COMPLETION_BONUS_COINS = 250;
+
+export const DAILY_CHALLENGE_TEMPLATES: DailyChallengeTemplate[] = [
+  // --- EASY TIER (50-100 coins) ---
+  {
+    templateId: 'daily_easy_dist',
+    title: 'Morning Commute Sprint',
+    descriptionTemplate: 'Drive {target} metres across any racing mode today.',
+    difficulty: 'easy',
+    category: 'distance',
+    metric: 'dailyDistance',
+    baseTarget: 1500,
+    scalePerTier: 250,
+    maxTarget: 3000,
+    rewardCoins: 75,
+  },
+  {
+    templateId: 'daily_easy_coins',
+    title: 'Street Bullion Sweep',
+    descriptionTemplate: 'Collect {target} road coins during races today.',
+    difficulty: 'easy',
+    category: 'coins',
+    metric: 'dailyCoinsPickedUp',
+    baseTarget: 25,
+    scalePerTier: 5,
+    maxTarget: 55,
+    rewardCoins: 80,
+  },
+  {
+    templateId: 'daily_easy_tunnels',
+    title: 'Harbor Tunnel Cruise',
+    descriptionTemplate: 'Drive cleanly through {target} illuminated road tunnels today.',
+    difficulty: 'easy',
+    category: 'stunts_tunnels',
+    metric: 'dailyTunnels',
+    baseTarget: 2,
+    scalePerTier: 1,
+    maxTarget: 5,
+    rewardCoins: 85,
+  },
+  {
+    templateId: 'daily_easy_jumps',
+    title: 'Viaduct Leap',
+    descriptionTemplate: 'Successfully land {target} broken-bridge jumps today.',
+    difficulty: 'easy',
+    category: 'stunts_jumps',
+    metric: 'dailyJumps',
+    baseTarget: 2,
+    scalePerTier: 1,
+    maxTarget: 5,
+    rewardCoins: 90,
+  },
+  {
+    templateId: 'daily_easy_nitro',
+    title: 'Afterburner Ignition',
+    descriptionTemplate: 'Activate nitro boost {target} times in active races today.',
+    difficulty: 'easy',
+    category: 'nitro_shield',
+    metric: 'dailyNitroActivations',
+    baseTarget: 4,
+    scalePerTier: 1,
+    maxTarget: 8,
+    rewardCoins: 70,
+  },
+
+  // --- MEDIUM TIER (100-200 coins) ---
+  {
+    templateId: 'daily_med_nearmiss',
+    title: 'Traffic Weaver',
+    descriptionTemplate: 'Execute {target} traffic near-misses without crashing today.',
+    difficulty: 'medium',
+    category: 'near_miss',
+    metric: 'dailyNearMisses',
+    baseTarget: 8,
+    scalePerTier: 2,
+    maxTarget: 18,
+    rewardCoins: 150,
+  },
+  {
+    templateId: 'daily_med_drift',
+    title: 'Apex Drift Session',
+    descriptionTemplate: 'Complete {target} controlled corner drifts in Levels Mode today.',
+    difficulty: 'medium',
+    category: 'drift',
+    metric: 'dailyDriftEvents',
+    baseTarget: 5,
+    scalePerTier: 1,
+    maxTarget: 12,
+    rewardCoins: 160,
+  },
+  {
+    templateId: 'daily_med_levels_podium',
+    title: 'Contender Podiums',
+    descriptionTemplate: 'Finish in the Top 3 in {target} Levels Mode races today.',
+    difficulty: 'medium',
+    category: 'levels_race',
+    metric: 'dailyLevelsPodiums',
+    baseTarget: 2,
+    scalePerTier: 1,
+    maxTarget: 4,
+    rewardCoins: 175,
+  },
+  {
+    templateId: 'daily_med_solo_dist',
+    title: 'Expressway Outrun',
+    descriptionTemplate: 'Drive {target} cumulative metres in Solo Mode today.',
+    difficulty: 'medium',
+    category: 'distance',
+    metric: 'dailySoloDistance',
+    baseTarget: 3500,
+    scalePerTier: 500,
+    maxTarget: 6500,
+    rewardCoins: 140,
+  },
+  {
+    templateId: 'daily_med_jumps',
+    title: 'Span Jumper',
+    descriptionTemplate: 'Land {target} broken-bridge jumps cleanly on the receiving road today.',
+    difficulty: 'medium',
+    category: 'stunts_jumps',
+    metric: 'dailyJumps',
+    baseTarget: 4,
+    scalePerTier: 1,
+    maxTarget: 8,
+    rewardCoins: 165,
+  },
+
+  // --- HARD TIER (200-350 coins) ---
+  {
+    templateId: 'daily_hard_levels_win',
+    title: 'Championship Dominator',
+    descriptionTemplate: 'Win {target} Levels Mode races in 1st place against AI rivals today.',
+    difficulty: 'hard',
+    category: 'levels_race',
+    metric: 'dailyLevelsWins',
+    baseTarget: 2,
+    scalePerTier: 1,
+    maxTarget: 4,
+    rewardCoins: 280,
+  },
+  {
+    templateId: 'daily_hard_highspeed_nm',
+    title: 'Supersonic Threader',
+    descriptionTemplate: 'Execute {target} high-speed near-misses at 180+ km/h today.',
+    difficulty: 'hard',
+    category: 'near_miss',
+    metric: 'dailyHighSpeedNearMisses',
+    baseTarget: 10,
+    scalePerTier: 2,
+    maxTarget: 20,
+    rewardCoins: 260,
+  },
+  {
+    templateId: 'daily_hard_clean_races',
+    title: 'Flawless Asphalt',
+    descriptionTemplate: 'Complete {target} races or runs with zero collisions today.',
+    difficulty: 'hard',
+    category: 'drift',
+    metric: 'dailyCleanRaces',
+    baseTarget: 2,
+    scalePerTier: 1,
+    maxTarget: 4,
+    rewardCoins: 300,
+  },
+  {
+    templateId: 'daily_hard_coins',
+    title: 'Vault Heist Run',
+    descriptionTemplate: 'Collect {target} highway pickup coins across races today.',
+    difficulty: 'hard',
+    category: 'coins',
+    metric: 'dailyCoinsPickedUp',
+    baseTarget: 75,
+    scalePerTier: 10,
+    maxTarget: 135,
+    rewardCoins: 250,
+  },
+  {
+    templateId: 'daily_hard_score',
+    title: 'High-Octane Score Blitz',
+    descriptionTemplate: 'Accumulate {target} total race points across runs today.',
+    difficulty: 'hard',
+    category: 'score',
+    metric: 'dailyScore',
+    baseTarget: 12000,
+    scalePerTier: 2500,
+    maxTarget: 25000,
+    rewardCoins: 320,
+  },
+];
+
 
 export const SENSITIVITY_MULTIPLIERS: Record<SensitivityLevel, number> = {
   low: 0.7,

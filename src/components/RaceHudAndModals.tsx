@@ -325,12 +325,6 @@ export const RaceHudAndModals: React.FC<RaceHudAndModalsProps> = ({
             </div>
           )}
 
-          {liveSnapshot.isAirborne && (
-            <div className="px-3 py-0.5 rounded-xl border bg-cyan-950/90 border-cyan-400 text-cyan-200 text-[11px] font-extrabold uppercase tracking-wider shadow-lg">
-              AIRBORNE · BRIDGE JUMP
-            </div>
-          )}
-
           {liveSnapshot.isDrifting && !liveSnapshot.isAirborne && (
             <div className="px-3 py-0.5 rounded-xl border bg-amber-950/90 border-amber-400 text-amber-200 text-[11px] font-extrabold uppercase tracking-wider shadow-lg">
               DRIFT · +{liveSnapshot.driftScore ?? 0} PTS
