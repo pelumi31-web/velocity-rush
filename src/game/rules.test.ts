@@ -31,12 +31,16 @@ import {
 import {
   calculateLevelRaceRewards,
   computeCurvedRoadCenterAtWorldZ,
+  computeExpectedJumpRangeMeters,
   computeRaceStandings,
   createLevelAiOpponents,
   generateLevelCourse,
   PLAYER_GRID_START_DIST,
+  sampleRoadSurfaceAtDistance,
   sampleTrackAtDistance,
   stepAiOpponent,
+  stepVehicleJumpPhysics,
+  validateBridgeJumpSpec,
 } from './levelsMode.ts';
 
 test('8 distinct vehicles exist with unique body styles and valid customization compatibility', () => {
@@ -408,7 +412,7 @@ test('economy, Solo Mode runs, challenges, AdMob frequency, and save sanitizatio
 test('Fair 6-car starting grid and U-shaped drift / hairpin curves in Levels Mode', () => {
   for (let lvl = 1; lvl <= 4; lvl++) {
     const course = generateLevelCourse(lvl);
-    const opponents = createLevelAiOpponents(lvl, 'starter_apex', 72);
+    const opponents = createLevelAiOpponents(lvl, 72);
     assert.equal(opponents.length, 5, 'Exactly 5 AI opponents must be spawned');
     assert.ok(PLAYER_GRID_START_DIST <= 0, 'Player starts behind or on start line');
 
@@ -430,7 +434,7 @@ test('Fair 6-car starting grid and U-shaped drift / hairpin curves in Levels Mod
         s.type === 'hairpin_right' ||
         s.type === 'sweeping_bend_left' ||
         s.type === 'sweeping_bend_right' ||
-        s.type === 's_curve'
+        s.type === 'drift_s_bend'
     );
     assert.ok(
       curvedSegments.length >= 2,
@@ -447,4 +451,209 @@ test('Fair 6-car starting grid and U-shaped drift / hairpin curves in Levels Mod
     );
   }
 });
+
+test('Feature 1 & 2: Illuminated Tunnels and Broken-Bridge Jumps geometry, physics, and 5-AI navigation', () => {
+  for (const lvl of [1, 2, 4, 8]) {
+    const course = generateLevelCourse(lvl);
+    assert.ok(course.tunnels.length >= 2, `Level ${lvl} must include illuminated tunnels`);
+    assert.ok(course.bridgeJumps.length >= 2, `Level ${lvl} must include broken-bridge jumps`);
+
+    // 1. Verify Tunnel smooth lighting transition & geometry bounds
+    const tun = course.tunnels[0];
+    const beforeTun = sampleRoadSurfaceAtDistance(
+      tun.startDist - 16,
+      course.bridgeJumps,
+      course.tunnels
+    );
+    assert.equal(beforeTun.isInsideTunnel, false);
+    assert.ok(
+      beforeTun.tunnelProximity01 > 0.2 && beforeTun.tunnelProximity01 < 0.8,
+      'Tunnel lighting proximity must transition smoothly before entrance'
+    );
+
+    const midTun = sampleRoadSurfaceAtDistance(
+      (tun.startDist + tun.endDist) * 0.5,
+      course.bridgeJumps,
+      course.tunnels
+    );
+    assert.equal(midTun.isInsideTunnel, true);
+    assert.equal(midTun.tunnelProximity01, 1.0);
+
+    // 2. Verify Broken-Bridge Jump has inclined ramp, open gap, clear obstacles, and valid range
+    for (const jump of course.bridgeJumps) {
+      const validated = validateBridgeJumpSpec(jump);
+      assert.ok(validated.rampPeakHeight >= 2.1, 'Ramp must have real upward elevation');
+      assert.ok(validated.rampAngleRad > 0.08, 'Ramp must have real upward incline angle');
+      assert.ok(validated.gapLength >= 16, 'Bridge gap must be a real span');
+
+      // Starter car top speed (~60.5 m/s) must easily exceed the gap length
+      const starterRange = computeExpectedJumpRangeMeters(validated, 54);
+      assert.ok(
+        starterRange > validated.gapLength + 6,
+        `Starter car range (${starterRange.toFixed(1)}m) must clear gap (${validated.gapLength}m)`
+      );
+
+      // Verify inclined surface on ramp
+      const midRamp = sampleRoadSurfaceAtDistance(
+        (jump.rampStartDist + jump.rampEndDist) * 0.5,
+        course.bridgeJumps,
+        course.tunnels
+      );
+      assert.equal(midRamp.isOnTakeoffRamp, true);
+      assert.ok(midRamp.groundY > 0.8 && midRamp.groundY < jump.rampPeakHeight);
+      assert.ok(midRamp.slopePitchRad > 0.08);
+
+      // Verify physically open gap across (gapStartDist, gapEndDist)
+      const midGap = sampleRoadSurfaceAtDistance(
+        (jump.gapStartDist + jump.gapEndDist) * 0.5,
+        course.bridgeJumps,
+        course.tunnels
+      );
+      assert.equal(midGap.isOverOpenGap, true);
+      assert.ok(midGap.groundY <= -10, 'Open bridge gap must drop down into chasm');
+
+      // Verify no course obstacles block the takeoff ramp, gap, or landing zone
+      const blockingObs = course.obstacles.filter(
+        (o) =>
+          o.distanceMeters >= jump.rampStartDist - 25 &&
+          o.distanceMeters <= jump.landingEndDist + 15
+      );
+      assert.equal(
+        blockingObs.length,
+        0,
+        'Takeoff ramp, open gap, and landing deck must be clear of obstacles'
+      );
+    }
+  }
+
+  // 3. Test Vehicle Takeoff -> Airborne Flight -> Safe Landing at Valid Speed
+  const course1 = generateLevelCourse(1);
+  const jump1 = course1.bridgeJumps[0];
+  let dist = jump1.rampStartDist - 5;
+  let y = 0;
+  let vy = 0;
+  let pitchRad = 0;
+  let isAirborne = false;
+  let activeJumpId: number | null = null;
+  const validSpeedMs = 52; // ~187 km/h (achievable by starter car)
+  const dt = 0.025;
+
+  let sawTakeoff = false;
+  let sawAirborneOverGap = false;
+  let sawLanding = false;
+  let sawFailedJump = false;
+
+  while (dist < jump1.landingEndDist) {
+    const nextDist = dist + validSpeedMs * dt;
+    const step = stepVehicleJumpPhysics({
+      prevDistanceMeters: dist,
+      nextDistanceMeters: nextDist,
+      speedMs: validSpeedMs,
+      y,
+      vy,
+      pitchRad,
+      isAirborne,
+      activeJumpId,
+      bridgeJumps: course1.bridgeJumps,
+      tunnels: course1.tunnels,
+      dt,
+    });
+    dist = nextDist;
+    y = step.y;
+    vy = step.vy;
+    pitchRad = step.pitchRad;
+    isAirborne = step.isAirborne;
+    activeJumpId = step.activeJumpId;
+
+    if (step.justTookOff) sawTakeoff = true;
+    if (isAirborne && dist > jump1.gapStartDist + 2 && dist < jump1.gapEndDist - 2) {
+      sawAirborneOverGap = true;
+      assert.ok(y > 1.5, 'Vehicle must be airborne well above road datum over the open gap');
+    }
+    if (step.justLanded) sawLanding = true;
+    if (step.justFailedJump) sawFailedJump = true;
+  }
+
+  assert.equal(sawTakeoff, true, 'Vehicle must trigger takeoff at ramp lip');
+  assert.equal(sawAirborneOverGap, true, 'Vehicle must fly across open bridge gap');
+  assert.equal(sawLanding, true, 'Vehicle must land safely on receiving platform');
+  assert.equal(sawFailedJump, false, 'Valid approach speed must not fail jump');
+  assert.equal(isAirborne, false, 'Vehicle must return to grounded state after landing');
+
+  // 4. Test Deliberate Failed Jump when Speed is Too Slow
+  dist = jump1.rampStartDist - 2;
+  y = 0;
+  vy = 0;
+  pitchRad = 0;
+  isAirborne = false;
+  activeJumpId = null;
+  const slowSpeedMs = 17; // ~61 km/h (heavy braking, well below minRequiredSpeedMs)
+  let failedDetected = false;
+
+  while (dist < jump1.landingEndDist && !failedDetected) {
+    const nextDist = dist + slowSpeedMs * dt;
+    const step = stepVehicleJumpPhysics({
+      prevDistanceMeters: dist,
+      nextDistanceMeters: nextDist,
+      speedMs: slowSpeedMs,
+      y,
+      vy,
+      pitchRad,
+      isAirborne,
+      activeJumpId,
+      bridgeJumps: course1.bridgeJumps,
+      tunnels: course1.tunnels,
+      dt,
+    });
+    dist = nextDist;
+    y = step.y;
+    vy = step.vy;
+    pitchRad = step.pitchRad;
+    isAirborne = step.isAirborne;
+    activeJumpId = step.activeJumpId;
+    if (step.justFailedJump) {
+      failedDetected = true;
+    }
+  }
+  assert.equal(failedDetected, true, 'Insufficient speed must trigger failed-jump detection');
+
+  // 5. Verify all 5 AI Opponents successfully jump the broken bridge and continue racing
+  const aiRacers = createLevelAiOpponents(1, 62);
+  for (const ai of aiRacers) {
+    ai.distanceMeters = jump1.approachStartDist;
+    ai.speedMs = 46;
+  }
+  const aibecameAirborne = new Set<string>();
+  let elapsed = 0;
+  for (let s = 0; s < 220; s++) {
+    elapsed += dt;
+    for (const ai of aiRacers) {
+      stepAiOpponent({
+        ai,
+        allOpponents: aiRacers,
+        playerX: -1.8,
+        playerDist: jump1.approachStartDist + elapsed * 48,
+        course: course1,
+        elapsedRaceSec: elapsed,
+        dt,
+      });
+      if (ai.isAirborne && ai.y > 1.5) {
+        aibecameAirborne.add(ai.id);
+      }
+    }
+  }
+  assert.equal(
+    aibecameAirborne.size,
+    5,
+    'All 5 AI opponents must become airborne across the broken-bridge jump'
+  );
+  for (const ai of aiRacers) {
+    assert.ok(
+      ai.distanceMeters > jump1.gapEndDist + 20,
+      `AI ${ai.driverName} must land on the receiving bridge section and continue racing`
+    );
+    assert.equal(ai.isAirborne, false, `AI ${ai.driverName} must be grounded after landing`);
+  }
+});
+
 

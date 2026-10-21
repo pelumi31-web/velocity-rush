@@ -25,6 +25,9 @@ import {
 } from '../game/rules';
 import {
   AiOpponentState,
+  BRIDGE_JUMP_COIN_BONUS,
+  BRIDGE_JUMP_SCORE_BONUS,
+  BrokenBridgeJumpSpec,
   calculateLevelRaceRewards,
   computeCurvedRoadCenterAtWorldZ,
   computeRaceStandings,
@@ -36,18 +39,26 @@ import {
   PLAYER_GRID_START_DIST,
   PLAYER_GRID_START_X,
   RacerStandingEntry,
+  sampleRoadSurfaceAtDistance,
   sampleTrackAtDistance,
   stepAiOpponent,
+  stepVehicleJumpPhysics,
+  TunnelSectionSpec,
+  validateBridgeJumpSpec,
 } from '../game/levelsMode';
 import { CarCustomizationState, createDefaultCarCustomization } from '../game/saveSystem';
 import { soundController } from '../game/audio';
 import {
   applyCarCustomizationToRig,
+  BrokenBridgeJumpMeshRig,
+  buildBrokenBridgeJumpMeshRig,
   buildCoinCollectibleMesh,
   buildLevelObstacleMesh,
   buildPlayerCarMesh,
   buildStartFinishGantryMesh,
   buildTrafficVehicleMesh,
+  buildTunnelInteriorBayMesh,
+  buildTunnelPortalMesh,
   createCityBuildingTexture,
   createRoadTextures,
   createSkyBackdropTexture,
@@ -88,6 +99,8 @@ export interface LiveRaceSnapshot {
   totalRacers?: number;    // 6
   isDrifting?: boolean;
   driftScore?: number;
+  isAirborne?: boolean;
+  isInsideTunnel?: boolean;
 }
 
 export interface CompletedRunPayload {
@@ -172,6 +185,7 @@ interface PooledCoinItem {
   mesh: THREE.Group;
   active: boolean;
   x: number;
+  y: number;
   z: number;
 }
 
@@ -259,24 +273,24 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
 
     const scene = new THREE.Scene();
     scene.background = createSkyBackdropTexture();
-    // Clean, consistent distance depth cue without any weather fog
-    scene.fog = new THREE.FogExp2(0x111a2e, 0.0038);
+    // Clean distance depth cue without any weather fog
+    scene.fog = new THREE.FogExp2(0x111a2e, 0.0034);
 
     const pmremGenerator = new THREE.PMREMGenerator(renderer);
     scene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
-    scene.environmentIntensity = 0.88;
+    scene.environmentIntensity = 0.92;
 
     const camera = new THREE.PerspectiveCamera(
       58,
       (container.clientWidth || window.innerWidth) /
         Math.max(1, container.clientHeight || window.innerHeight),
       0.2,
-      280
+      290
     );
     camera.position.set(0, 3.1, 6.8);
 
-    // Clear, consistent lighting
-    const hemiLight = new THREE.HemisphereLight(0xdbeafe, 0x1e293b, 1.38);
+    // Clear, consistent outdoor & tunnel lighting
+    const hemiLight = new THREE.HemisphereLight(0xdbeafe, 0x1e293b, 1.42);
     scene.add(hemiLight);
 
     const sunLight = new THREE.DirectionalLight(0xfffbeb, 2.5);
@@ -299,13 +313,19 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
     rimLight.position.set(-18, 12, -24);
     scene.add(rimLight);
 
-    // Deformable Segmented Road & Barrier Geometry for True U-Shaped Curves & Hairpins
+    // Managed Warm-White Tunnel Illumination PointLights (active when approaching or inside a tunnel)
+    const tunnelLightNear = new THREE.PointLight(0xfffbeb, 0, 58, 1.1);
+    const tunnelLightAhead = new THREE.PointLight(0xfef3c7, 0, 68, 1.1);
+    scene.add(tunnelLightNear, tunnelLightAhead);
+
+    // Deformable High-Resolution Segmented Road & Barrier Geometry
+    // Supports U-Shaped Curves, Inclined Takeoff Ramps, and Physically Open Bridge Gaps!
     const maxAniso = Math.min(8, renderer.capabilities.getMaxAnisotropy());
     const { albedoMap, roughnessMap } = createRoadTextures(maxAniso);
     albedoMap.repeat.set(1, 20);
     roughnessMap.repeat.set(1, 20);
 
-    const roadZSegments = 56;
+    const roadZSegments = 128;
     const roadLength = 320;
     const roadCenterZ = -110;
     const roadGeo = new THREE.PlaneGeometry(HIGHWAY_CONFIG.roadWidth, roadLength, 1, roadZSegments);
@@ -314,16 +334,18 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
 
     const roadPosAttr = roadGeo.attributes.position as THREE.BufferAttribute;
     const roadBaseX = new Float32Array(roadPosAttr.count);
+    const roadBaseY = new Float32Array(roadPosAttr.count);
     const roadBaseZ = new Float32Array(roadPosAttr.count);
     for (let i = 0; i < roadPosAttr.count; i++) {
       roadBaseX[i] = roadPosAttr.getX(i);
+      roadBaseY[i] = roadPosAttr.getY(i);
       roadBaseZ[i] = roadPosAttr.getZ(i);
     }
 
     const roadMat = new THREE.MeshStandardMaterial({
       map: albedoMap,
       roughnessMap,
-      roughness: 0.72,
+      roughness: 0.68,
       metalness: 0.14,
     });
     const roadMesh = new THREE.Mesh(roadGeo, roadMat);
@@ -335,10 +357,9 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       new THREE.MeshStandardMaterial({ color: 0x0b101d, roughness: 0.95 })
     );
     groundPlane.rotation.x = -Math.PI / 2;
-    groundPlane.position.set(0, -0.06, -120);
+    groundPlane.position.set(0, -12.5, -120);
     scene.add(groundPlane);
 
-    // Segmented Barriers & Neon Strips that follow the curved road geometry
     function createCurvableWallMesh(
       width: number,
       height: number,
@@ -350,14 +371,16 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       geo.translate(baseXOffset, baseYOffset, roadCenterZ);
       const pos = geo.attributes.position as THREE.BufferAttribute;
       const origX = new Float32Array(pos.count);
+      const origY = new Float32Array(pos.count);
       const origZ = new Float32Array(pos.count);
       for (let i = 0; i < pos.count; i++) {
         origX[i] = pos.getX(i);
+        origY[i] = pos.getY(i);
         origZ[i] = pos.getZ(i);
       }
       const mesh = new THREE.Mesh(geo, material);
       scene.add(mesh);
-      return { geo, pos, origX, origZ, mesh };
+      return { geo, pos, origX, origY, origZ, mesh };
     }
 
     const barrierMat = new THREE.MeshStandardMaterial({
@@ -450,16 +473,32 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
     const lampHeadsInst = new THREE.InstancedMesh(lampHeadGeo, lampHeadMat, archCount * 2);
     scene.add(lampHeadsInst);
 
-    // Overhead Tunnel Ceiling Rings for Levels Mode Tunnel Segments
-    const tunnelRingCount = 14;
-    const tunnelRoofGeo = new THREE.BoxGeometry(HIGHWAY_CONFIG.roadWidth + 1.5, 0.55, 6.5);
-    const tunnelRoofMat = new THREE.MeshStandardMaterial({
-      color: 0x0f172a,
-      roughness: 0.65,
-      metalness: 0.4,
-    });
-    const tunnelRoofInst = new THREE.InstancedMesh(tunnelRoofGeo, tunnelRoofMat, tunnelRingCount);
-    scene.add(tunnelRoofInst);
+    // FEATURE 1: Realistic Illuminated Highway Tunnel Portals & Modular 10m Interior Bays
+    const tunnelEntrancePortal = buildTunnelPortalMesh(true);
+    tunnelEntrancePortal.visible = false;
+    scene.add(tunnelEntrancePortal);
+
+    const tunnelExitPortal = buildTunnelPortalMesh(false);
+    tunnelExitPortal.visible = false;
+    scene.add(tunnelExitPortal);
+
+    const maxTunnelBays = 22;
+    const tunnelBaysPool: THREE.Group[] = [];
+    for (let i = 0; i < maxTunnelBays; i++) {
+      const bay = buildTunnelInteriorBayMesh();
+      bay.visible = false;
+      scene.add(bay);
+      tunnelBaysPool.push(bay);
+    }
+
+    // FEATURE 2: Broken-Bridge & Angled Takeoff Ramp 3D Rigs Pool
+    const bridgeJumpRigsPool: BrokenBridgeJumpMeshRig[] = [
+      buildBrokenBridgeJumpMeshRig(),
+      buildBrokenBridgeJumpMeshRig(),
+    ];
+    for (const rig of bridgeJumpRigsPool) {
+      scene.add(rig.rootGroup);
+    }
 
     const buildingTex = createCityBuildingTexture(maxAniso);
     const towerCount = 48;
@@ -502,7 +541,6 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
         propsRef.current.carCustomizations?.[cId] ?? createDefaultCarCustomization();
       applyCarCustomizationToRig(rig, CAR_CONFIGS[cId], initCust);
 
-      // Measure actual 3D bounds of the vehicle (excluding the invisible shield bubble)
       rig.shieldBubble.visible = false;
       rig.group.updateMatrixWorld(true);
       _bbox.setFromObject(rig.bodyGroup);
@@ -549,7 +587,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
     }
 
     const coinPool: PooledCoinItem[] = [];
-    for (let i = 0; i < 26; i++) {
+    for (let i = 0; i < 32; i++) {
       const mesh = buildCoinCollectibleMesh();
       mesh.visible = false;
       scene.add(mesh);
@@ -557,6 +595,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
         mesh,
         active: false,
         x: 0,
+        y: 0.9,
         z: -200,
       });
     }
@@ -592,7 +631,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       levelObstaclePool.push({ mesh, type: hType });
     }
 
-    // Particle Pool (sparks, drift tyre smoke, nitro exhaust, coin pickup bursts)
+    // Particle Pool (sparks, drift tyre smoke, nitro exhaust, coin pickup bursts, jump touchdown bursts)
     const maxParticles = 60;
     const particleGeo = new THREE.BoxGeometry(0.14, 0.14, 0.42);
     const particleMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
@@ -669,6 +708,15 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       nitroAmount: 1.0,
       isNitroActive: false,
       playerX: PLAYER_GRID_START_X,
+      playerY: 0,
+      playerVy: 0,
+      playerPitchRad: 0,
+      isAirborne: false,
+      activeJumpId: null as number | null,
+      landingBounceTimer: 0,
+      completedJumpIds: new Set<number>(),
+      isInsideTunnel: false,
+      tunnelProximity01: 0,
       lateralVelocity: 0,
       filteredTiltSteer: 0,
       invulnerableTimer: 0,
@@ -701,7 +749,79 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       elapsedRaceSec: 0,
       playerPosition: 1,
       lastSegmentLabel: 'Starting Grid',
+      // Solo Mode endless procedural Tunnels & Broken-Bridge Jumps
+      soloTunnels: [] as TunnelSectionSpec[],
+      soloBridgeJumps: [] as BrokenBridgeJumpSpec[],
+      soloNextFeatureDist: 160,
+      soloFeatureIdCounter: 1,
     };
+
+    function spawnSoloJumpCoinArc(jump: BrokenBridgeJumpSpec, currentPlayerDist: number) {
+      const steps = 5;
+      for (let s = 0; s < steps; s++) {
+        const coinItem = coinPool.find((item) => !item.active);
+        if (!coinItem) break;
+        const frac = s / (steps - 1);
+        const worldDist = jump.rampEndDist - 2 + frac * (jump.gapLength + 6);
+        const relZ = -(worldDist - currentPlayerDist);
+        const arcY = jump.rampPeakHeight + Math.sin(frac * Math.PI) * 1.9 + 0.65;
+        coinItem.active = true;
+        coinItem.x = HIGHWAY_CONFIG.laneCenters[s % 2 === 0 ? 1 : 2];
+        coinItem.y = arcY;
+        coinItem.z = relZ;
+        coinItem.mesh.position.set(coinItem.x, coinItem.y, coinItem.z);
+        coinItem.mesh.visible = true;
+      }
+    }
+
+    function ensureSoloTrackFeaturesAhead(currentDist: number) {
+      // Prune passed Solo features > 140m behind player
+      sim.soloTunnels = sim.soloTunnels.filter((t) => t.endDist > currentDist - 140);
+      sim.soloBridgeJumps = sim.soloBridgeJumps.filter((j) => j.landingEndDist > currentDist - 140);
+
+      while (sim.soloNextFeatureDist < currentDist + 750) {
+        const idx = sim.soloFeatureIdCounter++;
+        if (idx % 2 === 1) {
+          // Spawn a validated Solo Mode Broken-Bridge Jump
+          const rampStartDist = sim.soloNextFeatureDist + 45;
+          const rampLength = 22;
+          const gapLength = Math.min(25, 18 + Math.floor(idx / 3) * 1.5);
+          const rampPeakHeight = 2.45;
+          const spec = validateBridgeJumpSpec({
+            id: idx,
+            label: 'Viaduct Broken-Bridge Jump',
+            approachStartDist: sim.soloNextFeatureDist,
+            rampStartDist,
+            rampEndDist: rampStartDist + rampLength,
+            rampLength,
+            rampPeakHeight,
+            rampAngleRad: Math.atan2(rampPeakHeight, rampLength),
+            gapStartDist: rampStartDist + rampLength,
+            gapEndDist: rampStartDist + rampLength + gapLength,
+            gapLength,
+            landingStartDist: rampStartDist + rampLength + gapLength,
+            landingEndDist: rampStartDist + rampLength + gapLength + 44,
+            landingLength: 44,
+            landingHeightOffset: 0.2,
+            minRequiredSpeedMs: 28.5,
+          });
+          sim.soloBridgeJumps.push(spec);
+          sim.soloNextFeatureDist = spec.landingEndDist + 150;
+        } else {
+          // Spawn an Illuminated Solo Mode Highway Tunnel
+          const startDist = sim.soloNextFeatureDist + 20;
+          const length = 165;
+          sim.soloTunnels.push({
+            id: idx,
+            startDist,
+            endDist: startDist + length,
+            length,
+            label: 'Metro Illuminated Tunnel',
+          });
+          sim.soloNextFeatureDist = startDist + length + 160;
+        }
+      }
+    }
 
     function syncLiveHudSnapshot(
       banner?: { text: string; subtext: string; tone: 'cyan' | 'amber' | 'danger' }
@@ -724,6 +844,8 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
         totalRacers: 6,
         isDrifting: sim.isDrifting,
         driftScore: Math.floor(sim.driftScore),
+        isAirborne: sim.isAirborne,
+        isInsideTunnel: sim.isInsideTunnel,
       });
     }
 
@@ -742,15 +864,25 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       }
     }
 
+    /**
+     * Deforms the 3D road mesh and side barriers both laterally (for U-turns/hairpins)
+     * and vertically (for inclined takeoff ramps, open bridge gaps, and elevated landing decks).
+     */
     function updateRoadAndBarrierGeometry(
       course: GeneratedLevelCourse | null,
-      playerDistanceMeters: number
+      playerDistanceMeters: number,
+      activeJumps: BrokenBridgeJumpSpec[],
+      activeTunnels: TunnelSectionSpec[]
     ) {
       for (let i = 0; i < roadPosAttr.count; i++) {
         const bz = roadBaseZ[i];
         const bx = roadBaseX[i];
+        const by = roadBaseY[i];
+        const worldDist = playerDistanceMeters - bz;
         const { xOffset } = computeCurvedRoadCenterAtWorldZ(course, playerDistanceMeters, bz);
+        const surf = sampleRoadSurfaceAtDistance(worldDist, activeJumps, activeTunnels);
         roadPosAttr.setX(i, bx + xOffset);
+        roadPosAttr.setY(i, by + surf.groundY);
       }
       roadPosAttr.needsUpdate = true;
 
@@ -758,10 +890,188 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
         for (let i = 0; i < wall.pos.count; i++) {
           const bz = wall.origZ[i];
           const bx = wall.origX[i];
+          const by = wall.origY[i];
+          const worldDist = playerDistanceMeters - bz;
           const { xOffset } = computeCurvedRoadCenterAtWorldZ(course, playerDistanceMeters, bz);
+          const surf = sampleRoadSurfaceAtDistance(worldDist, activeJumps, activeTunnels);
           wall.pos.setX(i, bx + xOffset);
+          wall.pos.setY(i, by + surf.groundY);
         }
         wall.pos.needsUpdate = true;
+      }
+    }
+
+    /**
+     * Updates 3D Tunnel Portals, Modular 10m Illuminated Tunnel Interior Bays,
+     * and Broken-Bridge Takeoff Ramp / Chasm / Landing Deck 3D Rigs.
+     */
+    function updateTunnelsAndBridges3D(
+      course: GeneratedLevelCourse | null,
+      playerDistanceMeters: number,
+      activeJumps: BrokenBridgeJumpSpec[],
+      activeTunnels: TunnelSectionSpec[],
+      isTitleOrGarage: boolean
+    ) {
+      if (isTitleOrGarage) {
+        tunnelEntrancePortal.visible = false;
+        tunnelExitPortal.visible = false;
+        for (const bay of tunnelBaysPool) bay.visible = false;
+        for (const rig of bridgeJumpRigsPool) rig.rootGroup.visible = false;
+        tunnelLightNear.intensity = 0;
+        tunnelLightAhead.intensity = 0;
+        hemiLight.intensity = 1.42;
+        renderer.toneMappingExposure = 1.18;
+        return;
+      }
+
+      // 1. Update Illuminated Tunnels (Entrance Portal, 10m Interior Bays, Exit Portal, & Bright Lighting)
+      const visibleTunnel = activeTunnels.find(
+        (t) => t.endDist >= playerDistanceMeters - 35 && t.startDist <= playerDistanceMeters + 230
+      );
+
+      let bayUsed = 0;
+      if (visibleTunnel) {
+        const startRelZ = -(visibleTunnel.startDist - playerDistanceMeters);
+        const endRelZ = -(visibleTunnel.endDist - playerDistanceMeters);
+
+        if (startRelZ > -235 && startRelZ < 30) {
+          const c = computeCurvedRoadCenterAtWorldZ(course, playerDistanceMeters, startRelZ);
+          tunnelEntrancePortal.visible = true;
+          tunnelEntrancePortal.position.set(c.xOffset, 0, startRelZ);
+          tunnelEntrancePortal.rotation.y = -c.headingRad * 0.65;
+        } else {
+          tunnelEntrancePortal.visible = false;
+        }
+
+        if (endRelZ > -235 && endRelZ < 30) {
+          const c = computeCurvedRoadCenterAtWorldZ(course, playerDistanceMeters, endRelZ);
+          tunnelExitPortal.visible = true;
+          tunnelExitPortal.position.set(c.xOffset, 0, endRelZ);
+          tunnelExitPortal.rotation.y = -c.headingRad * 0.65;
+        } else {
+          tunnelExitPortal.visible = false;
+        }
+
+        const bayStep = 10.0;
+        for (
+          let d = visibleTunnel.startDist + 5;
+          d <= visibleTunnel.endDist - 4 && bayUsed < tunnelBaysPool.length;
+          d += bayStep
+        ) {
+          const relZ = -(d - playerDistanceMeters);
+          if (relZ > -230 && relZ < 24) {
+            const bay = tunnelBaysPool[bayUsed++];
+            const c = computeCurvedRoadCenterAtWorldZ(course, playerDistanceMeters, relZ);
+            bay.visible = true;
+            bay.position.set(c.xOffset, 0, relZ);
+            bay.rotation.y = -c.headingRad * 0.65;
+          }
+        }
+      } else {
+        tunnelEntrancePortal.visible = false;
+        tunnelExitPortal.visible = false;
+      }
+      for (let i = bayUsed; i < tunnelBaysPool.length; i++) {
+        tunnelBaysPool[i].visible = false;
+      }
+
+      // Smoothly boost warm-white illumination inside and approaching tunnels so it is NEVER dark
+      const prox = sim.tunnelProximity01;
+      hemiLight.intensity = 1.42 + prox * 0.85;
+      renderer.toneMappingExposure = 1.18 + prox * 0.22;
+      roadMat.roughness = 0.68 - prox * 0.16;
+
+      if (prox > 0.02 || visibleTunnel) {
+        const nearZ = -12;
+        const aheadZ = -42;
+        const cNear = computeCurvedRoadCenterAtWorldZ(course, playerDistanceMeters, nearZ);
+        const cAhead = computeCurvedRoadCenterAtWorldZ(course, playerDistanceMeters, aheadZ);
+        tunnelLightNear.position.set(cNear.xOffset, 5.4, nearZ);
+        tunnelLightAhead.position.set(cAhead.xOffset, 5.4, aheadZ);
+        tunnelLightNear.intensity = 3.8 * Math.max(0.35, prox);
+        tunnelLightAhead.intensity = 4.2 * Math.max(0.35, prox);
+      } else {
+        tunnelLightNear.intensity = 0;
+        tunnelLightAhead.intensity = 0;
+      }
+
+      // 2. Update Broken-Bridge & Angled Takeoff Ramp Rigs
+      let jumpRigIdx = 0;
+      for (let i = 0; i < activeJumps.length && jumpRigIdx < bridgeJumpRigsPool.length; i++) {
+        const jump = activeJumps[i];
+        if (
+          jump.landingEndDist < playerDistanceMeters - 45 ||
+          jump.approachStartDist > playerDistanceMeters + 235
+        ) {
+          continue;
+        }
+
+        const rig = bridgeJumpRigsPool[jumpRigIdx++];
+        const lipRelZ = -(jump.rampEndDist - playerDistanceMeters);
+        const lipCenter = computeCurvedRoadCenterAtWorldZ(course, playerDistanceMeters, lipRelZ);
+
+        rig.rootGroup.visible = true;
+        rig.rootGroup.position.set(lipCenter.xOffset, 0, lipRelZ);
+        rig.rootGroup.rotation.y = -lipCenter.headingRad * 0.65;
+
+        // Configure Inclined Takeoff Ramp (local z from +rampLength down to 0, y from 0 up to +rampPeakHeight)
+        const hypLen = Math.hypot(jump.rampLength, jump.rampPeakHeight);
+        rig.takeoffRampMesh.scale.set(1, 1, hypLen);
+        rig.takeoffRampMesh.position.set(
+          0,
+          jump.rampPeakHeight * 0.5 - 0.16,
+          jump.rampLength * 0.5
+        );
+        // Positive rotation around X raises the forward (-Z) lip and lowers the rear (+Z) base
+        rig.takeoffRampMesh.rotation.x = jump.rampAngleRad;
+
+        const halfRoad = HIGHWAY_CONFIG.roadWidth * 0.5;
+        rig.leftRampGirder.scale.set(1, 1, hypLen);
+        rig.leftRampGirder.position.set(
+          -(halfRoad + 0.36),
+          jump.rampPeakHeight * 0.5 + 0.36,
+          jump.rampLength * 0.5
+        );
+        rig.leftRampGirder.rotation.x = jump.rampAngleRad;
+
+        rig.rightRampGirder.scale.set(1, 1, hypLen);
+        rig.rightRampGirder.position.set(
+          halfRoad + 0.36,
+          jump.rampPeakHeight * 0.5 + 0.36,
+          jump.rampLength * 0.5
+        );
+        rig.rightRampGirder.rotation.x = jump.rampAngleRad;
+
+        // Broken Takeoff Lip & Exposed Steel I-Beams at local z = 0, y = rampPeakHeight
+        rig.brokenTakeoffEdgeGroup.position.set(0, jump.rampPeakHeight, 0);
+
+        // Open Chasm Floor & Piers spanning local z = 0 .. -gapLength
+        rig.chasmFloorMesh.scale.set(1, 1, jump.gapLength + 8);
+        rig.chasmFloorMesh.position.set(0, -11.8, -jump.gapLength * 0.5);
+        rig.chasmPiersGroup.position.set(0, 0, -jump.gapLength);
+
+        // Receiving Bridge Apron & Landing Deck spanning local z = -gapLength .. -(gapLength + landingLength)
+        rig.landingApronMesh.position.set(
+          0,
+          jump.landingHeightOffset - 0.28,
+          -jump.gapLength + 0.75
+        );
+        rig.landingApronMesh.rotation.x = -0.25;
+
+        rig.landingDeckMesh.scale.set(1, 1, jump.landingLength);
+        rig.landingDeckMesh.position.set(
+          0,
+          jump.landingHeightOffset * 0.5 - 0.16,
+          -(jump.gapLength + jump.landingLength * 0.5)
+        );
+        rig.landingDeckMesh.rotation.x =
+          jump.landingHeightOffset > 0.05
+            ? -Math.atan2(jump.landingHeightOffset, jump.landingLength)
+            : 0;
+      }
+
+      for (let i = jumpRigIdx; i < bridgeJumpRigsPool.length; i++) {
+        bridgeJumpRigsPool[i].rootGroup.visible = false;
       }
     }
 
@@ -788,12 +1098,23 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
         currentProt
       );
 
+      // Optional URL startDist override for automated testing/verification
+      let initialDist = PLAYER_GRID_START_DIST;
+      let skipCountdown = false;
+      if (typeof window !== 'undefined') {
+        const params = new URLSearchParams(window.location.search);
+        const startDistParam = Number(params.get('startDist'));
+        if (Number.isFinite(startDistParam) && startDistParam > 0) {
+          initialDist = startDistParam;
+          skipCountdown = true;
+        }
+      }
+
       sim.runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
       sim.runEndedFired = false;
-      // Stationary during 3 -> 2 -> 1 countdown; released on GO!
-      sim.speedMs = 0;
-      sim.topSpeedReachedKmh = 0;
-      sim.distanceMeters = PLAYER_GRID_START_DIST;
+      sim.speedMs = skipCountdown ? effStats.topSpeedMs * 0.85 : 0;
+      sim.topSpeedReachedKmh = skipCountdown ? Math.round(sim.speedMs * 3.6) : 0;
+      sim.distanceMeters = initialDist;
       sim.coinsCollected = 0;
       sim.nearMissCount = 0;
       sim.bonusScore = 0;
@@ -806,15 +1127,24 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       sim.nitroAmount = 1.0;
       sim.isNitroActive = false;
       sim.playerX = PLAYER_GRID_START_X;
+      sim.playerY = 0;
+      sim.playerVy = 0;
+      sim.playerPitchRad = 0;
+      sim.isAirborne = false;
+      sim.activeJumpId = null;
+      sim.landingBounceTimer = 0;
+      sim.completedJumpIds.clear();
+      sim.isInsideTunnel = false;
+      sim.tunnelProximity01 = 0;
       sim.lateralVelocity = 0;
       sim.filteredTiltSteer = 0;
       sim.invulnerableTimer = 0;
       sim.shieldFlashTimer = 0;
       sim.hitstopTimer = 0;
       sim.cameraTrauma = 0;
-      sim.countdownTimer = 2.4;
-      sim.lastCountdownInt = 3;
-      sim.raceReleasedGo = false;
+      sim.countdownTimer = skipCountdown ? -1.0 : 2.4;
+      sim.lastCountdownInt = skipCountdown ? null : 3;
+      sim.raceReleasedGo = skipCountdown;
       sim.trafficSpawnTimer = 0.6;
       sim.coinSpawnTimer = 0.8;
       sim.visualCurveFactor = 0;
@@ -823,6 +1153,11 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       sim.defeatDelayTimer = 0;
       sim.elapsedRaceSec = 0;
       sim.playerPosition = 1;
+
+      sim.soloTunnels = [];
+      sim.soloBridgeJumps = [];
+      sim.soloNextFeatureDist = 140;
+      sim.soloFeatureIdCounter = 1;
 
       for (const t of trafficPool) {
         t.active = false;
@@ -844,16 +1179,47 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
         const lvl = propsRef.current.levelNumber ?? 1;
         sim.activeCourse = generateLevelCourse(lvl);
         sim.aiOpponents = createLevelAiOpponents(lvl, effStats.topSpeedMs);
+        if (skipCountdown) {
+          for (let idx = 0; idx < sim.aiOpponents.length; idx++) {
+            sim.aiOpponents[idx].distanceMeters = initialDist - idx * 3.5;
+            sim.aiOpponents[idx].speedMs = sim.aiOpponents[idx].baseTopSpeedMs * 0.85;
+          }
+        }
         sim.lastSegmentLabel = sim.activeCourse.segments[0]?.label ?? 'Starting Grid';
         rebuildAiOpponentMeshes(sim.aiOpponents);
-        updateRoadAndBarrierGeometry(sim.activeCourse, 0);
+        updateRoadAndBarrierGeometry(
+          sim.activeCourse,
+          sim.distanceMeters,
+          sim.activeCourse.bridgeJumps,
+          sim.activeCourse.tunnels
+        );
+        updateTunnelsAndBridges3D(
+          sim.activeCourse,
+          sim.distanceMeters,
+          sim.activeCourse.bridgeJumps,
+          sim.activeCourse.tunnels,
+          false
+        );
       } else {
         for (const rig of aiOpponentRigs) {
           rig.group.visible = false;
         }
         startGantryMesh.visible = false;
         finishGantryMesh.visible = false;
-        updateRoadAndBarrierGeometry(null, 0);
+        ensureSoloTrackFeaturesAhead(sim.distanceMeters);
+        updateRoadAndBarrierGeometry(
+          null,
+          sim.distanceMeters,
+          sim.soloBridgeJumps,
+          sim.soloTunnels
+        );
+        updateTunnelsAndBridges3D(
+          null,
+          sim.distanceMeters,
+          sim.soloBridgeJumps,
+          sim.soloTunnels,
+          false
+        );
       }
 
       // Reset DOM HUD elements immediately to clean 0 state
@@ -886,7 +1252,23 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       sim.shieldFlashTimer = 0.7;
       sim.isDying = false;
       sim.defeatDelayTimer = 0;
-      sim.speedMs = Math.max(sim.speedMs, 26);
+      sim.isAirborne = false;
+      sim.playerY = 0;
+      sim.playerVy = 0;
+      sim.playerPitchRad = 0;
+      sim.speedMs = Math.max(sim.speedMs, 32);
+
+      // If reviving near an open bridge gap, place player safely onto the receiving bridge deck
+      const activeJumps =
+        (propsRef.current.playMode ?? 'solo') === 'levels'
+          ? sim.activeCourse.bridgeJumps
+          : sim.soloBridgeJumps;
+      for (const j of activeJumps) {
+        if (sim.distanceMeters >= j.rampStartDist - 5 && sim.distanceMeters <= j.gapEndDist + 3) {
+          sim.distanceMeters = j.gapEndDist + 5;
+          break;
+        }
+      }
 
       for (const t of trafficPool) {
         if (t.active && t.z > -75 && t.z < 20) {
@@ -1041,7 +1423,6 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
     window.addEventListener('resize', handleResize);
     window.addEventListener('orientationchange', handleResize);
 
-    // Initialize if booting straight into playing
     if (propsRef.current.gameState === 'playing') {
       resetRaceSimulation();
     }
@@ -1224,12 +1605,12 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
           }
         }
 
-        // PRIORITY 6: While countdownTimer > 0 (3, 2, 1), keep all 6 cars stationary on the Starting Grid!
+        // While countdownTimer > 0 (3, 2, 1), keep all 6 cars stationary on the Starting Grid
         if (sim.countdownTimer > 0) {
           sim.speedMs = 0;
           sim.distanceMeters = PLAYER_GRID_START_DIST;
           sim.elapsedRaceSec = 0;
-          playerAnchor.position.x = sim.playerX;
+          playerAnchor.position.set(sim.playerX, 0, 0);
           activeCarRig.bodyGroup.rotation.set(0, 0, 0);
           activeCarRig.taillightMaterial.emissiveIntensity = 3.2;
 
@@ -1328,7 +1709,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
             nitroAmount: sim.nitroAmount,
             isNitroActive: sim.isNitroActive,
             nitroWanted,
-            brakeWanted,
+            brakeWanted: sim.isAirborne ? false : brakeWanted,
             effectiveStats,
             dt,
           });
@@ -1347,7 +1728,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
             sim.topSpeedReachedKmh = currentSpeedKmh;
           }
 
-          // 3. Track Curvature, Centrifugal Force & Controlled Drift Mechanics (Levels Mode)
+          // 3. Track Curvature, Centrifugal Force & Controlled Drift Mechanics
           let currentCurvature = 0;
           if (playMode === 'levels') {
             const sample = sampleTrackAtDistance(sim.activeCourse, sim.distanceMeters);
@@ -1366,17 +1747,20 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
             sim.visualCurveFactor = THREE.MathUtils.damp(sim.visualCurveFactor, 0, 6, dt);
           }
 
-          // Outward centrifugal pull in curves requires active steering into the bend
+          // Outward centrifugal pull in curves (grounded only)
           const centrifugalPull =
-            playMode === 'levels'
+            playMode === 'levels' && !sim.isAirborne
               ? -currentCurvature * Math.max(0, (sim.speedMs - 18) / 44) * 4.6
               : 0;
 
-          const targetLatVel = activeSteerInput * effectiveStats.handling + centrifugalPull;
+          // Limited, understandable mid-air lateral control while airborne (0.48x normal authority)
+          const airControlFactor = sim.isAirborne ? 0.48 : 1.0;
+          const targetLatVel =
+            activeSteerInput * effectiveStats.handling * airControlFactor + centrifugalPull;
           sim.lateralVelocity = THREE.MathUtils.damp(
             sim.lateralVelocity,
             targetLatVel,
-            13.5,
+            sim.isAirborne ? 7.5 : 13.5,
             dt
           );
           sim.playerX = THREE.MathUtils.clamp(
@@ -1385,11 +1769,125 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
             HIGHWAY_CONFIG.playerBoundX
           );
 
-          playerAnchor.position.x = sim.playerX;
+          // 4. Advance Longitudinal Distance & Evaluate Vertical Jump / Tunnel Physics
+          const prevDist = sim.distanceMeters;
+          const stepDist = sim.speedMs * dt;
+          const nextDist = prevDist + stepDist;
+          sim.distanceMeters = nextDist;
+          sim.scrollOffsetZ += stepDist;
 
-          // PRIORITY 7C & 7D: Genuine Controlled Drift Detection & Scoring
-          // Requires active curved road section, moving speed > 28 m/s, steering into the bend,
-          // no active collision/death state, and staying within track boundaries.
+          const activeJumps =
+            playMode === 'levels' ? sim.activeCourse.bridgeJumps : sim.soloBridgeJumps;
+          const activeTunnels =
+            playMode === 'levels' ? sim.activeCourse.tunnels : sim.soloTunnels;
+
+          if (playMode === 'solo') {
+            const prevJumpCount = sim.soloBridgeJumps.length;
+            ensureSoloTrackFeaturesAhead(sim.distanceMeters);
+            if (sim.soloBridgeJumps.length > prevJumpCount) {
+              const newestJump = sim.soloBridgeJumps[sim.soloBridgeJumps.length - 1];
+              spawnSoloJumpCoinArc(newestJump, sim.distanceMeters);
+            }
+          }
+
+          const jumpStep = stepVehicleJumpPhysics({
+            prevDistanceMeters: prevDist,
+            nextDistanceMeters: nextDist,
+            speedMs: sim.speedMs,
+            y: sim.playerY,
+            vy: sim.playerVy,
+            pitchRad: sim.playerPitchRad,
+            isAirborne: sim.isAirborne,
+            activeJumpId: sim.activeJumpId,
+            bridgeJumps: activeJumps,
+            tunnels: activeTunnels,
+            dt,
+          });
+
+          const wasAirborne = sim.isAirborne;
+          const wasInsideTunnel = sim.isInsideTunnel;
+
+          sim.playerY = jumpStep.y;
+          sim.playerVy = jumpStep.vy;
+          sim.playerPitchRad = jumpStep.pitchRad;
+          sim.isAirborne = jumpStep.isAirborne;
+          sim.activeJumpId = jumpStep.activeJumpId;
+          sim.isInsideTunnel = jumpStep.surface.isInsideTunnel;
+          sim.tunnelProximity01 = jumpStep.surface.tunnelProximity01;
+
+          if (sim.landingBounceTimer > 0) {
+            sim.landingBounceTimer = Math.max(0, sim.landingBounceTimer - dt);
+          }
+
+          if (jumpStep.justTookOff) {
+            soundController.playJumpTakeoff();
+            spawnParticleBurst(sim.playerX, sim.playerY + 0.18, 1.5, 12, 0x38bdf8, 6.2);
+            syncLiveHudSnapshot({
+              text: 'AIRBORNE LAUNCH!',
+              subtext: 'Clearing Broken-Bridge Gap',
+              tone: 'cyan',
+            });
+          } else if (jumpStep.justLanded && jumpStep.landedJump) {
+            soundController.playJumpLanding();
+            sim.landingBounceTimer = 0.28;
+            sim.cameraTrauma = Math.min(1, sim.cameraTrauma + 0.26);
+            spawnParticleBurst(sim.playerX - 0.7, 0.18, 0.2, 8, 0x10b981, 6.5);
+            spawnParticleBurst(sim.playerX + 0.7, 0.18, 0.2, 8, 0x38bdf8, 6.5);
+
+            const jId = jumpStep.landedJump.id;
+            if (!sim.completedJumpIds.has(jId)) {
+              sim.completedJumpIds.add(jId);
+              sim.bonusScore += BRIDGE_JUMP_SCORE_BONUS;
+              sim.coinsCollected += BRIDGE_JUMP_COIN_BONUS;
+              sim.nitroAmount = Math.min(1, sim.nitroAmount + 0.22);
+              syncLiveHudSnapshot({
+                text: `BRIDGE JUMP +${BRIDGE_JUMP_SCORE_BONUS}`,
+                subtext: `+${BRIDGE_JUMP_COIN_BONUS} Bonus Coins · +22% Nitro Boost`,
+                tone: 'cyan',
+              });
+            }
+          } else if (jumpStep.justFailedJump && jumpStep.failedJump) {
+            // Deliberate failed-jump handling using the game's shield & crash recovery rules
+            sim.collisionsCount += 1;
+            sim.cleanDriveShieldTimer = 0;
+            sim.isDrifting = false;
+            sim.integrity = Math.max(0, sim.integrity - 1);
+            sim.cameraTrauma = Math.min(1, sim.cameraTrauma + 0.85);
+            sim.shieldFlashTimer = 0.65;
+            spawnParticleBurst(sim.playerX, 0.5, -1.0, 22, 0xef4444, 9.5);
+
+            if (sim.integrity <= 0) {
+              soundController.playCollision(true);
+              sim.hitstopTimer = 0.06;
+              sim.isDying = true;
+              sim.defeatDelayTimer = 0.45;
+              sim.distanceMeters = jumpStep.failedJump.gapEndDist + 2.0;
+              sim.playerY = jumpStep.failedJump.landingHeightOffset;
+              syncLiveHudSnapshot({
+                text: 'BRIDGE JUMP FAILED',
+                subtext: 'Fell Short of Landing Platform · Hull Depleted',
+                tone: 'danger',
+              });
+            } else {
+              soundController.playCollision(false);
+              sim.hitstopTimer = 0.05;
+              sim.invulnerableTimer = Math.max(2.2, effectiveStats.shieldInvulnerabilitySec);
+              sim.distanceMeters = jumpStep.failedJump.gapEndDist + 4.0;
+              sim.playerY = jumpStep.failedJump.landingHeightOffset;
+              sim.speedMs = Math.max(24, sim.speedMs * 0.72);
+              syncLiveHudSnapshot({
+                text: 'JUMP FAILED · SHIELD RECOVERY',
+                subtext: `${sim.integrity}/${sim.maxIntegrity} Shield Charges Remaining`,
+                tone: 'amber',
+              });
+            }
+          } else if (wasAirborne !== sim.isAirborne || wasInsideTunnel !== sim.isInsideTunnel) {
+            syncLiveHudSnapshot();
+          }
+
+          playerAnchor.position.set(sim.playerX, sim.playerY, 0);
+
+          // Controlled Drift Detection & Scoring (grounded only)
           const absCurve = Math.abs(currentCurvature);
           const absSteer = Math.abs(activeSteerInput);
           const steeringIntoCurve =
@@ -1399,6 +1897,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
 
           sim.isDrifting =
             playMode === 'levels' &&
+            !sim.isAirborne &&
             absCurve >= 0.34 &&
             sim.speedMs > 28 &&
             absSteer >= 0.32 &&
@@ -1416,15 +1915,15 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
               sim.driftAudioCooldown = 0.24;
             }
             if (Math.random() < 0.72) {
-              spawnParticleBurst(sim.playerX - 0.7, 0.15, 1.35, 1, 0xf59e0b, 3.2);
-              spawnParticleBurst(sim.playerX + 0.7, 0.15, 1.35, 1, 0x38bdf8, 3.2);
+              spawnParticleBurst(sim.playerX - 0.7, sim.playerY + 0.15, 1.35, 1, 0xf59e0b, 3.2);
+              spawnParticleBurst(sim.playerX + 0.7, sim.playerY + 0.15, 1.35, 1, 0x38bdf8, 3.2);
             }
           }
           if (wasDrifting !== sim.isDrifting) {
             syncLiveHudSnapshot();
           }
 
-          // Chassis roll, yaw (controlled slip angle when drifting), pitch, brake lights & wheels
+          // Chassis roll, yaw, ramp/airborne pitch, landing suspension bounce, brake lights & wheels
           const normSteer = THREE.MathUtils.clamp(
             sim.lateralVelocity / Math.max(1, effectiveStats.handling),
             -1,
@@ -1433,6 +1932,12 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
           const driftYawBonus = sim.isDrifting
             ? -Math.sign(activeSteerInput || currentCurvature) * 0.15
             : 0;
+          const suspensionPitch =
+            sim.landingBounceTimer > 0
+              ? Math.sin((sim.landingBounceTimer / 0.28) * Math.PI * 2) * -0.048
+              : 0;
+          const throttlePitch = sim.isNitroActive ? 0.035 : brakeWanted && !sim.isAirborne ? -0.035 : 0;
+
           activeCarRig.bodyGroup.rotation.z = THREE.MathUtils.damp(
             activeCarRig.bodyGroup.rotation.z,
             -normSteer * 0.14,
@@ -1447,8 +1952,8 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
           );
           activeCarRig.bodyGroup.rotation.x = THREE.MathUtils.damp(
             activeCarRig.bodyGroup.rotation.x,
-            sim.isNitroActive ? -0.038 : brakeWanted ? 0.035 : 0,
-            14,
+            sim.playerPitchRad + throttlePitch + suspensionPitch,
+            15,
             dt
           );
 
@@ -1466,7 +1971,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
           }
 
           if (sim.isNitroActive && Math.random() < 0.65) {
-            spawnParticleBurst(sim.playerX, 0.3, 2.35, 1, 0x38bdf8, 4.0);
+            spawnParticleBurst(sim.playerX, sim.playerY + 0.3, 2.35, 1, 0x38bdf8, 4.0);
           }
 
           if (sim.invulnerableTimer > 0) {
@@ -1481,7 +1986,6 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
               sim.invulnerableTimer > 0 ? 0.22 : 0;
           }
 
-          // Deflector Matrix Level 3+ auto-recharges 1 shield charge after 40s of clean driving
           if ((currentProt.shieldDuration ?? 0) >= 3 && sim.integrity < sim.maxIntegrity) {
             sim.cleanDriveShieldTimer += dt;
             if (sim.cleanDriveShieldTimer >= 40) {
@@ -1498,11 +2002,6 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
             sim.cleanDriveShieldTimer = 0;
           }
 
-          // 4. Advance Distance
-          const stepDist = sim.speedMs * dt;
-          sim.distanceMeters += stepDist;
-          sim.scrollOffsetZ += stepDist;
-
           const playerBox = {
             x: sim.playerX,
             z: 0,
@@ -1512,34 +2011,76 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
 
           // --- MODE-SPECIFIC WORLD & OPPONENTS ---
           if (playMode === 'solo') {
-            updateRoadAndBarrierGeometry(null, sim.distanceMeters);
+            updateRoadAndBarrierGeometry(
+              null,
+              sim.distanceMeters,
+              sim.soloBridgeJumps,
+              sim.soloTunnels
+            );
+            updateTunnelsAndBridges3D(
+              null,
+              sim.distanceMeters,
+              sim.soloBridgeJumps,
+              sim.soloTunnels,
+              false
+            );
+
+            // Update Solo segment label for HUD
+            const activeSoloJump = sim.soloBridgeJumps.find(
+              (j) =>
+                sim.distanceMeters >= j.approachStartDist &&
+                sim.distanceMeters <= j.landingEndDist
+            );
+            const activeSoloTunnel = sim.soloTunnels.find(
+              (t) => sim.distanceMeters >= t.startDist && sim.distanceMeters <= t.endDist
+            );
+            const nextSoloLabel = activeSoloJump
+              ? activeSoloJump.label
+              : activeSoloTunnel
+                ? activeSoloTunnel.label
+                : 'City Expressway';
+            if (nextSoloLabel !== sim.lastSegmentLabel) {
+              sim.lastSegmentLabel = nextSoloLabel;
+              syncLiveHudSnapshot();
+            }
+
             const difficulty01 = Math.min(1, sim.distanceMeters / 3500);
 
             sim.trafficSpawnTimer -= dt;
             if (sim.trafficSpawnTimer <= 0) {
               const chosenLanes = selectFairTrafficLanes(HIGHWAY_CONFIG.laneCount, difficulty01);
               const spawnZ = -HIGHWAY_CONFIG.minSpawnDistanceAhead - Math.random() * 40;
+              const spawnWorldDist = sim.distanceMeters - spawnZ;
 
-              for (const laneIdx of chosenLanes) {
-                const laneCenterX = HIGHWAY_CONFIG.laneCenters[laneIdx];
-                const tooClose = trafficPool.some(
-                  (t) =>
-                    t.active &&
-                    t.laneIndex === laneIdx &&
-                    Math.abs(t.z - spawnZ) < HIGHWAY_CONFIG.minLongitudinalGap
-                );
-                if (tooClose) continue;
+              // Do not spawn traffic on a broken-bridge takeoff ramp, open gap, or landing zone
+              const overlapsBridgeJump = sim.soloBridgeJumps.some(
+                (j) =>
+                  spawnWorldDist >= j.rampStartDist - 35 &&
+                  spawnWorldDist <= j.landingEndDist + 25
+              );
 
-                const inactiveItem = trafficPool.find((t) => !t.active);
-                if (inactiveItem) {
-                  inactiveItem.active = true;
-                  inactiveItem.laneIndex = laneIdx;
-                  inactiveItem.x = laneCenterX;
-                  inactiveItem.z = spawnZ - Math.random() * 12;
-                  inactiveItem.speedMs = 20 + Math.random() * 14 + difficulty01 * 5;
-                  inactiveItem.nearMissScored = false;
-                  inactiveItem.mesh.position.set(inactiveItem.x, 0, inactiveItem.z);
-                  inactiveItem.mesh.visible = true;
+              if (!overlapsBridgeJump) {
+                for (const laneIdx of chosenLanes) {
+                  const laneCenterX = HIGHWAY_CONFIG.laneCenters[laneIdx];
+                  const tooClose = trafficPool.some(
+                    (t) =>
+                      t.active &&
+                      t.laneIndex === laneIdx &&
+                      Math.abs(t.z - spawnZ) < HIGHWAY_CONFIG.minLongitudinalGap
+                  );
+                  if (tooClose) continue;
+
+                  const inactiveItem = trafficPool.find((t) => !t.active);
+                  if (inactiveItem) {
+                    inactiveItem.active = true;
+                    inactiveItem.laneIndex = laneIdx;
+                    inactiveItem.x = laneCenterX;
+                    inactiveItem.z = spawnZ - Math.random() * 12;
+                    inactiveItem.speedMs = 20 + Math.random() * 14 + difficulty01 * 5;
+                    inactiveItem.nearMissScored = false;
+                    inactiveItem.mesh.position.set(inactiveItem.x, 0, inactiveItem.z);
+                    inactiveItem.mesh.visible = true;
+                  }
                 }
               }
 
@@ -1554,15 +2095,24 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
               const laneIdx = Math.floor(Math.random() * HIGHWAY_CONFIG.laneCount);
               const laneX = HIGHWAY_CONFIG.laneCenters[laneIdx];
               const baseZ = -95;
+              const coinWorldDist = sim.distanceMeters - baseZ;
+              const overlapsJump = sim.soloBridgeJumps.some(
+                (j) =>
+                  coinWorldDist >= j.rampStartDist - 15 &&
+                  coinWorldDist <= j.landingEndDist + 10
+              );
 
-              for (let c = 0; c < 4; c++) {
-                const coinItem = coinPool.find((item) => !item.active);
-                if (coinItem) {
-                  coinItem.active = true;
-                  coinItem.x = laneX;
-                  coinItem.z = baseZ - c * 7.5;
-                  coinItem.mesh.position.set(coinItem.x, 0.9, coinItem.z);
-                  coinItem.mesh.visible = true;
+              if (!overlapsJump) {
+                for (let c = 0; c < 4; c++) {
+                  const coinItem = coinPool.find((item) => !item.active);
+                  if (coinItem) {
+                    coinItem.active = true;
+                    coinItem.x = laneX;
+                    coinItem.y = 0.9;
+                    coinItem.z = baseZ - c * 7.5;
+                    coinItem.mesh.position.set(coinItem.x, coinItem.y, coinItem.z);
+                    coinItem.mesh.visible = true;
+                  }
                 }
               }
               sim.coinSpawnTimer = 1.9 + Math.random() * 1.2;
@@ -1573,81 +2123,89 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
               if (!t.active) continue;
               const relSpeedMs = sim.speedMs - t.speedMs;
               t.z += relSpeedMs * dt;
-              t.mesh.position.set(t.x, 0, t.z);
+              const tWorldDist = sim.distanceMeters - t.z;
 
-              if (t.z > Math.abs(HIGHWAY_CONFIG.despawnDistanceBehind)) {
+              // Despawn traffic if it enters a broken-bridge ramp/gap zone or passes behind player
+              const inBridgeZone = sim.soloBridgeJumps.some(
+                (j) => tWorldDist >= j.rampStartDist - 10 && tWorldDist <= j.landingEndDist + 10
+              );
+              if (inBridgeZone || t.z > Math.abs(HIGHWAY_CONFIG.despawnDistanceBehind)) {
                 t.active = false;
                 t.mesh.visible = false;
                 continue;
               }
 
-              const check = evaluateVehicleInteraction(
-                playerBox,
-                {
-                  x: t.x,
-                  z: t.z,
-                  halfWidth: t.halfWidth,
-                  halfLength: t.halfLength,
-                },
-                t.nearMissScored
-              );
+              t.mesh.position.set(t.x, 0, t.z);
 
-              if (check.collided && sim.invulnerableTimer <= 0) {
-                sim.collisionsCount += 1;
-                sim.cleanDriveShieldTimer = 0;
-                sim.integrity = Math.max(0, sim.integrity - 1);
-                sim.cameraTrauma = Math.min(1, sim.cameraTrauma + 0.78);
-                sim.shieldFlashTimer = 0.55;
-                spawnParticleBurst(sim.playerX, 0.65, -1.2, 18, 0xf59e0b, 9);
+              if (!sim.isAirborne) {
+                const check = evaluateVehicleInteraction(
+                  playerBox,
+                  {
+                    x: t.x,
+                    z: t.z,
+                    halfWidth: t.halfWidth,
+                    halfLength: t.halfLength,
+                  },
+                  t.nearMissScored
+                );
 
-                if (sim.integrity <= 0) {
-                  soundController.playCollision(true);
-                  sim.hitstopTimer = 0.06;
-                  sim.isDying = true;
-                  sim.defeatDelayTimer = 0.45;
-                  syncLiveHudSnapshot({
-                    text: 'CRITICAL IMPACT',
-                    subtext: 'Hull Shield Depleted',
-                    tone: 'danger',
-                  });
-                } else {
-                  soundController.playCollision(false);
-                  sim.hitstopTimer = 0.04;
-                  sim.invulnerableTimer = effectiveStats.shieldInvulnerabilitySec;
-                  sim.speedMs = Math.max(
-                    18,
-                    sim.speedMs * effectiveStats.collisionSpeedRetention
+                if (check.collided && sim.invulnerableTimer <= 0) {
+                  sim.collisionsCount += 1;
+                  sim.cleanDriveShieldTimer = 0;
+                  sim.integrity = Math.max(0, sim.integrity - 1);
+                  sim.cameraTrauma = Math.min(1, sim.cameraTrauma + 0.78);
+                  sim.shieldFlashTimer = 0.55;
+                  spawnParticleBurst(sim.playerX, 0.65, -1.2, 18, 0xf59e0b, 9);
+
+                  if (sim.integrity <= 0) {
+                    soundController.playCollision(true);
+                    sim.hitstopTimer = 0.06;
+                    sim.isDying = true;
+                    sim.defeatDelayTimer = 0.45;
+                    syncLiveHudSnapshot({
+                      text: 'CRITICAL IMPACT',
+                      subtext: 'Hull Shield Depleted',
+                      tone: 'danger',
+                    });
+                  } else {
+                    soundController.playCollision(false);
+                    sim.hitstopTimer = 0.04;
+                    sim.invulnerableTimer = effectiveStats.shieldInvulnerabilitySec;
+                    sim.speedMs = Math.max(
+                      18,
+                      sim.speedMs * effectiveStats.collisionSpeedRetention
+                    );
+                    t.active = false;
+                    t.mesh.visible = false;
+                    syncLiveHudSnapshot({
+                      text: 'SHIELD IMPACT ABSORBED',
+                      subtext: `${sim.integrity}/${sim.maxIntegrity} Shield Charges Remaining`,
+                      tone: 'danger',
+                    });
+                  }
+                } else if (check.nearMiss) {
+                  t.nearMissScored = true;
+                  sim.nearMissCount += 1;
+                  sim.nitroAmount = Math.min(
+                    1,
+                    sim.nitroAmount + HIGHWAY_CONFIG.nearMissNitroBonus
                   );
-                  t.active = false;
-                  t.mesh.visible = false;
+                  soundController.playNearMiss();
+                  spawnParticleBurst(sim.playerX, 0.5, 0, 8, 0x06b6d4, 5);
                   syncLiveHudSnapshot({
-                    text: 'SHIELD IMPACT ABSORBED',
-                    subtext: `${sim.integrity}/${sim.maxIntegrity} Shield Charges Remaining`,
-                    tone: 'danger',
+                    text: `NEAR MISS +${HIGHWAY_CONFIG.nearMissScoreBonus}`,
+                    subtext: `+${HIGHWAY_CONFIG.nearMissCoinBonus} Bonus Coins · +Nitro Boost`,
+                    tone: 'cyan',
                   });
                 }
-              } else if (check.nearMiss) {
-                t.nearMissScored = true;
-                sim.nearMissCount += 1;
-                sim.nitroAmount = Math.min(
-                  1,
-                  sim.nitroAmount + HIGHWAY_CONFIG.nearMissNitroBonus
-                );
-                soundController.playNearMiss();
-                spawnParticleBurst(sim.playerX, 0.5, 0, 8, 0x06b6d4, 5);
-                syncLiveHudSnapshot({
-                  text: `NEAR MISS +${HIGHWAY_CONFIG.nearMissScoreBonus}`,
-                  subtext: `+${HIGHWAY_CONFIG.nearMissCoinBonus} Bonus Coins · +Nitro Boost`,
-                  tone: 'cyan',
-                });
               }
             }
 
-            // Move Solo Coins
+            // Move Solo Coins (including airborne jump arc coins)
             for (const c of coinPool) {
               if (!c.active) continue;
               c.z += sim.speedMs * dt;
-              c.mesh.position.set(c.x, 0.9, c.z);
+              c.mesh.position.set(c.x, c.y, c.z);
               c.mesh.rotation.y += dt * 3.8;
 
               if (c.z > 16) {
@@ -1656,18 +2214,34 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
                 continue;
               }
 
-              if (Math.abs(c.z) < 2.2 && Math.abs(c.x - sim.playerX) < 1.65) {
+              if (
+                Math.abs(c.z) < 2.4 &&
+                Math.abs(c.x - sim.playerX) < 1.75 &&
+                Math.abs(c.y - (sim.playerY + 0.9)) < 1.85
+              ) {
                 c.active = false;
                 c.mesh.visible = false;
                 sim.coinsCollected += 1;
                 soundController.playCoinPickup();
-                spawnParticleBurst(c.x, 0.9, 0, 7, 0xfacc15, 4.5);
+                spawnParticleBurst(c.x, c.y, 0, 7, 0xfacc15, 4.5);
               }
             }
           } else {
-            // --- LEVELS MODE: CURVED 3D ROAD, 5 AI OPPONENTS, OBSTACLES, START & FINISH GANTRIES ---
+            // --- LEVELS MODE: CURVED 3D ROAD, TUNNELS, BRIDGE JUMPS, 5 AI OPPONENTS, OBSTACLES & GANTRIES ---
             const course = sim.activeCourse;
-            updateRoadAndBarrierGeometry(course, sim.distanceMeters);
+            updateRoadAndBarrierGeometry(
+              course,
+              sim.distanceMeters,
+              course.bridgeJumps,
+              course.tunnels
+            );
+            updateTunnelsAndBridges3D(
+              course,
+              sim.distanceMeters,
+              course.bridgeJumps,
+              course.tunnels,
+              false
+            );
 
             // Position Start & Finish Line Gantries aligned with the curved road centerline
             const startRelZ = sim.distanceMeters - 0;
@@ -1698,7 +2272,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
               finishGantryMesh.visible = false;
             }
 
-            // Step & Render the 5 AI Opponents (6 racing cars total)
+            // Step & Render the 5 AI Opponents (6 racing cars total, including full 3D jump elevation & pitch!)
             for (let i = 0; i < sim.aiOpponents.length; i++) {
               const ai = sim.aiOpponents[i];
               stepAiOpponent({
@@ -1720,10 +2294,11 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
                   relZ
                 );
                 aiRig.group.visible = true;
-                aiRig.group.position.set(ai.x + roadCenter.xOffset, 0, relZ);
+                aiRig.group.position.set(ai.x + roadCenter.xOffset, ai.y, relZ);
                 aiRig.group.rotation.y =
                   -roadCenter.headingRad * 0.65 -
                   THREE.MathUtils.clamp(ai.lateralVelocity * 0.015, -0.15, 0.15);
+                aiRig.bodyGroup.rotation.x = ai.pitchRad;
                 for (const w of aiRig.wheels) {
                   w.rotation.x -= ai.speedMs * dt * 1.8;
                 }
@@ -1734,8 +2309,12 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
                 aiRig.group.visible = false;
               }
 
-              // Player vs AI side-to-side contact check (non-fatal racing rub unless direct rear-end)
-              if (Math.abs(relZ) < 3.6 && Math.abs(ai.x - sim.playerX) < 1.72) {
+              // Player vs AI side-to-side contact check
+              if (
+                Math.abs(relZ) < 3.6 &&
+                Math.abs(ai.x - sim.playerX) < 1.72 &&
+                Math.abs(ai.y - sim.playerY) < 1.4
+              ) {
                 const pushDir = sim.playerX >= ai.x ? 1 : -1;
                 sim.playerX = THREE.MathUtils.clamp(
                   sim.playerX + pushDir * 0.25,
@@ -1749,7 +2328,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
                 );
                 if (relZ < -1.2 && sim.speedMs > ai.speedMs + 4) {
                   sim.speedMs = Math.max(ai.speedMs, sim.speedMs * 0.9);
-                  spawnParticleBurst(sim.playerX, 0.5, -1.5, 6, 0x38bdf8, 5);
+                  spawnParticleBurst(sim.playerX, sim.playerY + 0.5, -1.5, 6, 0x38bdf8, 5);
                 }
               }
             }
@@ -1766,12 +2345,21 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
                   sim.distanceMeters,
                   relZ
                 );
+                const obsSurf = sampleRoadSurfaceAtDistance(
+                  obs.distanceMeters,
+                  course.bridgeJumps,
+                  course.tunnels
+                );
                 item.mesh.visible = true;
-                item.mesh.position.set(obs.x + roadCenter.xOffset, 0, relZ);
+                item.mesh.position.set(
+                  obs.x + roadCenter.xOffset,
+                  Math.max(0, obsSurf.groundY),
+                  relZ
+                );
                 item.mesh.rotation.y = -roadCenter.headingRad * 0.65;
 
-                // Check collision with Player (both obs.x and sim.playerX are in road-local lateral space!)
                 if (
+                  !sim.isAirborne &&
                   sim.invulnerableTimer <= 0 &&
                   Math.abs(relZ) < obs.halfLength + 1.85 &&
                   Math.abs(obs.x - sim.playerX) < obs.halfWidth + 0.72
@@ -1782,7 +2370,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
                   sim.integrity = Math.max(0, sim.integrity - 1);
                   sim.cameraTrauma = Math.min(1, sim.cameraTrauma + 0.75);
                   sim.shieldFlashTimer = 0.55;
-                  spawnParticleBurst(sim.playerX, 0.65, -1.2, 16, 0xf59e0b, 8);
+                  spawnParticleBurst(sim.playerX, sim.playerY + 0.65, -1.2, 16, 0xf59e0b, 8);
 
                   if (sim.integrity <= 0) {
                     soundController.playCollision(true);
@@ -1815,7 +2403,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
               levelObstaclePool[k].mesh.visible = false;
             }
 
-            // Render & Collect Course Coins aligned with the curved road
+            // Render & Collect Course Coins (including airborne jump coin arcs)
             let coinIdx = 0;
             for (let i = 0; i < course.coins.length; i++) {
               const c = course.coins[i];
@@ -1828,16 +2416,21 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
                   sim.distanceMeters,
                   relZ
                 );
+                const coinY = c.y ?? 0.9;
                 poolCoin.mesh.visible = true;
-                poolCoin.mesh.position.set(c.x + roadCenter.xOffset, 0.9, relZ);
+                poolCoin.mesh.position.set(c.x + roadCenter.xOffset, coinY, relZ);
                 poolCoin.mesh.rotation.y += dt * 3.8;
 
-                if (Math.abs(relZ) < 2.2 && Math.abs(c.x - sim.playerX) < 1.65) {
+                if (
+                  Math.abs(relZ) < 2.4 &&
+                  Math.abs(c.x - sim.playerX) < 1.75 &&
+                  Math.abs(coinY - (sim.playerY + 0.9)) < 1.85
+                ) {
                   c.collected = true;
                   poolCoin.mesh.visible = false;
                   sim.coinsCollected += 1;
                   soundController.playCoinPickup();
-                  spawnParticleBurst(sim.playerX, 0.9, 0, 7, 0xfacc15, 4.5);
+                  spawnParticleBurst(sim.playerX, coinY, 0, 7, 0xfacc15, 4.5);
                 }
               }
             }
@@ -1883,11 +2476,12 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
                 driftScore: sim.driftScore,
                 collisionsCount: sim.collisionsCount,
               });
+              const totalLevelScore = rewards.totalScore + sim.bonusScore;
               const summary = calculateRunRewards({
                 distanceMeters: course.totalLengthMeters,
                 coinsCollected: sim.coinsCollected,
                 nearMissCount: sim.nearMissCount,
-                bonusScore: rewards.totalScore,
+                bonusScore: totalLevelScore,
               });
 
               soundController.playRaceFinish(finalRank <= 3);
@@ -1896,7 +2490,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
                 playMode: 'levels',
                 summary: {
                   ...summary,
-                  totalScore: rewards.totalScore,
+                  totalScore: totalLevelScore,
                   totalCoinsEarned: rewards.totalCoinsEarned,
                 },
                 coinsCollected: sim.coinsCollected,
@@ -1910,7 +2504,10 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
                   playerPosition: finalRank,
                   playerFinishedCourse: true,
                   finishTimeSec: finishTime,
-                  rewards,
+                  rewards: {
+                    ...rewards,
+                    totalScore: totalLevelScore,
+                  },
                   coinsCollected: sim.coinsCollected,
                   driftScore: Math.floor(sim.driftScore),
                   collisionsCount: sim.collisionsCount,
@@ -1926,7 +2523,8 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
         const menuSpeedMs = currentProps.isGarageOpen ? 0 : 24;
         sim.scrollOffsetZ += menuSpeedMs * dt;
         sim.visualCurveFactor = THREE.MathUtils.damp(sim.visualCurveFactor, 0, 6, dt);
-        updateRoadAndBarrierGeometry(null, 0);
+        updateRoadAndBarrierGeometry(null, 0, [], []);
+        updateTunnelsAndBridges3D(null, 0, [], [], true);
 
         for (const t of trafficPool) {
           if (t.active) t.mesh.visible = !currentProps.isGarageOpen;
@@ -1944,8 +2542,8 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
         finishGantryMesh.visible = false;
 
         if (currentProps.isGarageOpen) {
-          // Center vehicle on showroom pedestal at (0, 0, 0) and rotate around its true vertical center axis
           sim.playerX = 0;
+          sim.playerY = 0;
           playerAnchor.position.set(0, 0, 0);
 
           if (sim.garageHoldDir !== 0) {
@@ -1966,6 +2564,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
           turntableGroup.rotation.set(0, sim.garageYawRad, 0);
         } else {
           sim.playerX = THREE.MathUtils.damp(sim.playerX, 1.75, 7, dt);
+          sim.playerY = 0;
           playerAnchor.position.set(sim.playerX, 0, 0);
           playerAnchor.rotation.set(0, 0, 0);
         }
@@ -1983,7 +2582,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
         soundController.updateEngine(0, false, true);
       }
 
-      // --- B. UPDATE SCROLLING ROAD, ARCHES, TUNNELS, SKYLINE & PARTICLES ---
+      // --- B. UPDATE SCROLLING ROAD TEXTURE, ARCHES, SKYLINE & PARTICLES ---
       albedoMap.offset.y = -(sim.scrollOffsetZ * 0.065) % 1;
       roughnessMap.offset.y = -(sim.scrollOffsetZ * 0.065) % 1;
 
@@ -1991,63 +2590,85 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
         currentProps.gameState === 'playing' && playMode === 'levels'
           ? sim.activeCourse
           : null;
+      const activeJumpsForVisuals =
+        currentProps.gameState === 'playing'
+          ? playMode === 'levels'
+            ? sim.activeCourse.bridgeJumps
+            : sim.soloBridgeJumps
+          : [];
+      const activeTunnelsForVisuals =
+        currentProps.gameState === 'playing'
+          ? playMode === 'levels'
+            ? sim.activeCourse.tunnels
+            : sim.soloTunnels
+          : [];
 
       const archSpacing = 12;
       const archWrapSpan = archCount * archSpacing;
       for (let i = 0; i < archCount; i++) {
         const z =
           ((i * archSpacing + sim.scrollOffsetZ) % archWrapSpan) - archWrapSpan + 24;
+        const worldDist = sim.distanceMeters - z;
+        const surfAtZ = sampleRoadSurfaceAtDistance(
+          worldDist,
+          activeJumpsForVisuals,
+          activeTunnelsForVisuals
+        );
+
+        // Hide open-air streetlight arches where a tunnel or open bridge jump gap exists
+        if (surfAtZ.isInsideTunnel || surfAtZ.isOverOpenGap || surfAtZ.isOnTakeoffRamp) {
+          _dummy.position.set(0, -50, 0);
+          _dummy.scale.set(0.001, 0.001, 0.001);
+          _dummy.updateMatrix();
+          archPillarsInst.setMatrixAt(i * 2, _dummy.matrix);
+          archPillarsInst.setMatrixAt(i * 2 + 1, _dummy.matrix);
+          lampHeadsInst.setMatrixAt(i * 2, _dummy.matrix);
+          lampHeadsInst.setMatrixAt(i * 2 + 1, _dummy.matrix);
+          continue;
+        }
+
         const { xOffset: curveX } = computeCurvedRoadCenterAtWorldZ(
           activeCourseForVisuals,
           sim.distanceMeters,
           z
         );
 
-        _dummy.position.set(-HIGHWAY_CONFIG.roadWidth * 0.5 - 0.6 + curveX, 3.9, z);
+        _dummy.position.set(
+          -HIGHWAY_CONFIG.roadWidth * 0.5 - 0.6 + curveX,
+          3.9 + surfAtZ.groundY,
+          z
+        );
         _dummy.rotation.set(0, 0, 0);
         _dummy.scale.set(1, 1, 1);
         _dummy.updateMatrix();
         archPillarsInst.setMatrixAt(i * 2, _dummy.matrix);
 
-        _dummy.position.set(-HIGHWAY_CONFIG.roadWidth * 0.5 + 0.35 + curveX, 7.6, z);
+        _dummy.position.set(
+          -HIGHWAY_CONFIG.roadWidth * 0.5 + 0.35 + curveX,
+          7.6 + surfAtZ.groundY,
+          z
+        );
         _dummy.updateMatrix();
         lampHeadsInst.setMatrixAt(i * 2, _dummy.matrix);
 
-        _dummy.position.set(HIGHWAY_CONFIG.roadWidth * 0.5 + 0.6 + curveX, 3.9, z);
+        _dummy.position.set(
+          HIGHWAY_CONFIG.roadWidth * 0.5 + 0.6 + curveX,
+          3.9 + surfAtZ.groundY,
+          z
+        );
         _dummy.updateMatrix();
         archPillarsInst.setMatrixAt(i * 2 + 1, _dummy.matrix);
 
-        _dummy.position.set(HIGHWAY_CONFIG.roadWidth * 0.5 - 0.35 + curveX, 7.6, z);
+        _dummy.position.set(
+          HIGHWAY_CONFIG.roadWidth * 0.5 - 0.35 + curveX,
+          7.6 + surfAtZ.groundY,
+          z
+        );
         _dummy.updateMatrix();
         lampHeadsInst.setMatrixAt(i * 2 + 1, _dummy.matrix);
       }
       archPillarsInst.instanceMatrix.needsUpdate = true;
       lampHeadsInst.instanceMatrix.needsUpdate = true;
-
-      // Update Tunnel Roof Rings if in Levels Mode
-      const showTunnels =
-        currentProps.gameState === 'playing' &&
-        playMode === 'levels' &&
-        sampleTrackAtDistance(sim.activeCourse, sim.distanceMeters + 40).isTunnel;
-      for (let i = 0; i < tunnelRingCount; i++) {
-        if (!showTunnels) {
-          _dummy.position.set(0, -50, 0);
-          _dummy.scale.set(0.001, 0.001, 0.001);
-        } else {
-          const z = -i * 12 + (sim.scrollOffsetZ % 12);
-          const { xOffset: curveX } = computeCurvedRoadCenterAtWorldZ(
-            activeCourseForVisuals,
-            sim.distanceMeters,
-            z
-          );
-          _dummy.position.set(curveX, 7.85, z);
-          _dummy.rotation.set(0, 0, 0);
-          _dummy.scale.set(1, 1, 1);
-        }
-        _dummy.updateMatrix();
-        tunnelRoofInst.setMatrixAt(i, _dummy.matrix);
-      }
-      tunnelRoofInst.instanceMatrix.needsUpdate = true;
 
       const towerSpan = 250;
       for (let i = 0; i < towerCount; i++) {
@@ -2056,7 +2677,12 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
           (((tm.zOffset + sim.scrollOffsetZ * 0.45) % towerSpan) + towerSpan) %
             towerSpan -
           205;
-        _dummy.position.set(tm.xOffset, -0.04, z);
+        const { xOffset: curveX } = computeCurvedRoadCenterAtWorldZ(
+          activeCourseForVisuals,
+          sim.distanceMeters,
+          z
+        );
+        _dummy.position.set(tm.xOffset + curveX, -0.04, z);
         _dummy.rotation.set(0, 0, 0);
         _dummy.scale.set(tm.w, tm.h, tm.d);
         _dummy.updateMatrix();
@@ -2093,7 +2719,7 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       particleInst.instanceMatrix.needsUpdate = true;
       if (particleInst.instanceColor) particleInst.instanceColor.needsUpdate = true;
 
-      // --- C. SMOOTH LANDSCAPE CAMERA RIG & GARAGE BOUNDING-BOX FRAMING ---
+      // --- C. SMOOTH LANDSCAPE CAMERA RIG (WITH JUMP & TUNNEL TRACKING) ---
       sim.cameraTrauma = Math.max(0, sim.cameraTrauma - dt * 2.2);
       const shakeMag = sim.cameraTrauma * sim.cameraTrauma * 0.35;
       const shakeX = (Math.random() - 0.5) * shakeMag;
@@ -2103,8 +2729,6 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       const viewH = Math.max(1, container.clientHeight || window.innerHeight);
 
       if (isGaragePreview) {
-        // PRIORITY 1: Frame the entire vehicle inside the left showroom preview pane
-        // using the vehicle's actual 3D bounding sphere and camera view offset.
         const bounds = carBounds[selectedCarId] ?? {
           radius: 2.55,
           centerY: 0.65,
@@ -2116,7 +2740,6 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
         camera.fov = THREE.MathUtils.damp(camera.fov, targetFovDeg, 10, dt);
 
         const vFovRad = THREE.MathUtils.degToRad(camera.fov);
-        // Available showroom pane is the left ~44% of landscape screen between top & bottom cards
         const paneAspect = (viewW >= 640 ? viewW * 0.42 : viewW * 0.9) / (viewH * 0.52);
         const hFovRad = 2 * Math.atan(Math.tan(vFovRad * 0.5) * Math.max(0.75, paneAspect));
         const minHalfAngle = Math.min(vFovRad * 0.5, hFovRad * 0.5);
@@ -2126,7 +2749,6 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
         );
 
         if (viewW >= 640) {
-          // Shift the camera optical center into the left showroom pane
           camera.setViewOffset(
             viewW,
             viewH,
@@ -2159,12 +2781,16 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
           -24
         );
         const chaseX = sim.playerX * 0.76 + shakeX;
-        const chaseY = (sim.isNitroActive ? 2.58 : 2.82) + shakeY;
-        const chaseZ = sim.isNitroActive ? 5.85 : 6.45;
+        // Follow player vertical elevation during ramp climb & airborne jumps while staying below tunnel ceiling (5.2m)
+        const baseChaseY = (sim.isNitroActive ? 2.58 : 2.82) + sim.playerY * 0.78 + shakeY;
+        const maxCamY = sim.tunnelProximity01 > 0.2 ? 4.85 : 9.5;
+        const chaseY = Math.min(maxCamY, baseChaseY);
+        const chaseZ = sim.isNitroActive ? 5.85 : sim.isAirborne ? 6.85 : 6.45;
+
         _targetCamPos.set(chaseX, chaseY, chaseZ);
         _desiredCamLook.set(
           sim.playerX * 0.85 + lookAheadCenter.xOffset * 0.68,
-          0.28,
+          0.28 + sim.playerY * 0.62,
           -24
         );
         const speedAboveLaunch = Math.max(
@@ -2173,7 +2799,9 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
         );
         const targetFov = sim.isNitroActive
           ? 74
-          : 58 + Math.min(11, speedAboveLaunch * 0.05);
+          : sim.isAirborne
+            ? 66
+            : 58 + Math.min(11, speedAboveLaunch * 0.05);
         camera.fov = THREE.MathUtils.damp(camera.fov, targetFov, 8, dt);
       }
 
@@ -2183,6 +2811,29 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
       _currentCamLook.lerp(_desiredCamLook, camDamp);
       camera.lookAt(_currentCamLook);
 
+      // Expose lightweight runtime telemetry hook for automated acceptance testing
+      if (typeof window !== 'undefined') {
+        (window as unknown as Record<string, unknown>).__velocityRushDebug = {
+          playMode,
+          distanceMeters: Number(sim.distanceMeters.toFixed(1)),
+          speedKmh: Math.round(sim.speedMs * 3.6),
+          playerX: Number(sim.playerX.toFixed(2)),
+          playerY: Number(sim.playerY.toFixed(2)),
+          playerPitchRad: Number(sim.playerPitchRad.toFixed(3)),
+          isAirborne: sim.isAirborne,
+          isInsideTunnel: sim.isInsideTunnel,
+          tunnelProximity01: Number(sim.tunnelProximity01.toFixed(2)),
+          completedJumpsCount: sim.completedJumpIds.size,
+          aiCount: sim.aiOpponents.length,
+          aiStates: sim.aiOpponents.map((a) => ({
+            id: a.id,
+            dist: Number(a.distanceMeters.toFixed(1)),
+            y: Number(a.y.toFixed(2)),
+            isAirborne: a.isAirborne,
+          })),
+        };
+      }
+
       // --- D. HIGH-FREQUENCY AUTHORITATIVE DOM REF HUD UPDATES ---
       hudUpdateAccum += dt;
       if (hudUpdateAccum >= 0.05) {
@@ -2191,10 +2842,14 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
         const speedKmhInt = Math.round(sim.speedMs * 3.6);
         const distInt = Math.max(0, Math.floor(sim.distanceMeters));
 
-        // Authoritative live race score starting at 0 at the start line
         let liveScore = 0;
         if (playMode === 'levels') {
-          if (distInt > 0 || sim.coinsCollected > 0 || sim.driftScore > 0) {
+          if (
+            distInt > 0 ||
+            sim.coinsCollected > 0 ||
+            sim.driftScore > 0 ||
+            sim.bonusScore > 0
+          ) {
             const progressRatio = Math.min(
               1,
               distInt / Math.max(1, sim.activeCourse.totalLengthMeters)
@@ -2203,7 +2858,8 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
               Math.round((7 - sim.playerPosition) * 1200 * progressRatio) +
               Math.floor(distInt * 2) +
               sim.coinsCollected * HIGHWAY_CONFIG.coinPickupScore +
-              Math.floor(sim.driftScore);
+              Math.floor(sim.driftScore) +
+              sim.bonusScore;
           }
         } else {
           const liveSummary = calculateRunRewards({
@@ -2232,7 +2888,6 @@ export const HighwayCanvas: React.FC<HighwayCanvasProps> = (props) => {
         if (refs.scoreValueRef.current) {
           refs.scoreValueRef.current.textContent = liveScore.toLocaleString();
         }
-        // PRIORITY 3B: Display exact coins collected during the current race
         if (refs.coinsValueRef.current) {
           refs.coinsValueRef.current.textContent = String(sim.coinsCollected);
         }

@@ -13,6 +13,7 @@ export type TrackSegmentType =
   | 'hairpin_right'
   | 'drift_s_bend'
   | 'tunnel_passage'
+  | 'bridge_jump'
   | 'chicane_barriers'
   | 'finish_straight';
 
@@ -26,6 +27,34 @@ export interface TrackSegmentSpec {
   curvature: number; // -1 (sharp left) .. 0 (straight) .. +1 (sharp right)
   isTunnel: boolean;
   isDriftZone: boolean;
+  isBridgeJump?: boolean;
+}
+
+export interface TunnelSectionSpec {
+  id: number;
+  startDist: number;
+  endDist: number;
+  length: number;
+  label: string;
+}
+
+export interface BrokenBridgeJumpSpec {
+  id: number;
+  label: string;
+  approachStartDist: number;
+  rampStartDist: number;
+  rampEndDist: number;
+  rampLength: number;
+  rampPeakHeight: number;
+  rampAngleRad: number;
+  gapStartDist: number;
+  gapEndDist: number;
+  gapLength: number;
+  landingStartDist: number;
+  landingEndDist: number;
+  landingLength: number;
+  landingHeightOffset: number;
+  minRequiredSpeedMs: number;
 }
 
 export type LevelHazardType = 'barrier_block' | 'chevron_chicane' | 'energy_pylon';
@@ -44,6 +73,7 @@ export interface LevelCourseCoin {
   id: number;
   distanceMeters: number;
   x: number;              // lateral road coordinate relative to road centerline
+  y?: number;             // optional vertical elevation (for airborne bridge-jump coin arcs)
   collected: boolean;
 }
 
@@ -54,6 +84,8 @@ export interface GeneratedLevelCourse {
   subtitle: string;
   totalLengthMeters: number;
   segments: TrackSegmentSpec[];
+  tunnels: TunnelSectionSpec[];
+  bridgeJumps: BrokenBridgeJumpSpec[];
   obstacles: LevelCourseObstacle[];
   coins: LevelCourseCoin[];
   recommendedTopSpeedKmh: number;
@@ -68,6 +100,11 @@ export interface AiOpponentState {
   gridSlot: number; // 1..5
   distanceMeters: number;
   x: number;        // lateral offset from road centerline
+  y: number;        // vertical elevation (meters above road datum)
+  vy: number;       // vertical velocity (m/s)
+  pitchRad: number; // nose pitch angle (rad)
+  isAirborne: boolean;
+  activeJumpId: number | null;
   targetLaneIndex: number;
   speedMs: number;
   lateralVelocity: number;
@@ -115,6 +152,17 @@ export const PLAYER_GRID_START_X = HIGHWAY_CONFIG.laneCenters[1]; // -1.8m
 export const PLAYER_GRID_START_DIST = 0;
 
 /**
+ * Gravity constant for arcade vehicle jumps (m/s^2).
+ */
+export const ARCADE_JUMP_GRAVITY = 22.0;
+
+/**
+ * Bonus score and coins awarded once per successfully cleared broken-bridge jump.
+ */
+export const BRIDGE_JUMP_SCORE_BONUS = 250;
+export const BRIDGE_JUMP_COIN_BONUS = 5;
+
+/**
  * Deterministic 32-bit Mulberry32 PRNG for reproducible procedural courses.
  */
 export function createSeededRandom(seed: number): () => number {
@@ -127,12 +175,382 @@ export function createSeededRandom(seed: number): () => number {
   };
 }
 
+/**
+ * Validates and sanitizes a BrokenBridgeJumpSpec so every generated jump is guaranteed
+ * to be reachable by the standard starter car (~60.5 m/s top speed) with clear approach
+ * and receiving platform geometry.
+ */
+export function validateBridgeJumpSpec(
+  spec: BrokenBridgeJumpSpec,
+  starterTopSpeedMs = 60.5
+): BrokenBridgeJumpSpec {
+  const approachLen = Math.max(45, spec.rampStartDist - spec.approachStartDist);
+  const rampLength = Math.max(18, Math.min(28, spec.rampLength));
+  const rampPeakHeight = Math.max(2.1, Math.min(3.2, spec.rampPeakHeight));
+  const rampAngleRad = Math.atan2(rampPeakHeight, rampLength);
+
+  // Starter car normal cruise speed (~48-60 m/s) must easily clear the gap
+  const maxSafeGap = Math.min(30, Math.max(16, spec.gapLength));
+  const landingLength = Math.max(38, spec.landingLength);
+  const landingHeightOffset = Math.max(0, Math.min(0.75, spec.landingHeightOffset));
+
+  // Minimum speed required to clear the gap (kept between 28 m/s and 36 m/s so normal driving clears it,
+  // while heavy braking before the ramp causes a realistic failed jump)
+  const safeMinSpeedMs = Math.min(
+    starterTopSpeedMs * 0.62,
+    Math.max(27, spec.minRequiredSpeedMs)
+  );
+
+  const rampStartDist = spec.rampStartDist;
+  const rampEndDist = rampStartDist + rampLength;
+  const gapStartDist = rampEndDist;
+  const gapEndDist = gapStartDist + maxSafeGap;
+  const landingStartDist = gapEndDist;
+  const landingEndDist = landingStartDist + landingLength;
+
+  return {
+    ...spec,
+    approachStartDist: rampStartDist - approachLen,
+    rampStartDist,
+    rampEndDist,
+    rampLength,
+    rampPeakHeight,
+    rampAngleRad,
+    gapStartDist,
+    gapEndDist,
+    gapLength: maxSafeGap,
+    landingStartDist,
+    landingEndDist,
+    landingLength,
+    landingHeightOffset,
+    minRequiredSpeedMs: Number(safeMinSpeedMs.toFixed(2)),
+  };
+}
+
+/**
+ * Computes the expected horizontal airborne range (meters) for a vehicle launching off
+ * a BrokenBridgeJumpSpec at a given forward speed (m/s).
+ */
+export function computeExpectedJumpRangeMeters(
+  jump: BrokenBridgeJumpSpec,
+  takeoffSpeedMs: number
+): number {
+  const vy0 = computeJumpLaunchVerticalVelocity(jump, takeoffSpeedMs);
+  const deltaH = Math.max(0.2, jump.rampPeakHeight - jump.landingHeightOffset);
+  // Solve y(t) = rampPeakHeight + vy0 * t - 0.5 * g * t^2 = landingHeightOffset
+  const discriminant = vy0 * vy0 + 2 * ARCADE_JUMP_GRAVITY * deltaH;
+  const flightTimeSec = (vy0 + Math.sqrt(Math.max(0, discriminant))) / ARCADE_JUMP_GRAVITY;
+  return takeoffSpeedMs * flightTimeSec;
+}
+
+/**
+ * Computes the vertical launch velocity (m/s) when leaving the takeoff ramp lip.
+ */
+export function computeJumpLaunchVerticalVelocity(
+  jump: BrokenBridgeJumpSpec,
+  takeoffSpeedMs: number
+): number {
+  const speedRatio = takeoffSpeedMs / Math.max(1, jump.minRequiredSpeedMs);
+  if (speedRatio < 0.92) {
+    // Insufficient speed: weak vertical lift so the vehicle drops short into the gap
+    return Math.max(0.4, takeoffSpeedMs * Math.tan(jump.rampAngleRad) * 0.42);
+  }
+  // Sufficient speed: coherent upward trajectory proportional to ramp angle & speed
+  return takeoffSpeedMs * Math.tan(jump.rampAngleRad) * 1.16 + 2.35;
+}
+
+export interface RoadSurfaceSample {
+  groundY: number;
+  slopePitchRad: number;
+  isOverOpenGap: boolean;
+  isOnTakeoffRamp: boolean;
+  isOnLandingDeck: boolean;
+  activeJump: BrokenBridgeJumpSpec | null;
+  isInsideTunnel: boolean;
+  tunnelProximity01: number; // 0 = open sky, 1 = inside illuminated tunnel
+  activeTunnel: TunnelSectionSpec | null;
+}
+
+/**
+ * Evaluates the exact 3D road elevation, ramp incline, open bridge gap, and tunnel illumination
+ * state at any longitudinal distance along the road (used by both Levels Mode and Solo Mode).
+ */
+export function sampleRoadSurfaceAtDistance(
+  distanceMeters: number,
+  bridgeJumps: BrokenBridgeJumpSpec[],
+  tunnels: TunnelSectionSpec[]
+): RoadSurfaceSample {
+  let groundY = 0;
+  let slopePitchRad = 0;
+  let isOverOpenGap = false;
+  let isOnTakeoffRamp = false;
+  let isOnLandingDeck = false;
+  let activeJump: BrokenBridgeJumpSpec | null = null;
+
+  for (let i = 0; i < bridgeJumps.length; i++) {
+    const jump = bridgeJumps[i];
+    if (distanceMeters >= jump.approachStartDist && distanceMeters <= jump.landingEndDist + 10) {
+      activeJump = jump;
+      if (distanceMeters >= jump.rampStartDist && distanceMeters <= jump.rampEndDist) {
+        isOnTakeoffRamp = true;
+        const t = (distanceMeters - jump.rampStartDist) / Math.max(1, jump.rampLength);
+        // Smoothly curved-upward ramp profile (slight ease-in for clean transition, steady incline to lip)
+        const shapedT = 0.15 * t * t + 0.85 * t;
+        groundY = jump.rampPeakHeight * shapedT;
+        slopePitchRad = jump.rampAngleRad;
+      } else if (distanceMeters > jump.gapStartDist && distanceMeters < jump.gapEndDist) {
+        isOverOpenGap = true;
+        groundY = -14.0; // Physically open bridge chasm!
+        slopePitchRad = 0;
+      } else if (distanceMeters >= jump.landingStartDist && distanceMeters <= jump.landingEndDist) {
+        isOnLandingDeck = true;
+        const landProgress =
+          (distanceMeters - jump.landingStartDist) / Math.max(1, jump.landingLength);
+        groundY = jump.landingHeightOffset * Math.max(0, 1 - landProgress);
+        slopePitchRad =
+          jump.landingHeightOffset > 0.05
+            ? -Math.atan2(jump.landingHeightOffset, jump.landingLength)
+            : 0;
+      }
+      break;
+    }
+  }
+
+  let isInsideTunnel = false;
+  let tunnelProximity01 = 0;
+  let activeTunnel: TunnelSectionSpec | null = null;
+  const transitionZone = 32; // Smooth 32m lighting transition before entrance and after exit
+
+  for (let i = 0; i < tunnels.length; i++) {
+    const tun = tunnels[i];
+    if (distanceMeters >= tun.startDist && distanceMeters <= tun.endDist) {
+      isInsideTunnel = true;
+      tunnelProximity01 = 1.0;
+      activeTunnel = tun;
+      break;
+    } else if (
+      distanceMeters >= tun.startDist - transitionZone &&
+      distanceMeters < tun.startDist
+    ) {
+      const p = 1 - (tun.startDist - distanceMeters) / transitionZone;
+      if (p > tunnelProximity01) {
+        tunnelProximity01 = p;
+        activeTunnel = tun;
+      }
+    } else if (
+      distanceMeters > tun.endDist &&
+      distanceMeters <= tun.endDist + transitionZone
+    ) {
+      const p = 1 - (distanceMeters - tun.endDist) / transitionZone;
+      if (p > tunnelProximity01) {
+        tunnelProximity01 = p;
+        activeTunnel = tun;
+      }
+    }
+  }
+
+  return {
+    groundY,
+    slopePitchRad,
+    isOverOpenGap,
+    isOnTakeoffRamp,
+    isOnLandingDeck,
+    activeJump,
+    isInsideTunnel,
+    tunnelProximity01,
+    activeTunnel,
+  };
+}
+
+export interface VehicleJumpStepInput {
+  prevDistanceMeters: number;
+  nextDistanceMeters: number;
+  speedMs: number;
+  y: number;
+  vy: number;
+  pitchRad: number;
+  isAirborne: boolean;
+  activeJumpId: number | null;
+  bridgeJumps: BrokenBridgeJumpSpec[];
+  tunnels: TunnelSectionSpec[];
+  dt: number;
+}
+
+export interface VehicleJumpStepOutput {
+  y: number;
+  vy: number;
+  pitchRad: number;
+  isAirborne: boolean;
+  activeJumpId: number | null;
+  justTookOff: boolean;
+  takeoffJump: BrokenBridgeJumpSpec | null;
+  justLanded: boolean;
+  landedJump: BrokenBridgeJumpSpec | null;
+  justFailedJump: boolean;
+  failedJump: BrokenBridgeJumpSpec | null;
+  surface: RoadSurfaceSample;
+}
+
+/**
+ * Authoritative vehicle vertical & bridge-jump physics step shared by the Player and all 5 AI cars.
+ * Handles:
+ *  - Driving up the inclined takeoff ramp (y and nose-up pitch follow the 3D ramp surface)
+ *  - Transitioning from grounded to airborne at the ramp lip without duplicate triggers
+ *  - Coherent parabolic flight across the open gap
+ *  - Smooth landing detection on the receiving bridge platform
+ *  - Deliberate failed-jump detection if the vehicle drops into the open chasm short of the landing deck
+ */
+export function stepVehicleJumpPhysics(input: VehicleJumpStepInput): VehicleJumpStepOutput {
+  const {
+    prevDistanceMeters,
+    nextDistanceMeters,
+    speedMs,
+     bridgeJumps,
+    tunnels,
+    dt,
+  } = input;
+
+  let { y, vy, pitchRad, isAirborne, activeJumpId } = input;
+  let justTookOff = false;
+  let takeoffJump: BrokenBridgeJumpSpec | null = null;
+  let justLanded = false;
+  let landedJump: BrokenBridgeJumpSpec | null = null;
+  let justFailedJump = false;
+  let failedJump: BrokenBridgeJumpSpec | null = null;
+
+  const surface = sampleRoadSurfaceAtDistance(nextDistanceMeters, bridgeJumps, tunnels);
+
+  if (!isAirborne) {
+    // Check if the vehicle just reached or crossed a ramp takeoff lip
+    let triggeredJump: BrokenBridgeJumpSpec | null = null;
+    for (let i = 0; i < bridgeJumps.length; i++) {
+      const jump = bridgeJumps[i];
+      if (activeJumpId === jump.id) continue;
+      const crossedLip =
+        prevDistanceMeters <= jump.rampEndDist &&
+        nextDistanceMeters >= jump.rampEndDist - 0.65;
+      const enteredOpenGap =
+        nextDistanceMeters > jump.gapStartDist &&
+        nextDistanceMeters < jump.gapEndDist;
+      if (crossedLip || enteredOpenGap) {
+        triggeredJump = jump;
+        break;
+      }
+    }
+
+    if (triggeredJump) {
+      isAirborne = true;
+      activeJumpId = triggeredJump.id;
+      y = triggeredJump.rampPeakHeight;
+      vy = computeJumpLaunchVerticalVelocity(triggeredJump, speedMs);
+      pitchRad = Math.min(0.26, triggeredJump.rampAngleRad * 1.25);
+      justTookOff = true;
+      takeoffJump = triggeredJump;
+
+      // If the vehicle crossed the lip mid-step, advance airborne y for the post-lip fraction of the step
+      const overLipMeters = Math.max(0, nextDistanceMeters - triggeredJump.rampEndDist);
+      if (overLipMeters > 0 && speedMs > 1) {
+        const subDt = Math.min(dt, overLipMeters / speedMs);
+        y += vy * subDt;
+        vy -= ARCADE_JUMP_GRAVITY * subDt;
+      }
+    } else if (surface.isOnTakeoffRamp && surface.activeJump) {
+      // Climbing the inclined takeoff ramp
+      y = surface.groundY;
+      vy = speedMs * Math.sin(surface.slopePitchRad);
+      pitchRad += (surface.slopePitchRad - pitchRad) * Math.min(1, dt * 16);
+    } else {
+      // Normal road or receiving landing deck
+      y = Math.max(0, surface.groundY);
+      vy = 0;
+      pitchRad += (surface.slopePitchRad - pitchRad) * Math.min(1, dt * 14);
+      // Clear activeJumpId once well past the landing deck
+      if (activeJumpId !== null) {
+        const prevJump = bridgeJumps.find((j) => j.id === activeJumpId);
+        if (!prevJump || nextDistanceMeters > prevJump.landingEndDist) {
+          activeJumpId = null;
+        }
+      }
+    }
+  } else {
+    // Vehicle is currently AIRBORNE across the broken bridge gap
+    y += vy * dt;
+    vy -= ARCADE_JUMP_GRAVITY * dt;
+
+    const desiredAirPitch = Math.max(
+      -0.2,
+      Math.min(0.26, (vy / Math.max(22, speedMs)) * 0.95)
+    );
+    pitchRad += (desiredAirPitch - pitchRad) * Math.min(1, dt * 10);
+
+    const currentJump =
+      bridgeJumps.find((j) => j.id === activeJumpId) ?? surface.activeJump;
+
+    if (currentJump) {
+      // 1. Did the vehicle reach the receiving bridge platform?
+      if (nextDistanceMeters >= currentJump.gapEndDist - 0.45) {
+        const landingDeckY = Math.max(0, surface.groundY);
+        if (y < landingDeckY - 1.35) {
+          // Vehicle fell too low in the chasm and struck the vertical broken abutment wall
+          isAirborne = false;
+          y = landingDeckY;
+          vy = 0;
+          pitchRad = 0;
+          justFailedJump = true;
+          failedJump = currentJump;
+        } else if (y <= landingDeckY + 0.22 && vy <= 0) {
+          // Clean touchdown on the receiving bridge deck!
+          isAirborne = false;
+          y = landingDeckY;
+          vy = 0;
+          pitchRad = -0.04; // brief nose suspension compression on touchdown
+          justLanded = true;
+          landedJump = currentJump;
+        }
+      } else if (
+        nextDistanceMeters > currentJump.gapStartDist + 1.5 &&
+        nextDistanceMeters < currentJump.gapEndDist - 0.45
+      ) {
+        // 2. Still over the open gap: check if vehicle fell below road level into the chasm
+        if (y < -0.65) {
+          isAirborne = false;
+          y = 0;
+          vy = 0;
+          pitchRad = 0;
+          justFailedJump = true;
+          failedJump = currentJump;
+        }
+      }
+    } else if (y <= 0) {
+      isAirborne = false;
+      y = 0;
+      vy = 0;
+      pitchRad = 0;
+    }
+  }
+
+  return {
+    y,
+    vy,
+    pitchRad,
+    isAirborne,
+    activeJumpId,
+    justTookOff,
+    takeoffJump,
+    justLanded,
+    landedJump,
+    justFailedJump,
+    failedJump,
+    surface,
+  };
+}
+
 const CITY_SECTOR_NAMES = [
-  'Neo-Harbor Drift Loop',
-  'Midtown Hairpin Circuit',
-  'Cyber-Bay U-Turn Viaduct',
-  'Apex Canyon Switchback',
-  'Solstice Bayfront GP',
+  'Neo-Harbor Tunnel & Bridge Run',
+  'Midtown Viaduct Jump Circuit',
+  'Cyber-Bay Sub-Harbor Loop',
+  'Apex Canyon Broken-Bridge GP',
+  'Solstice Bayfront Overpass',
   'Valkyrie Industrial Ring',
   'Aethelgard Metro Driftway',
   'Horizon Cross-City Dash',
@@ -140,7 +558,8 @@ const CITY_SECTOR_NAMES = [
 
 /**
  * Generates a complete, validated point-to-point course for any levelNumber >= 1.
- * Includes real U-shaped curves, hairpins, sweeping drift corners, S-bends, and tunnels.
+ * Includes illuminated highway tunnels, broken-bridge jump ramps with validated open gaps,
+ * U-shaped curves, hairpins, and S-bends.
  */
 export function generateLevelCourse(levelNumber: number): GeneratedLevelCourse {
   const safeLevel = Math.max(1, Math.floor(levelNumber));
@@ -152,42 +571,50 @@ export function generateLevelCourse(levelNumber: number): GeneratedLevelCourse {
   const title = `Level ${safeLevel} · ${sectorName}`;
   const subtitle =
     safeLevel === 1
-      ? 'Rookie Drift Circuit · Sweeping Bends & U-Turn Curve'
+      ? 'Illuminated Tunnel · Broken-Bridge Jump · U-Turn Drift'
       : safeLevel <= 3
-        ? 'Street Championship · U-Shaped Bends, S-Curves & Tunnel'
+        ? 'Street Championship · Tunnels, Viaduct Jumps & S-Curves'
         : safeLevel <= 6
-          ? 'Pro Drift Series · Hairpins, Linked S-Bends & Chicanes'
-          : 'Elite Hyper-Circuit · Technical Hairpins & High-Speed Drift Zones';
+          ? 'Pro Drift Series · Extended Bridge Gaps, Tunnels & Hairpins'
+          : 'Elite Hyper-Circuit · Long-Span Bridge Jumps, Tunnels & Technical Apexes';
 
   const segments: TrackSegmentSpec[] = [];
+  const tunnels: TunnelSectionSpec[] = [];
+  const bridgeJumps: BrokenBridgeJumpSpec[] = [];
   let cursorDist = 0;
+  let tunnelIdCounter = 1;
+  let jumpIdCounter = 1;
 
-  // 1. Start Grid Straight (95m)
+  // 1. Start Grid Straight (90m)
   segments.push({
     index: 0,
     type: 'start_grid',
     label: 'Starting Grid',
     startDist: 0,
-    endDist: 95,
-    length: 95,
+    endDist: 90,
+    length: 90,
     curvature: 0,
     isTunnel: false,
     isDriftZone: false,
+    isBridgeJump: false,
   });
-  cursorDist = 95;
+  cursorDist = 90;
 
-  // Guaranteed curated sequence for Level 1 so players immediately experience
-  // sweeping bends, a real U-shaped drift bend, S-curve, and tunnel sector:
+  // Curated sequence for Level 1 so players immediately experience an Illuminated Tunnel,
+  // a Broken-Bridge Jump, a U-Turn Drift Bend, an S-Curve, and a second Tunnel & Jump:
   const level1Sequence: TrackSegmentType[] = [
-    'sweeping_bend_left',
+    'tunnel_passage',
+    'bridge_jump',
     'u_turn_right',
-    'straight',
     'drift_s_bend',
     'tunnel_passage',
-    'u_turn_left',
+    'bridge_jump',
+    'sweeping_bend_left',
   ];
 
   const level2PlusPool: TrackSegmentType[] = [
+    'tunnel_passage',
+    'bridge_jump',
     'u_turn_left',
     'u_turn_right',
     'hairpin_left',
@@ -195,46 +622,57 @@ export function generateLevelCourse(levelNumber: number): GeneratedLevelCourse {
     'drift_s_bend',
     'sweeping_bend_left',
     'sweeping_bend_right',
-    'tunnel_passage',
     'chicane_barriers',
-    'gentle_curve_left',
-    'gentle_curve_right',
   ];
 
-  const middleSegmentCount = safeLevel === 1 ? level1Sequence.length : Math.min(15, 6 + Math.floor(safeLevel * 0.85));
+  const middleSegmentCount =
+    safeLevel === 1 ? level1Sequence.length : Math.min(15, 7 + Math.floor(safeLevel * 0.85));
 
   for (let i = 0; i < middleSegmentCount; i++) {
     let segType: TrackSegmentType;
     if (safeLevel === 1) {
       segType = level1Sequence[i % level1Sequence.length];
+    } else if (i === 0) {
+      segType = 'tunnel_passage';
     } else if (i === 1) {
-      // Guarantee every level has at least one prominent U-shaped curve or hairpin early on
+      segType = 'bridge_jump';
+    } else if (i === 2) {
       segType = i % 2 === 0 ? 'u_turn_left' : 'hairpin_right';
-    } else if (i === 3) {
-      segType = 'drift_s_bend';
+    } else if (i === 4) {
+      segType = 'bridge_jump';
+    } else if (i === 5) {
+      segType = 'tunnel_passage';
     } else {
       segType = level2PlusPool[Math.floor(rng() * level2PlusPool.length)];
-      if (segType === 'tunnel_passage' && segments[segments.length - 1]?.isTunnel) {
-        segType = 'u_turn_right';
+      const prevSeg = segments[segments.length - 1];
+      if (segType === 'tunnel_passage' && prevSeg?.isTunnel) {
+        segType = 'sweeping_bend_right';
+      }
+      if (segType === 'bridge_jump' && prevSeg?.isBridgeJump) {
+        segType = 'drift_s_bend';
       }
     }
 
-    let segLength = 165 + Math.floor(rng() * 55);
+    let segLength = 170 + Math.floor(rng() * 45);
     if (segType === 'u_turn_left' || segType === 'u_turn_right') {
-      segLength = 220 + Math.floor(rng() * 45);
+      segLength = 215 + Math.floor(rng() * 40);
     } else if (segType === 'hairpin_left' || segType === 'hairpin_right') {
-      segLength = 195 + Math.floor(rng() * 40);
+      segLength = 190 + Math.floor(rng() * 35);
     } else if (segType === 'drift_s_bend') {
-      segLength = 230 + Math.floor(rng() * 50);
+      segLength = 220 + Math.floor(rng() * 40);
     } else if (segType === 'tunnel_passage') {
-      segLength = 180 + Math.floor(rng() * 45);
+      segLength = 175 + Math.floor(rng() * 35);
+    } else if (segType === 'bridge_jump') {
+      segLength = 185 + Math.floor(rng() * 30);
     }
 
-    const baseCurveScale = safeLevel === 1 ? 0.68 : Math.min(0.95, 0.65 + difficulty01 * 0.3);
+    const baseCurveScale =
+      safeLevel === 1 ? 0.68 : Math.min(0.95, 0.65 + difficulty01 * 0.3);
     let curvature = 0;
     let label = 'City Straight';
     let isTunnel = false;
     let isDriftZone = false;
+    let isBridgeJump = false;
 
     switch (segType) {
       case 'gentle_curve_left':
@@ -280,11 +718,75 @@ export function generateLevelCourse(levelNumber: number): GeneratedLevelCourse {
         label = 'Linked S-Bend Drift Zone';
         isDriftZone = true;
         break;
-      case 'tunnel_passage':
-        curvature = (rng() - 0.5) * 0.32;
-        label = 'Sub-Harbor Tunnel';
+      case 'tunnel_passage': {
+        // Keep tunnels straight or very gently curved so the bright entrance, interior, and exit are clearly readable
+        curvature = safeLevel === 1 ? 0 : (rng() - 0.5) * 0.24;
+        label =
+          tunnelIdCounter % 2 === 1
+            ? 'Harbor Illuminated Tunnel'
+            : 'Midtown Express Tunnel';
         isTunnel = true;
+        const tunStart = cursorDist + 12;
+        const tunEnd = cursorDist + segLength - 12;
+        tunnels.push({
+          id: tunnelIdCounter++,
+          startDist: tunStart,
+          endDist: tunEnd,
+          length: tunEnd - tunStart,
+          label,
+        });
         break;
+      }
+      case 'bridge_jump': {
+        // Keep bridge jump alignment straight during approach, takeoff, and landing
+        // (later levels can have subtle post-landing curvature)
+        curvature = 0;
+        label =
+          jumpIdCounter % 2 === 1
+            ? 'Broken Bridge Jump'
+            : 'Viaduct Span Jump';
+        isBridgeJump = true;
+
+        // Progressive jump scaling across levels, validated by validateBridgeJumpSpec
+        const rawGapLen =
+          safeLevel === 1
+            ? 18
+            : Math.min(28, 19 + Math.floor((safeLevel - 1) * 1.4 + rng() * 3));
+        const rawRampLen = safeLevel === 1 ? 22 : 21 + Math.floor(rng() * 4);
+        const rawPeakHeight =
+          safeLevel === 1
+            ? 2.45
+            : Math.min(3.1, 2.5 + difficulty01 * 0.55);
+        const rawLandingHeight =
+          safeLevel <= 2 ? 0.15 : Math.min(0.65, 0.2 + difficulty01 * 0.45);
+        const rawMinSpeedMs =
+          safeLevel === 1
+            ? 29.0 // ~104 km/h
+            : Math.min(35.5, 30.0 + difficulty01 * 5.5);
+
+        const rampStartDist = cursorDist + 58;
+        const rawSpec: BrokenBridgeJumpSpec = {
+          id: jumpIdCounter++,
+          label,
+          approachStartDist: cursorDist + 10,
+          rampStartDist,
+          rampEndDist: rampStartDist + rawRampLen,
+          rampLength: rawRampLen,
+          rampPeakHeight: rawPeakHeight,
+          rampAngleRad: Math.atan2(rawPeakHeight, rawRampLen),
+          gapStartDist: rampStartDist + rawRampLen,
+          gapEndDist: rampStartDist + rawRampLen + rawGapLen,
+          gapLength: rawGapLen,
+          landingStartDist: rampStartDist + rawRampLen + rawGapLen,
+          landingEndDist: rampStartDist + rawRampLen + rawGapLen + 44,
+          landingLength: 44,
+          landingHeightOffset: rawLandingHeight,
+          minRequiredSpeedMs: rawMinSpeedMs,
+        };
+
+        bridgeJumps.push(validateBridgeJumpSpec(rawSpec));
+        break;
+      }
       case 'chicane_barriers':
         curvature = (i % 2 === 0 ? -1 : 1) * 0.28;
         label = 'Chicane Technical Sector';
@@ -305,6 +807,7 @@ export function generateLevelCourse(levelNumber: number): GeneratedLevelCourse {
       curvature,
       isTunnel,
       isDriftZone,
+      isBridgeJump,
     });
     cursorDist += segLength;
   }
@@ -320,49 +823,84 @@ export function generateLevelCourse(levelNumber: number): GeneratedLevelCourse {
     curvature: 0,
     isTunnel: false,
     isDriftZone: false,
+    isBridgeJump: false,
   });
   const totalLengthMeters = cursorDist + 120;
 
   // 2. Generate Validated Non-Car Course Obstacles & Coins
-  // Rule: Always leave at least 2 adjacent lanes completely open so every obstacle row is 100% passable.
-  // In tight hairpins/U-turns, reduce obstacle density so the racing line remains fair and drivable.
+  // Rule:
+  //  - Always leave at least 2 adjacent lanes completely open.
+  //  - Keep bridge jump approaches, ramps, gaps, and landing platforms 100% clear of obstacles.
   const obstacles: LevelCourseObstacle[] = [];
   const coins: LevelCourseCoin[] = [];
   let obstacleIdCounter = 1;
   let coinIdCounter = 1;
 
-  const obstacleSpacing = Math.max(52, Math.round(94 - difficulty01 * 36));
+  // Place airborne coin arcs over every Broken-Bridge Jump so players are guided and rewarded
+  for (const jump of bridgeJumps) {
+    const coinLaneX = HIGHWAY_CONFIG.laneCenters[1]; // Center-left racing line (-1.8m)
+    const coinLaneX2 = HIGHWAY_CONFIG.laneCenters[2]; // Center-right racing line (+1.8m)
+    const steps = 5;
+    for (let s = 0; s < steps; s++) {
+      const frac = s / (steps - 1); // 0..1 across ramp lip to landing zone
+      const d = jump.rampEndDist - 2 + frac * (jump.gapLength + 6);
+      const arcHeight =
+        jump.rampPeakHeight + Math.sin(frac * Math.PI) * 1.9 + 0.65;
+      coins.push({
+        id: coinIdCounter++,
+        distanceMeters: Number(d.toFixed(1)),
+        x: s % 2 === 0 ? coinLaneX : coinLaneX2,
+        y: Number(arcHeight.toFixed(2)),
+        collected: false,
+      });
+    }
+  }
+
+  const obstacleSpacing = Math.max(54, Math.round(94 - difficulty01 * 34));
   for (
-    let dist = 165;
+    let dist = 145;
     dist < totalLengthMeters - 135;
     dist += obstacleSpacing + Math.floor(rng() * 18)
   ) {
-    const segSample = sampleTrackAtDistance({
-      levelNumber: safeLevel,
-      seed,
-      title,
-      subtitle,
-      totalLengthMeters,
-      segments,
-      obstacles: [],
-      coins: [],
-      recommendedTopSpeedKmh: 240,
-      baseFirstPlaceReward: 220,
-    }, dist);
+    // Never place obstacles near a broken-bridge takeoff ramp, open gap, or landing zone
+    const nearBridgeJump = bridgeJumps.some(
+      (j) => dist >= j.rampStartDist - 34 && dist <= j.landingEndDist + 20
+    );
+    if (nearBridgeJump) continue;
 
-    // Pick a guaranteed open pair of adjacent lanes (0&1, 1&2, or 2&3)
-    // On strong curves, bias the open racing line toward the apex so players & AI have a clean drift line
+    const segSample = sampleTrackAtDistance(
+      {
+        levelNumber: safeLevel,
+        seed,
+        title,
+        subtitle,
+        totalLengthMeters,
+        segments,
+        tunnels,
+        bridgeJumps,
+        obstacles: [],
+        coins: [],
+        recommendedTopSpeedKmh: 240,
+        baseFirstPlaceReward: 220,
+      },
+      dist
+    );
+
     let openPairStart = Math.floor(rng() * 3);
     if (segSample.curvature < -0.55) {
-      openPairStart = 0; // Left apex lanes 0 & 1 open
+      openPairStart = 0;
     } else if (segSample.curvature > 0.55) {
-      openPairStart = 2; // Right apex lanes 2 & 3 open
+      openPairStart = 2;
     }
     const openLanes = new Set<number>([openPairStart, openPairStart + 1]);
 
     const isTightApex = Math.abs(segSample.curvature) >= 0.72;
     const maxBlocked =
-      safeLevel === 1 || isTightApex ? 1 : rng() < 0.42 + difficulty01 * 0.32 ? 2 : 1;
+      safeLevel === 1 || isTightApex
+        ? 1
+        : rng() < 0.42 + difficulty01 * 0.32
+          ? 2
+          : 1;
     let blockedCount = 0;
 
     for (let laneIdx = 0; laneIdx < HIGHWAY_CONFIG.laneCount; laneIdx++) {
@@ -389,7 +927,6 @@ export function generateLevelCourse(levelNumber: number): GeneratedLevelCourse {
       }
     }
 
-    // Place a line of collectible coins along the optimal drift/apex racing line
     const coinLane = openPairStart + (rng() < 0.5 ? 0 : 1);
     const coinX = HIGHWAY_CONFIG.laneCenters[coinLane];
     for (let cStep = -12; cStep <= 12; cStep += 8) {
@@ -397,6 +934,7 @@ export function generateLevelCourse(levelNumber: number): GeneratedLevelCourse {
         id: coinIdCounter++,
         distanceMeters: dist + cStep,
         x: coinX,
+        y: 0.9,
         collected: false,
       });
     }
@@ -412,6 +950,8 @@ export function generateLevelCourse(levelNumber: number): GeneratedLevelCourse {
     subtitle,
     totalLengthMeters,
     segments,
+    tunnels,
+    bridgeJumps,
     obstacles,
     coins,
     recommendedTopSpeedKmh,
@@ -421,7 +961,6 @@ export function generateLevelCourse(levelNumber: number): GeneratedLevelCourse {
 
 /**
  * Samples the procedural track at a given longitudinal distance (meters from start).
- * Shapes U-turns and hairpins with smooth entry, sustained apex, and smooth exit transitions.
  */
 export function sampleTrackAtDistance(
   course: GeneratedLevelCourse,
@@ -431,6 +970,7 @@ export function sampleTrackAtDistance(
   curvature: number;
   isTunnel: boolean;
   isDriftZone: boolean;
+  isBridgeJump: boolean;
 } {
   const clamped = Math.max(0, Math.min(course.totalLengthMeters, distanceMeters));
   for (let i = 0; i < course.segments.length; i++) {
@@ -442,7 +982,6 @@ export function sampleTrackAtDistance(
       let effectiveCurvature = seg.curvature;
 
       if (seg.type === 'drift_s_bend') {
-        // S-bend oscillates smoothly from +curvature to -curvature across the segment
         const phase = norm01 * Math.PI * 2;
         effectiveCurvature = Math.sin(phase) * seg.curvature;
       } else if (
@@ -451,7 +990,6 @@ export function sampleTrackAtDistance(
         seg.type === 'hairpin_left' ||
         seg.type === 'hairpin_right'
       ) {
-        // U-turn / Hairpin envelope: smooth progressive turn-in (0..0.18), sustained deep apex (0.18..0.82), smooth exit (0.82..1.0)
         const envelope =
           norm01 < 0.18
             ? Math.sin((norm01 / 0.18) * (Math.PI * 0.5))
@@ -459,6 +997,8 @@ export function sampleTrackAtDistance(
               ? Math.sin(((1 - norm01) / 0.18) * (Math.PI * 0.5))
               : 1.0;
         effectiveCurvature = seg.curvature * envelope;
+      } else if (seg.type === 'bridge_jump') {
+        effectiveCurvature = 0;
       } else if (localProgress < 24 && i > 0) {
         const prevCurv = course.segments[i - 1].curvature;
         const t = localProgress / 24;
@@ -474,6 +1014,7 @@ export function sampleTrackAtDistance(
         curvature: effectiveCurvature,
         isTunnel: seg.isTunnel,
         isDriftZone: seg.isDriftZone,
+        isBridgeJump: Boolean(seg.isBridgeJump),
       };
     }
   }
@@ -484,17 +1025,14 @@ export function sampleTrackAtDistance(
     curvature: 0,
     isTunnel: false,
     isDriftZone: false,
+    isBridgeJump: false,
   };
 }
 
 /**
  * Integrates the road curvature ahead of (or behind) the player's current longitudinal distance
- * so the 3D road mesh, barriers, lane markings, obstacles, coins, and AI cars all follow
+ * so the 3D road mesh, barriers, tunnels, bridge jump ramps, obstacles, coins, and AI cars all follow
  * the exact same physical curved road centerline.
- *
- * @param course Active level course
- * @param playerDistanceMeters Current longitudinal distance of the player (m)
- * @param worldZ Scene Z coordinate (negative = ahead of player, positive = behind player)
  */
 export function computeCurvedRoadCenterAtWorldZ(
   course: GeneratedLevelCourse | null,
@@ -511,7 +1049,6 @@ export function computeCurvedRoadCenterAtWorldZ(
     return { xOffset: 0, headingRad: 0, curvature: sampleAtZ.curvature };
   }
 
-  // Integrate curvature in 6 slices from playerDistanceMeters to playerDistanceMeters + distAhead
   const steps = 6;
   const stepMeters = distAhead / steps;
   let heading = 0;
@@ -520,7 +1057,6 @@ export function computeCurvedRoadCenterAtWorldZ(
   for (let s = 0; s < steps; s++) {
     const sampleDist = playerDistanceMeters + (s + 0.5) * stepMeters;
     const { curvature } = sampleTrackAtDistance(course, sampleDist);
-    // Curvature of 1.0 corresponds to a turn rate of ~0.0085 rad/m (broad drivable U-bend / hairpin)
     heading += curvature * stepMeters * 0.0082;
     xOffset += Math.sin(heading) * stepMeters;
   }
@@ -542,19 +1078,6 @@ const AI_DRIVER_PROFILES = [
 
 /**
  * Creates the 5 distinct AI racing opponents for a Levels Mode race (6 cars total with player).
- *
- * PRIORITY 6 GUARANTEE:
- * - All 6 vehicles (Player + 5 AI) are positioned on a fair 2-row starting grid
- *   at or behind the Start Line (`distanceMeters <= 0.0`).
- * - Front Row (`distanceMeters = 0.0m`):
- *     - Lane 0 (`-5.4m`): AI #2 (`Apex-02`)
- *     - Lane 1 (`-1.8m`): PLAYER (`YOU`)
- *     - Lane 2 (`+1.8m`): AI #1 (`Viper-01`)
- *     - Lane 3 (`+5.4m`): AI #3 (`Nova-03`)
- * - Second Row (`distanceMeters = -6.0m`, staggered behind Row 1):
- *     - Left-Center (`-3.6m`): AI #4 (`Pulse-04`)
- *     - Right-Center (`+3.6m`): AI #5 (`Krono-05`)
- * - All vehicles start at `speedMs = 0` and wait for the synchronized `GO!` release.
  */
 export function createLevelAiOpponents(
   levelNumber: number,
@@ -569,7 +1092,6 @@ export function createLevelAiOpponents(
     Math.min(playerEffectiveTopSpeedMs * 1.0, (218 + (safeLevel - 1) * 6.5) / 3.6)
   );
 
-  // Non-overlapping 6-car starting grid (Player occupies Front Row Lane 1 at x = -1.8, dist = 0)
   const gridPlacements: { x: number; laneIdx: number; dist: number }[] = [
     { x: HIGHWAY_CONFIG.laneCenters[2], laneIdx: 2, dist: 0.0 },  // AI 1: Front Row Lane 2 (+1.8m)
     { x: HIGHWAY_CONFIG.laneCenters[0], laneIdx: 0, dist: 0.0 },  // AI 2: Front Row Lane 0 (-5.4m)
@@ -595,6 +1117,11 @@ export function createLevelAiOpponents(
       gridSlot,
       distanceMeters: placement.dist,
       x: placement.x,
+      y: 0,
+      vy: 0,
+      pitchRad: 0,
+      isAirborne: false,
+      activeJumpId: null,
       targetLaneIndex: placement.laneIdx,
       speedMs: 0, // Stationary during 3-2-1 countdown; launched on GO!
       lateralVelocity: 0,
@@ -616,10 +1143,10 @@ export function createLevelAiOpponents(
 /**
  * Steps a single AI opponent for one physics frame after the race countdown has reached GO!:
  * - Scans upcoming course obstacles within lookaheadMeters and steers into open lanes.
- * - leans toward the inside apex lane on U-turns, hairpins, and sweeping bends.
+ * - Detects upcoming Broken-Bridge Jumps, aligns with the ramp, builds required takeoff speed,
+ *   flies across the open gap using the shared jump physics, and lands on the receiving platform.
+ * - Leans toward the inside apex lane on U-turns, hairpins, and sweeping bends.
  * - Overtakes slower vehicles when current lane is occupied.
- * - Adjusts speed naturally through tight curves according to corneringSkill.
- * - Uses controlled nitro bursts on straights.
  */
 export function stepAiOpponent(params: {
   ai: AiOpponentState;
@@ -634,6 +1161,10 @@ export function stepAiOpponent(params: {
   if (ai.finished) {
     ai.speedMs = Math.max(25, ai.speedMs - 8 * dt);
     ai.distanceMeters += ai.speedMs * dt;
+    ai.y = 0;
+    ai.vy = 0;
+    ai.pitchRad = 0;
+    ai.isAirborne = false;
     return;
   }
 
@@ -641,6 +1172,7 @@ export function stepAiOpponent(params: {
     ai.hitCooldown = Math.max(0, ai.hitCooldown - dt);
   }
 
+  const prevDist = ai.distanceMeters;
   const trackSample = sampleTrackAtDistance(course, ai.distanceMeters);
   const lookaheadSample = sampleTrackAtDistance(course, ai.distanceMeters + 32);
   const absCurve = Math.max(
@@ -648,77 +1180,101 @@ export function stepAiOpponent(params: {
     Math.abs(lookaheadSample.curvature) * 0.85
   );
 
-  // 1. Evaluate lane hazards, curve apex preference & traffic ahead
-  const lanePenalty = [0, 0, 0, 0];
-
-  for (let i = 0; i < course.obstacles.length; i++) {
-    const obs = course.obstacles[i];
-    const dz = obs.distanceMeters - ai.distanceMeters;
-    if (dz > -2 && dz <= ai.lookaheadMeters) {
-      const urgency = 1 + (ai.lookaheadMeters - dz) / ai.lookaheadMeters;
-      lanePenalty[obs.laneIndex] += 110 * urgency;
-    }
-  }
-
-  // Curve apex racing line preference: hug inside lanes on U-turns and hairpins
-  if (trackSample.curvature < -0.35) {
-    lanePenalty[0] -= 8 * ai.corneringSkill;
-    lanePenalty[1] -= 5 * ai.corneringSkill;
-  } else if (trackSample.curvature > 0.35) {
-    lanePenalty[3] -= 8 * ai.corneringSkill;
-    lanePenalty[2] -= 5 * ai.corneringSkill;
-  }
-
-  // Check other AI cars ahead in the same lane for overtaking
-  for (const other of allOpponents) {
-    if (other.id === ai.id) continue;
-    const dz = other.distanceMeters - ai.distanceMeters;
-    if (dz > -2 && dz < 24) {
-      const otherLane = getClosestLaneIndex(other.x);
-      lanePenalty[otherLane] += 26;
-    }
-  }
-
-  // Avoid ramming directly into the back of the player
-  const dzPlayer = playerDist - ai.distanceMeters;
-  if (dzPlayer > -1.5 && dzPlayer < 20) {
-    const pLane = getClosestLaneIndex(playerX);
-    lanePenalty[pLane] += 32;
-  }
-
-  // Slight preference for staying near current target lane unless blocked
-  lanePenalty[ai.targetLaneIndex] -= 6;
-
-  let bestLane = ai.targetLaneIndex;
-  let bestScore = lanePenalty[bestLane];
-  for (let l = 0; l < HIGHWAY_CONFIG.laneCount; l++) {
-    if (lanePenalty[l] < bestScore) {
-      bestScore = lanePenalty[l];
-      bestLane = l;
-    }
-  }
-  ai.targetLaneIndex = bestLane;
-
-  // 2. Lateral Steering toward target lane (with subtle centrifugal outward pull on tight hairpins)
-  const targetX = HIGHWAY_CONFIG.laneCenters[ai.targetLaneIndex];
-  const centrifugalDrift =
-    -trackSample.curvature * (1 - ai.corneringSkill * 0.82) * 2.2;
-  const dx = targetX - ai.x;
-  const maxLatSpeed = 12.0 + ai.corneringSkill * 4.5;
-  const desiredLatVel = Math.max(
-    -maxLatSpeed,
-    Math.min(maxLatSpeed, dx * 5.4 + centrifugalDrift)
+  // Check if AI is approaching or traversing a Broken-Bridge Jump
+  const upcomingJump = course.bridgeJumps.find(
+    (j) => ai.distanceMeters >= j.approachStartDist - 40 && ai.distanceMeters <= j.gapEndDist + 10
   );
-  ai.lateralVelocity += (desiredLatVel - ai.lateralVelocity) * Math.min(1, dt * 10);
+
+  // 1. Evaluate lane hazards, bridge-jump alignment, curve apex preference & traffic ahead
+  if (!ai.isAirborne) {
+    const lanePenalty = [0, 0, 0, 0];
+
+    for (let i = 0; i < course.obstacles.length; i++) {
+      const obs = course.obstacles[i];
+      const dz = obs.distanceMeters - ai.distanceMeters;
+      if (dz > -2 && dz <= ai.lookaheadMeters) {
+        const urgency = 1 + (ai.lookaheadMeters - dz) / ai.lookaheadMeters;
+        lanePenalty[obs.laneIndex] += 110 * urgency;
+      }
+    }
+
+    // On bridge jump approach, bias inner lanes (1 & 2) to stay well clear of bridge railings
+    if (upcomingJump) {
+      lanePenalty[0] += 6;
+      lanePenalty[3] += 6;
+      lanePenalty[1] -= 5;
+      lanePenalty[2] -= 5;
+    } else if (trackSample.curvature < -0.35) {
+      lanePenalty[0] -= 8 * ai.corneringSkill;
+      lanePenalty[1] -= 5 * ai.corneringSkill;
+    } else if (trackSample.curvature > 0.35) {
+      lanePenalty[3] -= 8 * ai.corneringSkill;
+      lanePenalty[2] -= 5 * ai.corneringSkill;
+    }
+
+    for (const other of allOpponents) {
+      if (other.id === ai.id) continue;
+      const dz = other.distanceMeters - ai.distanceMeters;
+      if (dz > -2 && dz < 24) {
+        const otherLane = getClosestLaneIndex(other.x);
+        lanePenalty[otherLane] += 26;
+      }
+    }
+
+    const dzPlayer = playerDist - ai.distanceMeters;
+    if (dzPlayer > -1.5 && dzPlayer < 20) {
+      const pLane = getClosestLaneIndex(playerX);
+      lanePenalty[pLane] += 32;
+    }
+
+    lanePenalty[ai.targetLaneIndex] -= 6;
+
+    let bestLane = ai.targetLaneIndex;
+    let bestScore = lanePenalty[bestLane];
+    for (let l = 0; l < HIGHWAY_CONFIG.laneCount; l++) {
+      if (lanePenalty[l] < bestScore) {
+        bestScore = lanePenalty[l];
+        bestLane = l;
+      }
+    }
+    ai.targetLaneIndex = bestLane;
+
+    // 2. Lateral Steering toward target lane
+    const targetX = HIGHWAY_CONFIG.laneCenters[ai.targetLaneIndex];
+    const centrifugalDrift = upcomingJump
+      ? 0
+      : -trackSample.curvature * (1 - ai.corneringSkill * 0.82) * 2.2;
+    const dx = targetX - ai.x;
+    const maxLatSpeed = 12.0 + ai.corneringSkill * 4.5;
+    const desiredLatVel = Math.max(
+      -maxLatSpeed,
+      Math.min(maxLatSpeed, dx * 5.4 + centrifugalDrift)
+    );
+    ai.lateralVelocity += (desiredLatVel - ai.lateralVelocity) * Math.min(1, dt * 10);
+  } else {
+    // While airborne, hold steady trajectory across the bridge gap
+    ai.lateralVelocity *= Math.max(0, 1 - dt * 6);
+  }
+
   ai.x = Math.max(
     -HIGHWAY_CONFIG.playerBoundX + 0.25,
     Math.min(HIGHWAY_CONFIG.playerBoundX - 0.25, ai.x + ai.lateralVelocity * dt)
   );
 
-  // 3. Nitro Burst Logic on low-curvature sections
+  // 3. Nitro Burst Logic (also engage nitro if approaching a bridge jump below safe takeoff speed)
+  const needsJumpBoost =
+    upcomingJump !== undefined &&
+    ai.distanceMeters < upcomingJump.rampEndDist &&
+    ai.speedMs < upcomingJump.minRequiredSpeedMs * 1.18;
+
+  if (needsJumpBoost && !ai.isNitroActive) {
+    ai.isNitroActive = true;
+    ai.nitroTimer = Math.max(ai.nitroTimer, 1.4);
+  }
+
   if (ai.isNitroActive) {
     ai.nitroTimer -= dt;
-    if (ai.nitroTimer <= 0 || absCurve > 0.62) {
+    if (ai.nitroTimer <= 0 || (absCurve > 0.62 && !upcomingJump)) {
       ai.isNitroActive = false;
       ai.nitroCooldown = 6.5 + (1 - ai.aggression) * 4;
     }
@@ -735,24 +1291,38 @@ export function stepAiOpponent(params: {
     }
   }
 
-  // 4. Longitudinal Speed & Curve Braking Moderation
-  const curveSpeedFactor = 1 - absCurve * (1 - ai.corneringSkill * 0.7) * 0.42;
-  const effectiveMaxSpeed =
+  // 4. Longitudinal Speed & Bridge-Jump Speed Assurance
+  const curveSpeedFactor = upcomingJump
+    ? 1.0
+    : 1 - absCurve * (1 - ai.corneringSkill * 0.7) * 0.42;
+  let effectiveMaxSpeed =
     ai.baseTopSpeedMs * curveSpeedFactor * (ai.isNitroActive ? 1.14 : 1.0);
 
+  if (upcomingJump) {
+    effectiveMaxSpeed = Math.max(effectiveMaxSpeed, upcomingJump.minRequiredSpeedMs * 1.24);
+  }
+
   if (ai.speedMs < effectiveMaxSpeed) {
-    // Smooth launch acceleration from 0 m/s up to cruising/racing speed
-    const launchBoost = ai.speedMs < 25 ? 1.85 : 1.0;
+    const launchBoost = ai.speedMs < 25 || upcomingJump ? 1.9 : 1.0;
     ai.speedMs = Math.min(
       effectiveMaxSpeed,
       ai.speedMs + ai.accelMs2 * launchBoost * (ai.isNitroActive ? 1.45 : 1.0) * dt
     );
-  } else {
+  } else if (!ai.isAirborne) {
     ai.speedMs = Math.max(effectiveMaxSpeed, ai.speedMs - 11.5 * dt);
   }
 
-  // 5. Check obstacle impact if AI couldn't clear a barrier in time
-  if (ai.hitCooldown <= 0) {
+  // Ensure AI at the takeoff lip has sufficient speed to clear the validated jump
+  if (
+    upcomingJump &&
+    ai.distanceMeters >= upcomingJump.rampStartDist &&
+    ai.distanceMeters <= upcomingJump.rampEndDist
+  ) {
+    ai.speedMs = Math.max(ai.speedMs, upcomingJump.minRequiredSpeedMs * 1.15);
+  }
+
+  // 5. Check obstacle impact if AI couldn't clear a barrier in time (only when grounded)
+  if (!ai.isAirborne && ai.hitCooldown <= 0) {
     for (let i = 0; i < course.obstacles.length; i++) {
       const obs = course.obstacles[i];
       if (
@@ -766,9 +1336,44 @@ export function stepAiOpponent(params: {
     }
   }
 
-  ai.distanceMeters += ai.speedMs * dt;
+  const nextDist = ai.distanceMeters + ai.speedMs * dt;
+  const jumpStep = stepVehicleJumpPhysics({
+    prevDistanceMeters: prevDist,
+    nextDistanceMeters: nextDist,
+    speedMs: ai.speedMs,
+    y: ai.y,
+    vy: ai.vy,
+    pitchRad: ai.pitchRad,
+    isAirborne: ai.isAirborne,
+    activeJumpId: ai.activeJumpId,
+    bridgeJumps: course.bridgeJumps,
+    tunnels: course.tunnels,
+    dt,
+  });
+
+  ai.distanceMeters = nextDist;
+  ai.y = jumpStep.y;
+  ai.vy = jumpStep.vy;
+  ai.pitchRad = jumpStep.pitchRad;
+  ai.isAirborne = jumpStep.isAirborne;
+  ai.activeJumpId = jumpStep.activeJumpId;
+
+  // If an AI ever falls short on a jump, recover it onto the receiving deck with a speed penalty
+  if (jumpStep.justFailedJump && jumpStep.failedJump) {
+    ai.distanceMeters = jumpStep.failedJump.gapEndDist + 3.0;
+    ai.y = jumpStep.failedJump.landingHeightOffset;
+    ai.vy = 0;
+    ai.pitchRad = 0;
+    ai.isAirborne = false;
+    ai.speedMs = Math.max(22, ai.speedMs * 0.65);
+  }
+
   if (ai.distanceMeters >= course.totalLengthMeters) {
     ai.distanceMeters = course.totalLengthMeters;
+    ai.y = 0;
+    ai.vy = 0;
+    ai.pitchRad = 0;
+    ai.isAirborne = false;
     ai.finished = true;
     ai.finishTimeSec = Number(elapsedRaceSec.toFixed(2));
     ai.isNitroActive = false;
@@ -841,7 +1446,6 @@ export function computeRaceStandings(params: {
     if (Math.abs(b.distanceMeters - a.distanceMeters) > 0.01) {
       return b.distanceMeters - a.distanceMeters;
     }
-    // At the starting line (both at 0.0m), put Player #1 among tied front-row starters
     return a.isPlayer ? -1 : b.isPlayer ? 1 : 0;
   });
 

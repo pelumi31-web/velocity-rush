@@ -306,6 +306,15 @@ export const RaceHudAndModals: React.FC<RaceHudAndModalsProps> = ({
             </div>
           )}
 
+          {!isLevels &&
+            liveSnapshot.segmentLabel &&
+            liveSnapshot.segmentLabel !== 'City Expressway' &&
+            liveSnapshot.segmentLabel !== 'Starting Grid' && (
+              <div className="bg-[#0b0f19]/88 border border-slate-800 px-3 py-0.5 rounded-xl text-[10px] font-bold uppercase tracking-wider text-cyan-300">
+                {liveSnapshot.segmentLabel}
+              </div>
+            )}
+
           {liveSnapshot.countdownValue !== null && (
             <div className="bg-[#0b0f19]/92 border border-cyan-500/50 px-5 py-1.5 rounded-2xl shadow-2xl">
               <span className="text-2xl sm:text-3xl font-extrabold font-mono text-cyan-400 tracking-wider">
@@ -316,7 +325,13 @@ export const RaceHudAndModals: React.FC<RaceHudAndModalsProps> = ({
             </div>
           )}
 
-          {liveSnapshot.isDrifting && (
+          {liveSnapshot.isAirborne && (
+            <div className="px-3 py-0.5 rounded-xl border bg-cyan-950/90 border-cyan-400 text-cyan-200 text-[11px] font-extrabold uppercase tracking-wider shadow-lg">
+              AIRBORNE · BRIDGE JUMP
+            </div>
+          )}
+
+          {liveSnapshot.isDrifting && !liveSnapshot.isAirborne && (
             <div className="px-3 py-0.5 rounded-xl border bg-amber-950/90 border-amber-400 text-amber-200 text-[11px] font-extrabold uppercase tracking-wider shadow-lg">
               DRIFT · +{liveSnapshot.driftScore ?? 0} PTS
             </div>

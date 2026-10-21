@@ -709,6 +709,40 @@ class SoundController {
       osc.stop(now + idx * 0.09 + 0.28);
     });
   }
+
+  public playJumpTakeoff(): void {
+    const ctx = this.ensureContext();
+    if (!ctx || !this.sfxGain || this.isGamePaused) return;
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const g = ctx.createGain();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(180, now);
+    osc.frequency.exponentialRampToValueAtTime(520, now + 0.22);
+    g.gain.setValueAtTime(0.18, now);
+    g.gain.exponentialRampToValueAtTime(0.001, now + 0.25);
+    osc.connect(g);
+    g.connect(this.sfxGain);
+    osc.start(now);
+    osc.stop(now + 0.26);
+  }
+
+  public playJumpLanding(): void {
+    const ctx = this.ensureContext();
+    if (!ctx || !this.sfxGain || this.isGamePaused) return;
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const g = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(140, now);
+    osc.frequency.exponentialRampToValueAtTime(48, now + 0.18);
+    g.gain.setValueAtTime(0.24, now);
+    g.gain.exponentialRampToValueAtTime(0.001, now + 0.2);
+    osc.connect(g);
+    g.connect(this.sfxGain);
+    osc.start(now);
+    osc.stop(now + 0.21);
+  }
 }
 
 export const soundController = new SoundController();

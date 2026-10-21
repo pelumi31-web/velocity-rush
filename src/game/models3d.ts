@@ -1526,3 +1526,458 @@ export function buildLevelObstacleMesh(type: LevelHazardType): THREE.Group {
 
   return group;
 }
+
+/**
+ * Builds a realistic modern highway Tunnel Entrance or Exit Portal frame
+ * with concrete abutments, safety chevrons, overhead illuminated portal signage,
+ * and warm-white threshold floodlights.
+ */
+export function buildTunnelPortalMesh(isEntrance: boolean): THREE.Group {
+  const group = new THREE.Group();
+  const halfRoad = 7.2; // HIGHWAY_CONFIG.roadWidth * 0.5
+
+  const concreteMat = new THREE.MeshStandardMaterial({
+    color: 0x475569,
+    roughness: 0.58,
+    metalness: 0.22,
+  });
+  const lightConcreteMat = new THREE.MeshStandardMaterial({
+    color: 0x94a3b8,
+    emissive: 0x334155,
+    emissiveIntensity: 0.35,
+    roughness: 0.45,
+    metalness: 0.18,
+  });
+  const warmFloodMat = new THREE.MeshStandardMaterial({
+    color: 0xfffbeb,
+    emissive: 0xfef08a,
+    emissiveIntensity: 3.4,
+  });
+  const amberReflectMat = new THREE.MeshStandardMaterial({
+    color: 0xf59e0b,
+    emissive: 0xd97706,
+    emissiveIntensity: 2.2,
+  });
+
+  // Left & Right Heavy Concrete Portal Pylons
+  const pylonGeo = new THREE.BoxGeometry(2.1, 7.6, 3.2);
+  const dadoGeo = new THREE.BoxGeometry(2.22, 2.2, 3.3);
+  const stripeGeo = new THREE.BoxGeometry(2.26, 0.28, 3.34);
+
+  for (const side of [-1, 1]) {
+    const px = side * (halfRoad + 1.35);
+    const pylon = new THREE.Mesh(pylonGeo, concreteMat);
+    pylon.position.set(px, 3.8, 0);
+    group.add(pylon);
+
+    const dado = new THREE.Mesh(dadoGeo, lightConcreteMat);
+    dado.position.set(px, 1.1, 0);
+    group.add(dado);
+
+    const stripe = new THREE.Mesh(stripeGeo, amberReflectMat);
+    stripe.position.set(px, 1.25, 0);
+    group.add(stripe);
+  }
+
+  // Overhead Concrete Portal Arch Lintels & Retaining Wall Crown
+  const lintelMesh = new THREE.Mesh(new THREE.BoxGeometry(19.6, 2.1, 3.2), concreteMat);
+  lintelMesh.position.set(0, 7.15, 0);
+  group.add(lintelMesh);
+
+  const crownFascia = new THREE.Mesh(new THREE.BoxGeometry(20.0, 0.42, 3.45), lightConcreteMat);
+  crownFascia.position.set(0, 8.25, 0);
+  group.add(crownFascia);
+
+  // Portal Illuminated Signboard
+  const signCanvas = document.createElement('canvas');
+  signCanvas.width = 512;
+  signCanvas.height = 64;
+  const ctx = signCanvas.getContext('2d')!;
+  ctx.fillStyle = '#0f172a';
+  ctx.fillRect(0, 0, 512, 64);
+  ctx.fillStyle = isEntrance ? '#fbbf24' : '#38bdf8';
+  ctx.fillRect(0, 0, 512, 6);
+  ctx.fillRect(0, 58, 512, 6);
+  ctx.fillStyle = '#fffbeb';
+  ctx.font = 'bold 21px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(
+    isEntrance ? 'METRO EXPRESS TUNNEL · LIGHTS ON' : 'TUNNEL EXIT · CITY EXPRESSWAY',
+    256,
+    32
+  );
+  const signTex = new THREE.CanvasTexture(signCanvas);
+  signTex.colorSpace = THREE.SRGBColorSpace;
+
+  const signMesh = new THREE.Mesh(
+    new THREE.BoxGeometry(14.2, 1.05, 0.25),
+    new THREE.MeshBasicMaterial({ map: signTex })
+  );
+  signMesh.position.set(0, 7.1, isEntrance ? 1.58 : -1.58);
+  group.add(signMesh);
+
+  // Bright Warm-White Portal Threshold Luminaires across the ceiling soffit
+  const soffitLightGeo = new THREE.BoxGeometry(2.2, 0.18, 1.4);
+  for (const lx of [-4.8, -1.6, 1.6, 4.8]) {
+    const lightFixture = new THREE.Mesh(soffitLightGeo, warmFloodMat);
+    lightFixture.position.set(lx, 6.04, 0);
+    group.add(lightFixture);
+  }
+
+  return group;
+}
+
+/**
+ * Builds a 10-meter modular Illuminated Tunnel Interior Bay (`z: -5m .. +5m`).
+ * Features bright ceramic lower wall panels, concrete upper walls, structural support ribs,
+ * vaulted roof deck, safety barriers, and bright warm-white ceiling & wall street lighting fixtures
+ * so the tunnel interior is always brightly lit and easy to read.
+ */
+export function buildTunnelInteriorBayMesh(): THREE.Group {
+  const group = new THREE.Group();
+  const halfRoad = 7.2;
+  const bayLen = 10.2; // Slight overlap to prevent any hairline seam between adjacent bays
+
+  // Bright ceramic tiled lower wall dado (warm-white self-illuminated so road edges are bright)
+  const ceramicWallMat = new THREE.MeshStandardMaterial({
+    color: 0xf8fafc,
+    emissive: 0xfffbeb,
+    emissiveIntensity: 0.55,
+    roughness: 0.28,
+    metalness: 0.12,
+  });
+
+  // Upper concrete tunnel wall
+  const upperWallMat = new THREE.MeshStandardMaterial({
+    color: 0xcbd5e1,
+    emissive: 0x64748b,
+    emissiveIntensity: 0.38,
+    roughness: 0.52,
+    metalness: 0.2,
+  });
+
+  // Structural arch support rib material
+  const ribSteelMat = new THREE.MeshStandardMaterial({
+    color: 0x475569,
+    emissive: 0x1e293b,
+    emissiveIntensity: 0.3,
+    roughness: 0.42,
+    metalness: 0.55,
+  });
+
+  // Ceiling concrete slab material
+  const ceilingMat = new THREE.MeshStandardMaterial({
+    color: 0x64748b,
+    emissive: 0x334155,
+    emissiveIntensity: 0.42,
+    roughness: 0.55,
+    metalness: 0.25,
+  });
+
+  // Bright warm-white LED / Sodium-vapor luminaire material
+  const warmLuminaireMat = new THREE.MeshStandardMaterial({
+    color: 0xfffbeb,
+    emissive: 0xfef08a,
+    emissiveIntensity: 3.6,
+  });
+
+  // Neutral-white center ceiling light strip material
+  const neutralLuminaireMat = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    emissive: 0xe0f2fe,
+    emissiveIntensity: 3.2,
+  });
+
+  // Roadside safety guide strip
+  const guideAmberMat = new THREE.MeshStandardMaterial({
+    color: 0xfbbf24,
+    emissive: 0xf59e0b,
+    emissiveIntensity: 2.4,
+  });
+
+  const lowerWallGeo = new THREE.BoxGeometry(0.65, 2.5, bayLen);
+  const upperWallGeo = new THREE.BoxGeometry(0.65, 3.6, bayLen);
+  const guideStripGeo = new THREE.BoxGeometry(0.08, 0.16, bayLen);
+  const ribPillarGeo = new THREE.BoxGeometry(0.82, 6.1, 0.55);
+  const corniceLightGeo = new THREE.BoxGeometry(0.36, 0.24, 3.8);
+
+  for (const side of [-1, 1]) {
+    const wallX = side * (halfRoad + 0.65);
+
+    const lowerWall = new THREE.Mesh(lowerWallGeo, ceramicWallMat);
+    lowerWall.position.set(wallX, 1.25, 0);
+    group.add(lowerWall);
+
+    const upperWall = new THREE.Mesh(upperWallGeo, upperWallMat);
+    upperWall.position.set(wallX, 4.3, 0);
+    group.add(upperWall);
+
+    const guideStrip = new THREE.Mesh(guideStripGeo, guideAmberMat);
+    guideStrip.position.set(side * (halfRoad + 0.3), 1.15, 0);
+    group.add(guideStrip);
+
+    // Structural support columns at Z = -2.5 and Z = +2.5
+    for (const rz of [-2.5, 2.5]) {
+      const ribPillar = new THREE.Mesh(ribPillarGeo, ribSteelMat);
+      ribPillar.position.set(side * (halfRoad + 0.52), 3.05, rz);
+      group.add(ribPillar);
+    }
+
+    // Dual Warm-White Upper Wall Streetlight Fixtures per bay on both left & right walls
+    for (const lz of [-2.5, 2.5]) {
+      const fixture = new THREE.Mesh(corniceLightGeo, warmLuminaireMat);
+      fixture.position.set(side * (halfRoad - 0.12), 5.68, lz);
+      fixture.rotation.z = side * 0.35;
+      group.add(fixture);
+    }
+  }
+
+  // Tunnel Roof Slab & Transverse Support Ribs
+  const roofSlab = new THREE.Mesh(new THREE.BoxGeometry(16.4, 0.55, bayLen), ceilingMat);
+  roofSlab.position.set(0, 6.25, 0);
+  group.add(roofSlab);
+
+  const roofBeamGeo = new THREE.BoxGeometry(16.0, 0.38, 0.58);
+  for (const rz of [-2.5, 2.5]) {
+    const beam = new THREE.Mesh(roofBeamGeo, ribSteelMat);
+    beam.position.set(0, 5.92, rz);
+    group.add(beam);
+  }
+
+  // Central Ceiling Bright Light Strips
+  const centerLightGeo = new THREE.BoxGeometry(1.1, 0.14, 3.9);
+  for (const lz of [-2.5, 2.5]) {
+    const centerLight = new THREE.Mesh(centerLightGeo, neutralLuminaireMat);
+    centerLight.position.set(0, 5.9, lz);
+    group.add(centerLight);
+  }
+
+  return group;
+}
+
+export interface BrokenBridgeJumpMeshRig {
+  rootGroup: THREE.Group;
+  takeoffRampMesh: THREE.Mesh;
+  leftRampGirder: THREE.Mesh;
+  rightRampGirder: THREE.Mesh;
+  brokenTakeoffEdgeGroup: THREE.Group;
+  chasmFloorMesh: THREE.Mesh;
+  chasmPiersGroup: THREE.Group;
+  landingDeckMesh: THREE.Mesh;
+  landingApronMesh: THREE.Mesh;
+}
+
+/**
+ * Creates a reusable 3D Broken-Bridge & Angled Takeoff Ramp Rig with:
+ * - Inclined asphalt/steel takeoff ramp with glowing chevron launch arrows
+ * - Side steel truss girders & hazard beacons
+ * - Jagged broken bridge edge & exposed steel I-beams over the open chasm
+ * - Deep chasm canal floor & concrete bridge support piers below the gap
+ * - Receiving bridge platform with sloped landing apron and emerald landing zone markings
+ */
+export function buildBrokenBridgeJumpMeshRig(): BrokenBridgeJumpMeshRig {
+  const rootGroup = new THREE.Group();
+  const roadWidth = 14.4;
+
+  // 1. High-contrast Takeoff Ramp Surface Texture (Asphalt + Cyan/Amber Launch Chevrons)
+  const rampCanvas = document.createElement('canvas');
+  rampCanvas.width = 512;
+  rampCanvas.height = 512;
+  const rCtx = rampCanvas.getContext('2d')!;
+  rCtx.fillStyle = '#1e293b';
+  rCtx.fillRect(0, 0, 512, 512);
+
+  // Hazard yellow/black side borders
+  for (let y = 0; y < 512; y += 32) {
+    rCtx.fillStyle = (y / 32) % 2 === 0 ? '#f59e0b' : '#0f172a';
+    rCtx.fillRect(0, y, 24, 32);
+    rCtx.fillRect(488, y, 24, 32);
+  }
+
+  // Lane dividers
+  rCtx.fillStyle = 'rgba(248, 250, 252, 0.5)';
+  for (const lx of [136, 256, 376]) {
+    rCtx.fillRect(lx - 3, 0, 6, 512);
+  }
+
+  // Bright upward launch chevrons across all 4 lanes
+  rCtx.strokeStyle = '#38bdf8';
+  rCtx.lineWidth = 10;
+  for (const cx of [76, 196, 316, 436]) {
+    for (let cy = 64; cy < 480; cy += 96) {
+      rCtx.beginPath();
+      rCtx.moveTo(cx - 32, cy + 24);
+      rCtx.lineTo(cx, cy - 18);
+      rCtx.lineTo(cx + 32, cy + 24);
+      rCtx.stroke();
+    }
+  }
+  // Glowing amber takeoff lip warning bar at the top of the ramp (y = 0..28)
+  rCtx.fillStyle = '#f59e0b';
+  rCtx.fillRect(24, 0, 464, 26);
+
+  const rampTex = new THREE.CanvasTexture(rampCanvas);
+  rampTex.colorSpace = THREE.SRGBColorSpace;
+
+  const rampMat = new THREE.MeshStandardMaterial({
+    map: rampTex,
+    emissive: 0x0ea5e9,
+    emissiveMap: rampTex,
+    emissiveIntensity: 0.42,
+    roughness: 0.48,
+    metalness: 0.25,
+  });
+
+  // Unit box geometry that will be scaled/angled dynamically to match each jump's rampLength & rampPeakHeight
+  const takeoffRampMesh = new THREE.Mesh(new THREE.BoxGeometry(roadWidth, 0.45, 1), rampMat);
+  rootGroup.add(takeoffRampMesh);
+
+  // Side Steel Girders along the inclined ramp
+  const girderMat = new THREE.MeshStandardMaterial({
+    color: 0xf59e0b,
+    emissive: 0xd97706,
+    emissiveIntensity: 0.85,
+    roughness: 0.35,
+    metalness: 0.65,
+  });
+  const leftRampGirder = new THREE.Mesh(new THREE.BoxGeometry(0.55, 1.05, 1), girderMat);
+  const rightRampGirder = new THREE.Mesh(new THREE.BoxGeometry(0.55, 1.05, 1), girderMat);
+  rootGroup.add(leftRampGirder, rightRampGirder);
+
+  // 2. Broken Takeoff Edge & Exposed Steel I-Beams at the lip of the chasm
+  const brokenTakeoffEdgeGroup = new THREE.Group();
+  const brokenConcreteMat = new THREE.MeshStandardMaterial({
+    color: 0x334155,
+    roughness: 0.85,
+    metalness: 0.15,
+  });
+  const rustedBeamMat = new THREE.MeshStandardMaterial({
+    color: 0x64748b,
+    roughness: 0.5,
+    metalness: 0.75,
+  });
+  const hazardBeaconMat = new THREE.MeshStandardMaterial({
+    color: 0xef4444,
+    emissive: 0xef4444,
+    emissiveIntensity: 3.0,
+  });
+
+  // Exposed longitudinal I-beams jutting out over the open gap
+  const ibeamGeo = new THREE.BoxGeometry(0.32, 0.42, 2.8);
+  for (const bx of [-6.0, -3.6, -1.2, 1.2, 3.6, 6.0]) {
+    const beam = new THREE.Mesh(ibeamGeo, rustedBeamMat);
+    beam.position.set(bx, -0.35, -1.1);
+    brokenTakeoffEdgeGroup.add(beam);
+  }
+
+  // Jagged fractured concrete chunks along the lip
+  const chunkGeo = new THREE.BoxGeometry(1.75, 0.65, 0.9);
+  for (let c = -3; c <= 3; c++) {
+    const chunk = new THREE.Mesh(chunkGeo, brokenConcreteMat);
+    chunk.position.set(c * 2.1, -0.25, -0.25 - (Math.abs(c) % 2) * 0.3);
+    chunk.rotation.y = (c % 2 === 0 ? 1 : -1) * 0.12;
+    brokenTakeoffEdgeGroup.add(chunk);
+  }
+
+  // Dual red hazard warning beacons on the ramp lip shoulders
+  const beaconGeo = new THREE.SphereGeometry(0.24, 12, 12);
+  for (const side of [-1, 1]) {
+    const beacon = new THREE.Mesh(beaconGeo, hazardBeaconMat);
+    beacon.position.set(side * (roadWidth * 0.5 + 0.35), 0.75, 0);
+    brokenTakeoffEdgeGroup.add(beacon);
+  }
+  rootGroup.add(brokenTakeoffEdgeGroup);
+
+  // 3. Deep Open Chasm Floor & Structural Bridge Piers below the missing section
+  const chasmFloorMat = new THREE.MeshStandardMaterial({
+    color: 0x040812,
+    emissive: 0x082f49,
+    emissiveIntensity: 0.35,
+    roughness: 0.25,
+    metalness: 0.7,
+  });
+  const chasmFloorMesh = new THREE.Mesh(new THREE.BoxGeometry(roadWidth + 14, 0.5, 1), chasmFloorMat);
+  rootGroup.add(chasmFloorMesh);
+
+  const chasmPiersGroup = new THREE.Group();
+  const pierGeo = new THREE.BoxGeometry(1.6, 12.0, 1.8);
+  for (const px of [-5.2, 0, 5.2]) {
+    const pierFront = new THREE.Mesh(pierGeo, brokenConcreteMat);
+    pierFront.position.set(px, -6.0, 0);
+    chasmPiersGroup.add(pierFront);
+  }
+  // Crossbar girder on the support pier
+  const crossGirder = new THREE.Mesh(
+    new THREE.BoxGeometry(roadWidth + 2.4, 1.1, 2.1),
+    rustedBeamMat
+  );
+  crossGirder.position.set(0, -0.65, 0);
+  chasmPiersGroup.add(crossGirder);
+  rootGroup.add(chasmPiersGroup);
+
+  // 4. Receiving Bridge Landing Platform & Catch Apron
+  const landCanvas = document.createElement('canvas');
+  landCanvas.width = 512;
+  landCanvas.height = 512;
+  const lCtx = landCanvas.getContext('2d')!;
+  lCtx.fillStyle = '#1b2230';
+  lCtx.fillRect(0, 0, 512, 512);
+
+  // High-visibility emerald/cyan landing zone target stripes on the receiving deck
+  lCtx.fillStyle = '#10b981';
+  lCtx.fillRect(0, 480, 512, 32);
+  lCtx.strokeStyle = '#34d399';
+  lCtx.lineWidth = 8;
+  for (const cx of [76, 196, 316, 436]) {
+    for (let cy = 120; cy < 460; cy += 110) {
+      lCtx.beginPath();
+      lCtx.moveTo(cx - 28, cy + 20);
+      lCtx.lineTo(cx, cy - 16);
+      lCtx.lineTo(cx + 28, cy + 20);
+      lCtx.stroke();
+    }
+  }
+  const landTex = new THREE.CanvasTexture(landCanvas);
+  landTex.colorSpace = THREE.SRGBColorSpace;
+
+  const landMat = new THREE.MeshStandardMaterial({
+    map: landTex,
+    emissive: 0x059669,
+    emissiveMap: landTex,
+    emissiveIntensity: 0.35,
+    roughness: 0.55,
+    metalness: 0.2,
+  });
+
+  const landingDeckMesh = new THREE.Mesh(new THREE.BoxGeometry(roadWidth, 0.45, 1), landMat);
+  rootGroup.add(landingDeckMesh);
+
+  const apronMat = new THREE.MeshStandardMaterial({
+    color: 0x10b981,
+    emissive: 0x059669,
+    emissiveIntensity: 1.4,
+    roughness: 0.4,
+    metalness: 0.5,
+  });
+  const landingApronMesh = new THREE.Mesh(
+    new THREE.BoxGeometry(roadWidth + 0.4, 0.9, 2.2),
+    apronMat
+  );
+  rootGroup.add(landingApronMesh);
+
+  rootGroup.visible = false;
+
+  return {
+    rootGroup,
+    takeoffRampMesh,
+    leftRampGirder,
+    rightRampGirder,
+    brokenTakeoffEdgeGroup,
+    chasmFloorMesh,
+    chasmPiersGroup,
+    landingDeckMesh,
+    landingApronMesh,
+  };
+}
+
