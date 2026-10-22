@@ -1636,15 +1636,16 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
           <div
             role="dialog"
             aria-label="Driver Challenges"
-            className="my-auto max-w-4xl w-full mx-auto bg-[#0b0f19]/95 border border-slate-800 rounded-2xl p-3 sm:p-4 shadow-2xl pointer-events-auto max-h-[84vh] flex flex-col overflow-hidden"
+            data-testid="challenges-modal"
+            className="my-auto max-w-4xl w-full mx-auto bg-[#0b0f19]/95 border border-slate-800 rounded-2xl p-2.5 sm:p-4 shadow-2xl pointer-events-auto max-h-[calc(100dvh-3.5rem)] min-h-0 overflow-y-auto overscroll-contain touch-pan-y [-webkit-overflow-scrolling:touch]"
           >
-            {/* Header & Primary Mode Switcher */}
-            <div className="flex flex-wrap items-center justify-between gap-2 pb-2.5 mb-2.5 border-b border-slate-800 shrink-0">
+            {/* Sticky Header & Primary Mode Switcher */}
+            <div className="sticky -top-2.5 sm:-top-4 z-20 bg-[#0b0f19]/95 backdrop-blur-md flex flex-wrap items-center justify-between gap-2 pt-1 pb-2.5 mb-2.5 border-b border-slate-800">
               <div>
-                <h2 className="text-base sm:text-lg font-extrabold uppercase tracking-tight text-slate-100">
+                <h2 className="text-sm sm:text-lg font-extrabold uppercase tracking-tight text-slate-100">
                   Highway Milestones & Daily Objectives
                 </h2>
-                <p className="text-[11px] text-slate-400">
+                <p className="text-[11px] text-slate-400 hidden sm:block">
                   Complete 32 lifetime progression milestones and 3 daily objectives across Solo, Levels, Stunts, and Garage.
                 </p>
               </div>
@@ -1655,7 +1656,7 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
                     type="button"
                     data-testid="challenges-mode-lifetime"
                     onClick={() => setChallengesMainView('lifetime')}
-                    className={`px-3 py-1 rounded-lg text-xs font-bold transition cursor-pointer flex items-center gap-1.5 ${
+                    className={`px-2.5 sm:px-3 py-1 rounded-lg text-xs font-bold transition cursor-pointer flex items-center gap-1.5 ${
                       challengesMainView === 'lifetime'
                         ? 'bg-cyan-400 text-slate-950'
                         : 'text-slate-300 hover:text-white'
@@ -1672,7 +1673,7 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
                     type="button"
                     data-testid="challenges-mode-daily"
                     onClick={() => setChallengesMainView('daily')}
-                    className={`px-3 py-1 rounded-lg text-xs font-bold transition cursor-pointer flex items-center gap-1.5 ${
+                    className={`px-2.5 sm:px-3 py-1 rounded-lg text-xs font-bold transition cursor-pointer flex items-center gap-1.5 ${
                       challengesMainView === 'daily'
                         ? 'bg-amber-400 text-slate-950'
                         : 'text-slate-300 hover:text-white'
@@ -1699,11 +1700,11 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
 
             {/* VIEW A: 32 LIFETIME MILESTONES & CHALLENGES */}
             {challengesMainView === 'lifetime' && (
-              <>
+              <div className="space-y-2.5 pb-2 touch-pan-y">
                 {/* Summary Bar */}
-                <div className="grid grid-cols-3 gap-2 mb-2.5 shrink-0">
-                  <div className="bg-slate-900/90 border border-slate-800 rounded-xl px-3 py-1.5 flex items-center justify-between">
-                    <span className="text-[11px] text-slate-400 uppercase font-semibold">
+                <div className="grid grid-cols-3 gap-2">
+                  <div className="bg-slate-900/90 border border-slate-800 rounded-xl px-2.5 sm:px-3 py-1.5 flex items-center justify-between">
+                    <span className="text-[10px] sm:text-[11px] text-slate-400 uppercase font-semibold">
                       Completed
                     </span>
                     <span
@@ -1713,9 +1714,9 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
                       {totalCompletedCount} / {CHALLENGES_CONFIG.length}
                     </span>
                   </div>
-                  <div className="bg-slate-900/90 border border-slate-800 rounded-xl px-3 py-1.5 flex items-center justify-between">
-                    <span className="text-[11px] text-slate-400 uppercase font-semibold">
-                      Rewards Claimed
+                  <div className="bg-slate-900/90 border border-slate-800 rounded-xl px-2.5 sm:px-3 py-1.5 flex items-center justify-between">
+                    <span className="text-[10px] sm:text-[11px] text-slate-400 uppercase font-semibold">
+                      Claimed
                     </span>
                     <span
                       data-testid="challenges-claimed-summary"
@@ -1724,9 +1725,9 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
                       {totalClaimedCount} / {CHALLENGES_CONFIG.length}
                     </span>
                   </div>
-                  <div className="bg-slate-900/90 border border-slate-800 rounded-xl px-3 py-1.5 flex items-center justify-between">
-                    <span className="text-[11px] text-slate-400 uppercase font-semibold">
-                      Ready to Claim
+                  <div className="bg-slate-900/90 border border-slate-800 rounded-xl px-2.5 sm:px-3 py-1.5 flex items-center justify-between">
+                    <span className="text-[10px] sm:text-[11px] text-slate-400 uppercase font-semibold">
+                      Ready
                     </span>
                     <span
                       data-testid="challenges-ready-summary"
@@ -1738,7 +1739,7 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
                 </div>
 
                 {/* 6 Category Filter Tabs */}
-                <div className="flex flex-wrap gap-1.5 mb-2.5 shrink-0">
+                <div className="flex flex-wrap gap-1.5">
                   {CHALLENGE_CATEGORY_TABS.map((tab) => {
                     const active = challengeCategoryFilter === tab.id;
                     const countInTab =
@@ -1751,7 +1752,7 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
                         type="button"
                         data-testid={`challenge-tab-${tab.id}`}
                         onClick={() => setChallengeCategoryFilter(tab.id)}
-                        className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition cursor-pointer ${
+                        className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition cursor-pointer touch-pan-y ${
                           active
                             ? 'bg-cyan-400 text-slate-950'
                             : 'bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800'
@@ -1763,8 +1764,11 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
                   })}
                 </div>
 
-                {/* Scrollable 2-Column Landscape Challenge Grid */}
-                <div className="flex-1 overflow-y-auto pr-1 grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                {/* 2-Column Landscape Challenge Grid */}
+                <div
+                  data-testid="challenges-list-grid"
+                  className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 touch-pan-y"
+                >
                   {filteredChallenges.map((ch) => {
                     const claimed = saveData.challenges.claimedChallengeIds.includes(ch.id);
                     const currentVal = getChallengeMetricValue(saveData, ch.metric);
@@ -1779,7 +1783,7 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
                       <div
                         key={ch.id}
                         data-testid={`challenge-card-${ch.id}`}
-                        className={`rounded-xl p-3 flex flex-col justify-between gap-2 border ${
+                        className={`rounded-xl p-3 flex flex-col justify-between gap-2 border touch-pan-y ${
                           readyToClaim
                             ? 'bg-slate-900/95 border-amber-400/60'
                             : claimed
@@ -1841,7 +1845,7 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
                                 onTriggerFeedbackNotice(res.reason);
                               }
                             }}
-                            className={`w-full py-1.5 px-3 rounded-lg text-xs font-bold uppercase tracking-wider transition-colors cursor-pointer ${
+                            className={`w-full py-1.5 px-3 rounded-lg text-xs font-bold uppercase tracking-wider transition-colors cursor-pointer touch-pan-y ${
                               claimed
                                 ? 'bg-emerald-950/50 text-emerald-400 border border-emerald-800/50 cursor-default'
                                 : readyToClaim
@@ -1860,14 +1864,14 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
                     );
                   })}
                 </div>
-              </>
+              </div>
             )}
 
             {/* VIEW B: DAILY CHALLENGES, STREAK, 250-COIN DAILY BONUS & HISTORY */}
             {challengesMainView === 'daily' && (
-              <div className="flex-1 overflow-y-auto pr-1 flex flex-col gap-3">
+              <div className="flex flex-col gap-3 pb-2 touch-pan-y">
                 {/* Daily Status, Streak & UTC Countdown Bar */}
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 shrink-0">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                   <div className="bg-slate-900/90 border border-slate-800 rounded-xl px-3 py-2 flex items-center justify-between">
                     <div>
                       <div className="text-[10px] uppercase tracking-wider text-slate-400">
@@ -1936,7 +1940,7 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
                           onTriggerFeedbackNotice(res.reason);
                         }
                       }}
-                      className={`px-2.5 py-1.5 rounded-lg text-[11px] font-bold uppercase tracking-wider cursor-pointer shrink-0 ${
+                      className={`px-2.5 py-1.5 rounded-lg text-[11px] font-bold uppercase tracking-wider cursor-pointer shrink-0 touch-pan-y ${
                         dailyState?.bonusClaimed
                           ? 'bg-emerald-950/60 text-emerald-400 border border-emerald-800/50 cursor-default'
                           : dailyBonusReady
@@ -1954,7 +1958,7 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
                 </div>
 
                 {/* 3 Daily Challenge Cards (Easy / Medium / Hard) */}
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 touch-pan-y">
                   {dailyItems.map((item) => {
                     const pct = Math.min(
                       100,
@@ -1973,7 +1977,7 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
                       <div
                         key={item.id}
                         data-testid={`daily-card-${item.difficulty}`}
-                        className={`rounded-xl p-3 flex flex-col justify-between gap-2.5 border ${
+                        className={`rounded-xl p-3 flex flex-col justify-between gap-2.5 border touch-pan-y ${
                           readyToClaim
                             ? 'bg-slate-900/95 border-amber-400/60'
                             : item.claimed
@@ -2036,7 +2040,7 @@ export const TitleAndMenus: React.FC<TitleAndMenusProps> = ({
                                 onTriggerFeedbackNotice(res.reason);
                               }
                             }}
-                            className={`w-full py-1.5 px-3 rounded-lg text-xs font-bold uppercase tracking-wider transition-colors cursor-pointer ${
+                            className={`w-full py-1.5 px-3 rounded-lg text-xs font-bold uppercase tracking-wider transition-colors cursor-pointer touch-pan-y ${
                               item.claimed
                                 ? 'bg-emerald-950/50 text-emerald-400 border border-emerald-800/50 cursor-default'
                                 : readyToClaim
